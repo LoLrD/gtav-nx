@@ -12,7 +12,8 @@ echo "nro + config uploaded"
 
 if [[ "${1:-}" == "--spirv" ]]; then
   existing=$(ftp_list "$SD_DIR/spirv" | sort)
-  mapfile -t local_files < <(cd "$SPIRV" && ls | sort)
+  local_files=()
+  while IFS= read -r f; do local_files+=("$f"); done < <(cd "$SPIRV" && ls | sort)
   todo=()
   for f in "${local_files[@]}"; do
     grep -qxF "$f" <<<"$existing" || todo+=("$f")
