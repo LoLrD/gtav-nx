@@ -25,6 +25,8 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <pthread.h>
+#elif defined(__SWITCH__)
+#include <pthread.h>
 #else
 #include <sys/syscall.h>
 #endif
@@ -82,6 +84,8 @@ ThreadTable& Table() {
     pthread_threadid_np(nullptr, &tid);
     t->tid = long(tid);
     pthread_getname_np(pthread_self(), name, sizeof(name));
+#elif defined(__SWITCH__)
+    t->tid = long(uintptr_t(pthread_self()));
 #else
     t->tid = syscall(SYS_gettid);
     char path[64];

@@ -11,6 +11,9 @@
 #if !TARGET_OS_IPHONE
 #include <mach/mach_vm.h>
 #endif
+#elif defined(__SWITCH__)
+#include <cstring>
+#include <switch.h>
 #elif defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -37,6 +40,18 @@ inline bool SafeReadMemory(void* dst, const void* src, size_t size) {
   return mach_vm_read_overwrite(mach_task_self(), mach_vm_address_t(uintptr_t(src)), size,
                                 mach_vm_address_t(uintptr_t(dst)), &got) == KERN_SUCCESS &&
          got == size;
+#elif defined(__SWITCH__)
+  uint64_t addr = uintptr_t(src);
+  const uint64_t end = addr + size;
+  while (addr < end) {
+    MemoryInfo info{};
+    u32 page_info = 0;
+    if (R_FAILED(svcQueryMemory(&info, &page_info, addr))) return false;
+    if (info.type == MemType_Unmapped || !(info.perm & Perm_R)) return false;
+    addr = info.addr + info.size;
+  }
+  std::memcpy(dst, src, size);
+  return true;
 #else
   iovec local{dst, size}, remote{const_cast<void*>(src), size};
   return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);

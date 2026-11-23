@@ -33,7 +33,7 @@
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
-#else
+#elif !defined(__SWITCH__)
 #include <sys/utsname.h>
 #endif
 
@@ -173,8 +173,10 @@ std::string SystemInfo(const std::string& reason, const std::string& log_text) {
     std::string line;
     while (std::getline(f, line))
       if (line.rfind("PRETTY_NAME=", 0) == 0) o << "os: " << line.substr(12) << "\n";
+#if !defined(__SWITCH__)
     struct utsname u {};
     if (uname(&u) == 0) o << "kernel: " << u.sysname << " " << u.release << " " << u.machine << "\n";
+#endif
     std::ifstream cpu("/proc/cpuinfo");
     while (std::getline(cpu, line))
       if (line.rfind("model name", 0) == 0) {

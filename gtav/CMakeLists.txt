@@ -272,8 +272,13 @@ endif()
 
 # The generated registration function (one call per game function, ~100k) takes clang's arm64
 # backend hours (-O3, and GlobalISel at -O0); it runs once at startup: unoptimized, SelectionDAG.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(_gtav_register_options "-O0;-fno-global-isel")
+else()
+    set(_gtav_register_options "-O0")
+endif()
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/generated/default/gtav_register.cpp
-                            PROPERTIES COMPILE_OPTIONS "-O0;-fno-global-isel" SKIP_PRECOMPILE_HEADERS ON)
+                            PROPERTIES COMPILE_OPTIONS "${_gtav_register_options}" SKIP_PRECOMPILE_HEADERS ON)
 
 # Profile-guided optimization of the recompiled game code (clang): GTAV_PGO=GENERATE builds an
 # instrumented game (writes LLVM_PROFILE_FILE when it exits normally or on the profile flush); merge

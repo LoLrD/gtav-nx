@@ -5,6 +5,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <switch.h>
 #else
 #include <pthread.h>
 #include <time.h>
@@ -20,6 +22,8 @@ inline void NameThread(const char* name) {  // at most 15 characters on Linux
   SetThreadDescription(GetCurrentThread(), w);
 #elif defined(__APPLE__)
   pthread_setname_np(name);
+#elif defined(__SWITCH__)
+  (void)name;
 #else
   pthread_setname_np(pthread_self(), name);
 #endif
@@ -28,6 +32,10 @@ inline void NameThread(const char* name) {  // at most 15 characters on Linux
 inline double ThreadCpuMs() {
 #if defined(_WIN32)
   return 0.0;
+#elif defined(__SWITCH__)
+  u64 ticks = 0;
+  if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, UINT64_MAX))) return 0.0;
+  return double(ticks) / 19200.0;
 #else
   timespec ts{};
   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;

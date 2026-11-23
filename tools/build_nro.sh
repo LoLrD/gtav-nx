@@ -23,6 +23,6 @@ docker run --rm -v "$ROOT:$ROOT" -v "$MESA_SDK:$MESA_SDK:ro" -w "$ROOT" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$ROOT/sdk" -DREXGLUE_BUILD_TESTS=OFF \
       -DGTAV_PREBUILT_NATIVE_SHADERS="$SHADERS" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA_SDK/opt/devkitpro/portlibs/switch"
-    cmake --build "$NRO_OUT" -j "$JOBS"
+    cmake --build "$NRO_OUT" -j "$JOBS" -- -k 0
   '
 echo "ok: $ROOT/$NRO_OUT/gtav.nro"

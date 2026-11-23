@@ -39,6 +39,8 @@ inline std::filesystem::path ExeDir() {
   std::error_code ec;
   auto exe = std::filesystem::canonical(buf, ec);
   return ec ? std::filesystem::path(buf).parent_path() : exe.parent_path();
+#elif defined(__SWITCH__)
+  return std::filesystem::path("sdmc:/switch/gtav-nx");
 #elif defined(__ANDROID__)
   // The process is app_process: use the app's external files dir (game data, spirv, logs),
   // which adb can write. Only valid once SDL's Java side is up (not from static initializers).

@@ -13,7 +13,7 @@
 	#else
 		typedef int (__stdcall* FARPROC)(void);
 	#endif
-#else
+#elif !defined(__SWITCH__)
 #	include <dlfcn.h>
 #endif
 
@@ -79,6 +79,9 @@ VkResult volkInitialize(void)
 
 	// note: function pointer is cast through void function pointer to silence cast-function-type warning on gcc8
 	vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void(*)(void))GetProcAddress(module, "vkGetInstanceProcAddr");
+#elif defined(__SWITCH__)
+	void* module = NULL;
+	return VK_ERROR_INITIALIZATION_FAILED;
 #elif defined(__APPLE__)
 	void* module = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
 	if (!module)
@@ -130,7 +133,7 @@ void volkFinalize(void)
 	{
 #if defined(_WIN32)
 		FreeLibrary((HMODULE)loadedModule);
-#else
+#elif !defined(__SWITCH__)
 		dlclose(loadedModule);
 #endif
 	}

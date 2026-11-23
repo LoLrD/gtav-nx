@@ -7,6 +7,18 @@
 //    them, the D-pad upper left, Back/Start top centre.
 #include "touch_controls.h"
 
+#if defined(__SWITCH__)
+
+#include <rex/input/input_driver.h>
+
+namespace gtav::native::touch {
+std::unique_ptr<rex::input::InputDriver> CreateDriver() { return nullptr; }
+bool Visible() { return false; }
+void Draw(ImDrawList*, float, float) {}
+}  // namespace gtav::native::touch
+
+#else
+
 #include "menu.h"
 
 #include <SDL3/SDL.h>
@@ -311,3 +323,5 @@ void Draw(ImDrawList* list, float w, float h) {
 }
 
 }  // namespace gtav::native::touch
+
+#endif

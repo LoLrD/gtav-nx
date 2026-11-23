@@ -1246,7 +1246,7 @@ class Renderer {
   // are always fullscreen. The swap chain follows through needsResize.
   bool fullscreen_applied_ = false;
   void ApplyFullscreen() {
-#if !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
+#if !defined(__ANDROID__) && !defined(__SWITCH__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
     const bool want = REXCVAR_GET(gtav_fullscreen);
     if (want == fullscreen_applied_ || REXCVAR_GET(gtav_native_hidden) || !window_) return;
     fullscreen_applied_ = want;
