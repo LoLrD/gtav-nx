@@ -55,7 +55,9 @@ class GtavApp : public rex::ReXApp {
     gtav::native::controls::Load();  // key bindings, mouse options, controller remap (controls.ini)
     config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
       auto input = rex::input::CreateDefaultInputSystem(tool_mode);
-      if (!tool_mode) input->AddDriver(gtav::native::touch::CreateDriver());
+      if (!tool_mode) {
+        if (auto touch = gtav::native::touch::CreateDriver()) input->AddDriver(std::move(touch));
+      }
       return input;
     };
   }

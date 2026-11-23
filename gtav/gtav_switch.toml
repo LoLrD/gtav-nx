@@ -10,3 +10,4 @@ gtav_native_spirv_dir = "sdmc:/switch/gtav-nx/spirv"
 gtav_native_stats = true
 gtav_native_vsync = true
 gtav_fps_limit = 30
+window_presenter = false
