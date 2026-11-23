@@ -482,6 +482,8 @@ set_source_files_properties(src/bug_report.cpp PROPERTIES COMPILE_DEFINITIONS "G
 
 if(REXGLUE_PLATFORM_SWITCH)
     target_compile_definitions(gtav PRIVATE GTAV_SWITCH=1)
+    target_sources(gtav PRIVATE src/switch_compat.cpp)
+    target_link_options(gtav PRIVATE -Wl,--wrap=pthread_detach)
     rexglue_switch_add_nro(gtav
         NAME "GTA V"
         AUTHOR "gtav-nx"
