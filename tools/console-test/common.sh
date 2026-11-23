@@ -19,7 +19,7 @@ CRASH_DIRS=(/atmosphere/crash_reports /atmosphere/fatal_reports)
 FTP_BASE="ftp://$SWITCH_IP:$FTP_PORT/"
 
 check_console() {
-  curl -sS --max-time 5 --user "$FTP_USER:$FTP_PASS" "$FTP_BASE" -l > /dev/null 2>&1 \
+  curl -sS --max-time 30 --retry 3 --user "$FTP_USER:$FTP_PASS" "$FTP_BASE" -l > /dev/null 2>&1 \
     || { echo "error: no connection to $SWITCH_IP:$FTP_PORT (console off, other IP, or sys-ftpd not running)" >&2; exit 1; }
 }
 ftp_curl() { curl -sS --retry 3 --retry-delay 3 --retry-all-errors --user "$FTP_USER:$FTP_PASS" "$@"; }
