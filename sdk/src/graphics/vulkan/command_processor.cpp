@@ -86,12 +86,15 @@ REXCVAR_DEFINE_BOOL(gpu_skip_rendering, false, "GPU/Vulkan",
 // processor thread at every swap (0-based, in PM4 order); it blocks until the title's renderer
 // has read the frame's guest memory. (Same hook as the D3D12 backend.)
 using SkipRenderingSwapHook = void (*)(uint64_t swap_index);
+#if defined(__SWITCH__)
+extern "C" __attribute__((weak)) void rex_skip_rendering_swap(uint64_t swap_index);
+#endif
 static SkipRenderingSwapHook ResolveSkipRenderingSwapHook() {
 #ifdef _WIN32
   return reinterpret_cast<SkipRenderingSwapHook>(
       GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_swap"));
 #elif defined(__SWITCH__)
-  return nullptr;
+  return &rex_skip_rendering_swap;
 #else
   return reinterpret_cast<SkipRenderingSwapHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_swap"));
 #endif

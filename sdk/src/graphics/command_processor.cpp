@@ -102,11 +102,16 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 // (the game is probably waiting for it).
 using SkipRenderingFenceHook = uint32_t (*)(uint32_t address, uint32_t value, uint32_t endian);
 using SkipRenderingIdleHook = void (*)();
+#if defined(__SWITCH__)
+extern "C" __attribute__((weak)) void rex_skip_rendering_idle();
+extern "C" __attribute__((weak)) uint32_t rex_skip_rendering_fence(uint32_t address, uint32_t value, uint32_t endian);
+extern "C" __attribute__((weak)) int rex_skip_rendering_gpu_waiters();
+#endif
 static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
 #ifdef _WIN32
   return reinterpret_cast<SkipRenderingIdleHook>(GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_idle"));
 #elif defined(__SWITCH__)
-  return nullptr;
+  return &rex_skip_rendering_idle;
 #else
   return reinterpret_cast<SkipRenderingIdleHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_idle"));
 #endif
@@ -116,7 +121,7 @@ static SkipRenderingFenceHook ResolveSkipRenderingFenceHook() {
   return reinterpret_cast<SkipRenderingFenceHook>(
       GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_fence"));
 #elif defined(__SWITCH__)
-  return nullptr;
+  return &rex_skip_rendering_fence;
 #else
   return reinterpret_cast<SkipRenderingFenceHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_fence"));
 #endif
@@ -131,7 +136,7 @@ static SkipRenderingGpuWaitersHook ResolveSkipRenderingGpuWaitersHook() {
   return reinterpret_cast<SkipRenderingGpuWaitersHook>(
       GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_gpu_waiters"));
 #elif defined(__SWITCH__)
-  return nullptr;
+  return &rex_skip_rendering_gpu_waiters;
 #else
   return reinterpret_cast<SkipRenderingGpuWaitersHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_gpu_waiters"));
 #endif
