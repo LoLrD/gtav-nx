@@ -11,3 +11,4 @@ gtav_native_stats = true
 gtav_native_vsync = true
 gtav_fps_limit = 30
 window_presenter = false
+guest_memory_large_pages = 1

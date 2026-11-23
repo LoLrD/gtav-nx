@@ -16,6 +16,8 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_compile_definitions(REX_PPC_FIXED_FLUSH_MODE)
+
 # GTAV_GAME_DLL: the release layout. The exe holds no recompiled game code; it loads gtav_game.dll,
 # which the player's installer generates from their own discs and builds with the bundled clang
 # (fs/gtav_pch.h). The exe then needs no generated sources at all.
