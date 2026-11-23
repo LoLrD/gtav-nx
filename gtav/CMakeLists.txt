@@ -200,6 +200,9 @@ elseif(REXGLUE_PLATFORM_SWITCH)
 else()
     rexglue_setup_target(gtav)
 endif()
+if(REXSDK_DIR)
+    target_include_directories(gtav PRIVATE ${REXSDK_DIR}/thirdparty/xxHash)
+endif()
 
 # The SDK builds recompiled code with -mcmodel=large ("large executable support"): every call
 # between the ~100 MB of game functions then goes through a 64-bit address in a register
@@ -294,7 +297,9 @@ endif()
 # Windows: rexruntime.dll exports none of its static SDL3, so the native window is Win32 (Plume's
 # HWND path) and no SDL is linked here.
 if(NOT WIN32 AND NOT REXGLUE_PLATFORM_SWITCH)
-    find_package(SDL3 REQUIRED CONFIG COMPONENTS Headers)
+    if(NOT TARGET SDL3::Headers)
+        find_package(SDL3 REQUIRED CONFIG COMPONENTS Headers)
+    endif()
     set(PLUME_SDL3_VULKAN_ENABLED ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/plume ${CMAKE_BINARY_DIR}/plume EXCLUDE_FROM_ALL)
@@ -320,6 +325,8 @@ if(WIN32)
     # rex_shader_float_constant_bitmap and rex_skip_rendering_wake are dllexported by the GPU plugin.
     find_library(REXGPU_XENOS NAMES rexgpu-xenosrd rexgpu-xenos PATHS ${rexglue_DIR}/../.. NO_DEFAULT_PATH REQUIRED)
     target_link_libraries(gtav PRIVATE ${REXGPU_XENOS})
+elseif(TARGET rexgpu-xenos AND NOT REXGLUE_PLATFORM_SWITCH)
+    target_link_libraries(gtav PRIVATE rexgpu-xenos)
 elseif(NOT REXGLUE_PLATFORM_SWITCH)
     find_library(REXGPU_XENOS rexgpu-xenos PATHS ${rexglue_DIR}/../.. NO_DEFAULT_PATH REQUIRED)
     target_link_libraries(gtav PRIVATE ${REXGPU_XENOS})

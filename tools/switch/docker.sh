@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DATA="$(cd "$ROOT/assets" && pwd -P)"
 IMAGE="${DEVKITA64_IMAGE:-nier-nx-build}"
 
 ensure_image() {
@@ -18,7 +17,7 @@ DOCKERFILE
 
 in_container() {
   ensure_image
-  docker run --rm -v "$ROOT:$ROOT" -v "$DATA:$DATA" -w "$ROOT" "$IMAGE" "$@"
+  docker run --rm -v "$ROOT:$ROOT" -w "$ROOT" "$IMAGE" "$@"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
