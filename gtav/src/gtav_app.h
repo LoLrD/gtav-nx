@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <rex/filesystem.h>
 #include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 
@@ -139,7 +140,15 @@ class GtavApp : public rex::ReXApp {
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>
   // CreateAchievementNotificationDialog() override;
-  // void OnConfigurePaths(rex::PathConfig& paths) override {}
+#if defined(__SWITCH__)
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    const auto data = rex::filesystem::GetExecutableFolder() / "data";
+    if (paths.game_data_root.empty()) paths.game_data_root = data / "game";
+    if (paths.update_data_root.empty()) paths.update_data_root = data / "update";
+    paths.user_data_root = data / "user";
+    paths.cache_root = data / "user" / "cache";
+  }
+#endif
 
  private:
   std::atomic<bool> shutting_down_{false};
