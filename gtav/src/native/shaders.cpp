@@ -8,6 +8,7 @@
 // input for the offline XenosRecomp pass.
 
 #include "shaders.h"
+#include "safe_read.h"
 #include "shader_compiler.h"
 
 #include <rex/cvar.h>
@@ -132,7 +133,8 @@ void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pix
       if (v < 0x1000) continue;
       const uint8_t* cand = (v >= 0x80000000) ? mem->TranslateVirtual(v) : mem->TranslatePhysical(v);
       if (v < 0x20000000 || v >= 0xA0000000) {
-        if (std::memcmp(cand, phys, 32) == 0)
+        uint8_t probe[32];
+        if (SafeReadMemory(probe, cand, sizeof(probe)) && std::memcmp(probe, phys, sizeof(probe)) == 0)
           REXLOG_INFO("[native-probe] {} obj {:08X}: microcode ptr at +{} = {:08X} (phys size {})",
                       pixel ? "ps" : "vs", object, off, v, be32(c + 8));
       }
