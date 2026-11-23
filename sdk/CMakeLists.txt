@@ -21,7 +21,7 @@ project(ReXGlue
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
-option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration (developer builds only)" OFF)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
 option(REXGLUE_PLATFORM_SWITCH             "Build for Nintendo Switch (devkitA64 + libnx; set by the toolchain file)" OFF)
 # Propagate profiling defines globally (compiled out in Release)
@@ -126,13 +126,24 @@ endfunction()
 
 if(NOT WIN32)
     # Use appropriate code model based on architecture
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
+    # REX_LARGE_CODE_MODEL=OFF: small code model (direct calls, RIP-relative data) for titles whose
+    # linked images stay below 2 GB; the large model costs a movabs + indirect call per call.
+    option(REX_LARGE_CODE_MODEL "Linux x86_64: build the runtime with -mcmodel=large" ON)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE AND REX_LARGE_CODE_MODEL)
         # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
         # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
         # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
         add_compile_options(-mcmodel=large)
     else()
         add_compile_options(-mcmodel=small)
+    endif()
+    # REX_SYMBOLIC_RUNTIME=ON: calls and data references inside the shared runtime bind at link time
+    # instead of going through the PLT/GOT (the runtime exports ~16,000 default-visibility symbols).
+    # Titles reach their own callbacks through dlsym, which is unaffected.
+    option(REX_SYMBOLIC_RUNTIME "Bind the runtime's internal references at link time" OFF)
+    if(REX_SYMBOLIC_RUNTIME AND NOT APPLE)
+        add_compile_options(-fno-semantic-interposition)
+        add_link_options(LINKER:-Bsymbolic-functions)
     endif()
     # Position-independent code for all targets
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -176,6 +187,10 @@ elseif(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+elseif(ANDROID)
+    # Android (NDK): Linux kernel + Bionic; platform.h also sets REX_PLATFORM_ANDROID.
+    set(REX_PLATFORM "android-arm64")
+    add_compile_definitions(REX_PLATFORM_LINUX=1)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -188,6 +203,9 @@ elseif(UNIX AND NOT APPLE)
 elseif(APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "mac-amd64")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(REX_IOS TRUE)
+        set(REX_PLATFORM "ios-arm64")
     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
         set(REX_PLATFORM "mac-arm64")
     else()
@@ -281,7 +299,10 @@ if(NOT REXGLUE_PLATFORM_SWITCH)
     # Host tools. Code generation runs on the PC; a Switch build compiles its
     # output.
     add_subdirectory(src/codegen)
-    add_subdirectory(src/rexglue)
+    # The codegen tool runs on the build host only; an iOS build is runtime libraries alone.
+    if(NOT REX_IOS)
+        add_subdirectory(src/rexglue)
+    endif()
 endif()
 
 # Add tests subdirectory if tests are enabled

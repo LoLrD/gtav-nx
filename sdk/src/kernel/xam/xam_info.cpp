@@ -19,7 +19,11 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xthread.h>
+#include <rex/cvar.h>
+
+REXCVAR_DECLARE(uint32_t, user_language);
 #include <rex/system/xtypes.h>
+#include <rex/kernel/xboxkrnl/threading.h>
 
 #if REX_PLATFORM_WIN32
 #include <windows.h>
@@ -183,6 +187,11 @@ u32 XGetGameRegion_entry() {
 }
 
 u32 XGetLanguage_entry() {
+  // --user_language (1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean,
+  // 8 Traditional Chinese, 9 Portuguese, 10 Simplified Chinese, 11 Polish, 12 Russian): the
+  // console's language setting, which games pick their text from.
+  const uint32_t user = REXCVAR_GET(user_language);
+  if (user > uint32_t(XLanguage::kInvalid) && user < uint32_t(XLanguage::kMaxLanguages)) return user;
   auto desired_language = XLanguage::kEnglish;
 
   // Switch the language based on game region.
@@ -322,10 +331,15 @@ u32 XamLoaderGetDvdTrayState_entry(mapped_u32 out_state) {
   return X_STATUS_SUCCESS;
 }
 
-u32 XamSwapDisc_entry(u32 disc_number) {
-  // Stub for multi-disc games. Single-disc games (like Blue Dragon's reblue test)
-  // don't need this, but the game may look it up dynamically via XexGetProcedureAddress.
-  REXKRNL_DEBUG("XamSwapDisc({}) - stub, returning success", (uint32_t)disc_number);
+u32 XamSwapDisc_entry(u32 disc_number, ppc_ptr_t<X_KEVENT> completion_event,
+                      mapped_void error_string) {
+  // Multi-disc games wait on completion_event after asking for the next disc. The
+  // host mounts the requested disc's files as game: up front, so report the swap
+  // as done immediately.
+  REXKRNL_DEBUG("XamSwapDisc({}) - completing immediately", (uint32_t)disc_number);
+  if (completion_event) {
+    xboxkrnl::xeKeSetEvent(completion_event, 1, 0);
+  }
   return X_STATUS_SUCCESS;
 }
 

@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -71,6 +72,8 @@ class InputSystem : public system::IInputSystem {
   // to be called on every GetState, SetState and GetCapabilities from the game (several per frame),
   // allocating memory and querying every driver each time. See RefreshDevices.
   std::atomic<int64_t> last_refresh_ns_{0};
+  // Serializes the public X* entry points (several guest threads poll input at once).
+  std::recursive_mutex mutex_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

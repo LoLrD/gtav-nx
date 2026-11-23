@@ -46,6 +46,16 @@
 extern "C" void RexSwitchPerfSetCurrentGuestEntry(uint32_t entry, uint32_t context);
 #endif
 
+#if REX_PLATFORM_SWITCH
+#define REX_GUEST_SLEEP_ZERO_US_DEFAULT 100
+#else
+#define REX_GUEST_SLEEP_ZERO_US_DEFAULT 0
+#endif
+// Guest Sleep(0): 0 yields (desktop: GTA V's update thread calls it ~1,500 times a frame from a
+// backoff spin, and every microsecond slept there is frame time); N > 0 sleeps N microseconds
+// instead. S23 FE same-run A/B 11-22, 0 vs 50: 20.5/18.1 vs 19.4/17.8 fps: yield there too.
+REXCVAR_DEFINE_INT32(guest_sleep_zero_us, REX_GUEST_SLEEP_ZERO_US_DEFAULT, "Kernel",
+                     "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -516,7 +526,9 @@ X_STATUS XThread::Create() {
 #if !REX_PLATFORM_SWITCH
   // On Switch the scheme in SwitchPriorityFor decides instead: this value would
   // reach svcSetThreadPriority as 0 or 1, outside an application's range.
-  if (creation_params_.creation_flags & 0x60) {
+  // Creation-flag priority: honoured only when thread priorities are not ignored (on Linux this
+  // is a SCHED_FIFO request, which would make a game thread real-time under an rtprio limit).
+  if ((creation_params_.creation_flags & 0x60) && !REXCVAR_GET(ignore_thread_priorities)) {
     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
   }
 #endif
@@ -1078,8 +1090,14 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     }
   } else {
     if (timeout_ms == 0) {
-      if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
+      // Sleep(0): yield. Only threads the guest lowered (negative priority increment) sleep a
+      // little so higher-priority threads get the core. priority_ is the guest increment, so it
+      // must not be compared with the host ThreadPriority constants (kBelowNormal is 8 on POSIX:
+      // every Sleep(0) became a 100 us nanosleep, ~1,500 times a frame on GTA V's update thread).
+      if (priority_ < 0) {
         rex::thread::Sleep(std::chrono::microseconds(100));
+      } else if (const int32_t us = REXCVAR_GET(guest_sleep_zero_us); us > 0) {
+        rex::thread::Sleep(std::chrono::microseconds(us));
       } else {
         rex::thread::MaybeYield();
       }

@@ -58,12 +58,14 @@ class XmaDecoder {
 
  private:
   void WorkerThreadMain();
+  static inline thread_local void* tls_mmio_ppc_context_ = nullptr;
 
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
     return as->ReadRegister(addr);
   }
   static void MMIOWriteRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr,
                                      uint32_t value) {
+    tls_mmio_ppc_context_ = ppc_context;  // xma_trace_buffers: who kicked
     as->WriteRegister(addr, value);
   }
 

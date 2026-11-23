@@ -23,17 +23,18 @@
 #include <set>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/platform.h>
 #include <rex/stream.h>
-#include <rex/cvar.h>
 #include <rex/filesystem.h>
 
 #if defined(__aarch64__) && !REX_ARCH_AMD64
@@ -302,6 +303,40 @@ void ResetDumpXma(uint32_t context) {
 
 }  // namespace
 
+// Loud audio burst hunt (gtav): xma_trace logs each context's decoded frames that are near full
+// scale or jump 20 dB over that context's previous frame, plus every "starved on input" reset;
+// xma_starved_reset=false turns that reset off for an A/B run.
+// Off: flushing (ffmpeg-gtav.patch xmaframes_flush, even with the full fresh-context reset) gave
+// 13-16 audio bursts in the scripted boot capture where reopening gave 4 (audio_bursts.py, 10-30);
+// reopening costs the audio thread ~20% (table setup) but that thread does not limit the fps.
+REXCVAR_DEFINE_BOOL(xma_flush_streams, false, "Audio",
+                    "Experiment: a new XMA stream flushes the decoder instead of reopening it (rebuilding its "
+                    "tables); more audio bursts in tests");
+REXCVAR_DEFINE_INT32(xma_fresh_contexts, 3, "Audio",
+                     "Decoder contexts per format kept opened ahead on a background thread: a new XMA stream "
+                     "takes one instead of reopening its own (same fresh state, without rebuilding the codec "
+                     "tables on the audio thread); 0 = reopen in place");
+REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
+REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
+REXCVAR_DEFINE_BOOL(xma_persistent_enable, false, "Audio",
+                    "XMA contexts stay enabled until the game disables them (as the hardware does) and decode "
+                    "whenever they have input and output space; off = one decode pass per kick");
+REXCVAR_DEFINE_BOOL(xma_output_keep_free_block, false, "Audio",
+                    "Never fill an XMA output ring completely (write == read must mean empty)");
+REXCVAR_DEFINE_BOOL(xma_kick_one_decode, false, "Audio",
+                    "A kick delivers at most subframe_decode_count output blocks, as the hardware does. GTA V "
+                    "primes the next block of a cutscene stream with one kick and waits for those blocks; "
+                    "filling the whole ring (write == read, valid cleared) left that channel waiting forever");
+REXCVAR_DEFINE_BOOL(xma_flush_tail, true, "Audio",
+                    "When a context is kicked with no input left, deliver the last decoded frame's tail held "
+                    "back for realignment (it waits for the next frame otherwise). GTA V stream channels "
+                    "count every sample of a block before playing the next; without it a cutscene channel "
+                    "stopped 384 samples short and the dialogue stopped after the first block");
+REXCVAR_DEFINE_BOOL(xma_trace_buffers, false, "Audio",
+                    "Log every XMA input buffer swap and every buffer the game (re)validates, per context");
+REXCVAR_DEFINE_BOOL(xma_starved_reset, true, "Audio",
+                    "Reset output write_offset to read_offset when a context runs out of input");
+
 namespace rex::audio {
 
 using stream::BitStream;
@@ -349,6 +384,106 @@ void NoteLoopDisabled(uint32_t context, const XMA_CONTEXT_DATA& data, bool* repo
   }
 }
 
+thread_local uint32_t g_trace_ctx = 0;  // xma_trace_buffers: the context Work() is on
+// Peak |sample| of a converted frame (big-endian int16).
+uint32_t FramePeak(const uint8_t* frame, size_t bytes) {
+  uint32_t peak = 0;
+  for (size_t i = 0; i + 1 < bytes; i += 2) {
+    int32_t v = int16_t(uint16_t(frame[i]) << 8 | frame[i + 1]);
+    peak = std::max<uint32_t>(peak, uint32_t(v < 0 ? -v : v));
+  }
+  return peak;
+}
+
+// Freshly opened decoder contexts by (sample rate, channels), made on a background thread, and
+// contexts to free there. Opening builds the codec's MDCT/sine/VLC tables (~20% of the game's
+// audio thread on a phone); a pre-opened context is the same fresh state as a reopen.
+class FreshContexts {
+ public:
+  static FreshContexts& Get() {
+    static FreshContexts* instance = new FreshContexts();  // lives for the process
+    return *instance;
+  }
+  // A fresh opened context for the format, or nullptr (the caller opens one). Asks for more.
+  AVCodecContext* Take(const AVCodec* codec, int sample_rate, int channels) {
+    const int want = REXCVAR_GET(xma_fresh_contexts);
+    if (want <= 0) return nullptr;
+    std::lock_guard lock(mutex_);
+    codec_ = codec;
+    auto& pool = pools_[{sample_rate, channels}];
+    AVCodecContext* context = nullptr;
+    if (!pool.empty()) {
+      context = pool.back();
+      pool.pop_back();
+    }
+    Start();
+    cv_.notify_one();
+    return context;
+  }
+  void Free(AVCodecContext* context) {
+    if (!context) return;
+    std::lock_guard lock(mutex_);
+    if (!started_) {
+      avcodec_free_context(&context);
+      return;
+    }
+    to_free_.push_back(context);
+    cv_.notify_one();
+  }
+
+ private:
+  void Start() {  // mutex_ held
+    if (started_) return;
+    started_ = true;
+    std::thread([this] { Run(); }).detach();
+  }
+  void Run() {
+    std::unique_lock lock(mutex_);
+    for (;;) {
+      cv_.wait(lock, [&] { return !to_free_.empty() || Missing() != nullptr; });
+      while (!to_free_.empty()) {
+        AVCodecContext* context = to_free_.back();
+        to_free_.pop_back();
+        lock.unlock();
+        avcodec_free_context(&context);
+        lock.lock();
+      }
+      while (auto* key = Missing()) {
+        const auto format = *key;
+        const AVCodec* codec = codec_;
+        lock.unlock();
+        AVCodecContext* context = avcodec_alloc_context3(codec);
+        if (context) {
+          context->sample_rate = format.first;
+          context->channels = format.second;
+          context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+          if (avcodec_open2(context, codec, NULL) < 0) avcodec_free_context(&context);
+        }
+        lock.lock();
+        if (!context) {
+          failed_ = true;  // (never seen) the callers open their own from now on
+          break;
+        }
+        pools_[format].push_back(context);
+      }
+    }
+  }
+  const std::pair<int, int>* Missing() {  // mutex_ held: a format below its count
+    const size_t want = size_t(std::max(REXCVAR_GET(xma_fresh_contexts), 0));
+    if (failed_) return nullptr;
+    for (auto& [format, pool] : pools_)
+      if (pool.size() < want) return &format;
+    return nullptr;
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::map<std::pair<int, int>, std::vector<AVCodecContext*>> pools_;
+  std::vector<AVCodecContext*> to_free_;
+  const AVCodec* codec_ = nullptr;
+  bool started_ = false;
+  bool failed_ = false;
+};
 }  // namespace
 
 const uint32_t XmaContext::kBitsPerPacketHeader;
@@ -360,6 +495,9 @@ XmaContext::XmaContext()
 XmaContext::~XmaContext() {
   if (av_context_) {
     avcodec_free_context(&av_context_);
+  }
+  for (auto& spare : spare_contexts_) {
+    if (spare) avcodec_free_context(&spare);
   }
   if (av_frame_) {
     av_frame_free(&av_frame_);
@@ -531,19 +669,67 @@ bool XmaContext::Work() {
   if (!is_allocated() || !is_enabled()) {
     return false;
   }
-  set_is_enabled(false);
+  // Hardware: a context decodes while enabled, until XMADisableContext. GTA V's streamer refills an
+  // enabled context (next block of a cutscene track) without kicking it again; with one pass per
+  // kick that block was never decoded and the cutscene's dialogue stopped after ~7 s (issues #3/#4).
+  const bool persistent = REXCVAR_GET(xma_persistent_enable);
+  if (!persistent) set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
   const XMA_CONTEXT_DATA initial_data = data;
+  if (persistent) {
+    // Only passes that can move something: valid output with space, and input (or a frame to finish).
+    if (!data.output_buffer_valid) return false;
+    if (!data.IsAnyInputBufferValid() && current_frame_remaining_subframes_ == 0 && !data.IsConsumeOnlyContext())
+      return false;
+  }
+  g_trace_ctx = id_;
+  if (REXCVAR_GET(xma_trace_buffers)) {
+    // What the game handed us since the last pass: newly valid buffers.
+    const uint32_t valid = uint32_t(data.input_buffer_0_valid) | uint32_t(data.input_buffer_1_valid) << 1;
+    if (valid != traced_valid_)
+      REXLOG_INFO("xma: ctx {} buffers valid {:02b} (was {:02b}) current {} read {} pkts {}/{} out valid {} w/r {}/{}",
+                  id_, valid, traced_valid_, uint32_t(data.current_buffer), uint32_t(data.input_buffer_read_offset),
+                  uint32_t(data.input_buffer_0_packet_count), uint32_t(data.input_buffer_1_packet_count),
+                  uint32_t(data.output_buffer_valid), uint32_t(data.output_buffer_write_offset),
+                  uint32_t(data.output_buffer_read_offset));
+    traced_valid_ = valid;
+    // Big buffers (stream blocks): saved for offline decoding, with the context registers.
+    static int dumped = 0;
+    if (valid && data.GetCurrentInputBufferPacketCount() >= 20 && dumped < 400 &&
+        data.GetCurrentInputBufferAddress() != dumped_ptr_) {
+      dumped_ptr_ = data.GetCurrentInputBufferAddress();
+      traced_passes_ = 0;
+      traced_frames_ = 0;
+      const uint32_t packets = data.GetCurrentInputBufferPacketCount();
+      const uint8_t* in = memory()->TranslatePhysical(data.GetCurrentInputBufferAddress());
+      const std::string path = fmt::format("/tmp/xma_buf_{:02}_ctx{}_p{}_off{}.bin", dumped++, id_, packets,
+                                           uint32_t(data.input_buffer_read_offset));
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(&data, 1, sizeof(XMA_CONTEXT_DATA), f);  // 64-byte register snapshot first
+        std::fwrite(in, 1, size_t(packets) * 2048, f);
+        std::fclose(f);
+      }
+    }
+  }
 
   if (!data.output_buffer_valid) {
+    if (REXCVAR_GET(xma_trace_buffers) && dumped_ptr_ && traced_passes_ < 4000 &&
+        (data.input_buffer_0_ptr == dumped_ptr_ || data.input_buffer_1_ptr == dumped_ptr_)) {
+      ++traced_passes_;
+      REXLOG_INFO("xma: ctx {} pass skipped: output not valid (read {} w/r {}/{})", id_,
+                  uint32_t(data.input_buffer_read_offset), uint32_t(data.output_buffer_write_offset),
+                  uint32_t(data.output_buffer_read_offset));
+    }
     return true;
   }
 
   // Avoid modulo by zero and accesses outside the guest buffer.
-  if (!data.output_buffer_block_count ||
-      data.output_buffer_read_offset >= data.output_buffer_block_count ||
+  if (!data.output_buffer_block_count) {
+    return true;
+  }
+  if (data.output_buffer_read_offset >= data.output_buffer_block_count ||
       data.output_buffer_write_offset >= data.output_buffer_block_count) {
     data.error_status = 4;
     data.output_buffer_valid = 0;
@@ -552,24 +738,32 @@ bool XmaContext::Work() {
   }
 
   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+  const uint32_t ring_start_write = output_rb.write_offset();
   uint32_t output_bytes_written = 0;
+
+  const bool flushed = !data.IsAnyInputBufferValid() && FlushCarry(data);
 
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
     if (current_frame_remaining_subframes_ == 0) {
       return true;
     }
-    // Flush all the PCM that fits, even if the packet size was set to zero.
-    // Consume returns zero when it has to wait for free space.
-    while (current_frame_remaining_subframes_) {
-      const uint32_t written = Consume(&output_rb, &data);
-      if (!written) {
-        break;
+    // Room for this part of the frame (plus the padding after its last part); otherwise wait for
+    // the game to read and kick again. Writing past the read offset made write == read, which the
+    // game's XMAPlayback reads as "nothing decoded" (output valid set): it lost the whole ring.
+    {
+      const int32_t sdc = std::max<int32_t>(1, data.subframe_decode_count);
+      const int32_t part = std::min<int32_t>(current_frame_remaining_subframes_, sdc);
+      const int32_t need = part + data.output_buffer_padding;
+      if (data.output_buffer_block_count != 0 && remaining_subframe_blocks_in_output_buffer_ < need) {
+        StoreContextMerged(data, initial_data, context_ptr);
+        return true;
       }
-      output_bytes_written += written;
     }
+    output_bytes_written = Consume(&output_rb, &data);
     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
-    if (output_bytes_written && output_rb.empty()) {
+    if (data.output_buffer_block_count != 0 && output_rb.empty() &&
+        data.output_buffer_write_offset != initial_data.output_buffer_write_offset) {
       data.output_buffer_valid = 0;
     }
     StoreContextMerged(data, initial_data, context_ptr);
@@ -590,46 +784,118 @@ bool XmaContext::Work() {
   }
 
   uint8_t silence_reason = 0;  // Measurement only
+  const uint32_t pass_start_write = output_rb.write_offset();
+  const uint32_t ring_bytes = output_rb.capacity();
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
-    const uint32_t previous_offset = data.input_buffer_read_offset;
+    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
+    const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
     const uint32_t previous_buffer = data.current_buffer;
     const auto previous_valid = data.input_buffer_0_valid | (data.input_buffer_1_valid << 1);
     const uint32_t previous_loop_count = data.loop_count;
-    const uint8_t previous_subframes = current_frame_remaining_subframes_;
+
     Decode(&data);
     const uint32_t written = Consume(&output_rb, &data);
     output_bytes_written += written;
 
-    // The last packet can leave several decoded subframes. If this returns with
-    // PCM pending, the consumer may wait for a full block without advancing the
-    // read position or re-enabling this context.
-    if ((!data.IsAnyInputBufferValid() && !current_frame_remaining_subframes_) ||
-        data.error_status == 4) {
+    if (REXCVAR_GET(xma_kick_one_decode) && ring_bytes) {
+      const uint32_t blocks_written =
+          (output_rb.write_offset() + ring_bytes - pass_start_write) % ring_bytes / kOutputBytesPerBlock;
+      if (blocks_written >= effective_sdc) break;
+    }
+
+    // Don't abandon a partially consumed frame (xenia-canary fix). Consume() hands over at most
+    // subframe_decode_count blocks per pass, so the pass that exhausts the input usually leaves
+    // the rest of the last frame undelivered; nothing would kick the context again to deliver it
+    // and the game's stream never finishes (GTA V cutscene audio hang).
+    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
+        current_frame_remaining_subframes_ == 0) {
       silence_reason = data.error_status == 4 ? 4 : 2;
+      break;
+    }
+
+    // No progress: Decode didn't advance and no frame is pending.
+    if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
+        current_frame_remaining_subframes_ == 0) {
+      silence_reason = 3;
       break;
     }
     // A frame's continuation may be missing while the producer refills the other
     // buffer. Keep the state and release the lock until the next Enable, without
     // spinning here or turning an input wait into an error.
-    if (!written && previous_offset == data.input_buffer_read_offset &&
+    if (!written && pre_decode_offset == data.input_buffer_read_offset &&
         previous_buffer == data.current_buffer &&
         previous_valid == (data.input_buffer_0_valid | (data.input_buffer_1_valid << 1)) &&
         previous_loop_count == data.loop_count &&
-        previous_subframes == current_frame_remaining_subframes_) {
+        pre_remaining_subframes == current_frame_remaining_subframes_) {
       silence_reason = 3;
       break;
     }
   }
 
-  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
-
-  // Equal pointers mean full only if PCM was written this time.
-  if (output_bytes_written && output_rb.empty()) {
+  if (initial_data.IsAnyInputBufferValid() || flushed || output_rb.write_offset() != ring_start_write) {
+    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+  } else if (REXCVAR_GET(xma_starved_reset) &&
+             data.output_buffer_write_offset != data.output_buffer_read_offset) {
+    // Starved on input: games use write_offset == read_offset as a stall detector.
+    if (REXCVAR_GET(xma_trace))
+      REXLOG_INFO("xma: ctx {} starved on input, write offset {} -> read offset {}", id_,
+                  uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_read_offset));
+    data.output_buffer_write_offset = data.output_buffer_read_offset;
     data.output_buffer_valid = 0;
+  }
+
+  // Output buffer full: this pass filled it (write caught up with read). Not for a buffer the game
+  // has not sized yet (0 blocks reads as "no space, empty": the context was marked full before the
+  // game finished setting it up and never decoded again; GTA V cutscene streams went silent).
+  if (data.output_buffer_block_count != 0 && remaining_subframe_blocks_in_output_buffer_ == 0 &&
+      output_rb.empty()) {
+    data.output_buffer_valid = 0;
+  }
+
+  if (REXCVAR_GET(xma_trace_buffers) && dumped_ptr_ && traced_passes_ < 4000 &&
+      (initial_data.input_buffer_0_ptr == dumped_ptr_ || initial_data.input_buffer_1_ptr == dumped_ptr_)) {
+    ++traced_passes_;
+    REXLOG_INFO("xma: ctx {} pass: read {} -> {} cur {} -> {} valid {}{} -> {}{} out w/r {}/{} -> {} valid {} -> {} "
+                "frame left {} pad {} err {}",
+                id_, uint32_t(initial_data.input_buffer_read_offset), uint32_t(data.input_buffer_read_offset),
+                uint32_t(initial_data.current_buffer), uint32_t(data.current_buffer),
+                uint32_t(initial_data.input_buffer_0_valid), uint32_t(initial_data.input_buffer_1_valid),
+                uint32_t(data.input_buffer_0_valid), uint32_t(data.input_buffer_1_valid),
+                uint32_t(initial_data.output_buffer_write_offset), uint32_t(initial_data.output_buffer_read_offset),
+                uint32_t(data.output_buffer_write_offset), uint32_t(initial_data.output_buffer_valid),
+                uint32_t(data.output_buffer_valid), current_frame_remaining_subframes_,
+                uint32_t(data.output_buffer_padding), uint32_t(data.error_status));
+  }
+  if (REXCVAR_GET(xma_trace_buffers) && initial_data.IsAnyInputBufferValid()) {
+    // A pass with input that moved nothing: what the decoder is waiting on.
+    const bool moved = data.input_buffer_read_offset != initial_data.input_buffer_read_offset ||
+                       data.current_buffer != initial_data.current_buffer ||
+                       data.output_buffer_write_offset != initial_data.output_buffer_write_offset;
+    if (!moved) {
+      if (++stalled_passes_ == 50)
+        REXLOG_INFO("xma: ctx {} no progress for 50 passes: valid {}{} current {} read {} bits of {} packets, "
+                    "out valid {} w/r {}/{} space {} subframes left {} error {}",
+                    id_, uint32_t(data.input_buffer_0_valid), uint32_t(data.input_buffer_1_valid),
+                    uint32_t(data.current_buffer), uint32_t(data.input_buffer_read_offset),
+                    data.GetCurrentInputBufferPacketCount(), uint32_t(data.output_buffer_valid),
+                    uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_read_offset),
+                    remaining_subframe_blocks_in_output_buffer_, current_frame_remaining_subframes_,
+                    uint32_t(data.error_status));
+    } else {
+      stalled_passes_ = 0;
+    }
   }
 
   StoreContextMerged(data, initial_data, context_ptr);
   NoteProduction(output_bytes_written != 0, silence_reason, data);  // Measurement only
+  if (persistent) {
+    return data.input_buffer_read_offset != initial_data.input_buffer_read_offset ||
+           data.current_buffer != initial_data.current_buffer ||
+           data.output_buffer_write_offset != initial_data.output_buffer_write_offset ||
+           data.input_buffer_0_valid != initial_data.input_buffer_0_valid ||
+           data.input_buffer_1_valid != initial_data.input_buffer_1_valid ||
+           data.output_buffer_valid != initial_data.output_buffer_valid;
+  }
   return true;
 }
 
@@ -675,15 +941,23 @@ void XmaContext::ResetDecoderState() {
   ResetDumpXma(id());  // diagnostic audio_dump_xma_s
   // A freed or re-initialized context is a new logical stream, so the previous
   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
-  // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
-  if (av_context_) {
-    av_context_->sample_rate = 0;
-    av_context_->channels = 0;
+  // ff_xmaframes_decoder's flush callback (ffmpeg-gtav.patch) clears it and the
+  // rest of the stream state, like a reopen without rebuilding the codec's tables
+  // (reopening for every sound was ~20% of the audio thread on a phone).
+  if (av_context_ && av_context_->sample_rate) {
+    if (REXCVAR_GET(xma_flush_streams)) {
+      avcodec_flush_buffers(av_context_);
+    } else {  // makes PrepareDecoder reopen the codec on the next decode
+      av_context_->sample_rate = 0;
+      av_context_->channels = 0;
+    }
   }
   raw_frame_.fill(0);
+  decoded_frame_.fill(0);
+  carry_frame_.fill(0);
+  carry_valid_ = false;
+  pending_output_limit_ = 0;
+  pending_start_skip_ = 0;
   in_silence_ = false;  // a new sound does not inherit the previous one's silence
   stall_reported_ = false;
   last_block_hash_ = 0;
@@ -711,7 +985,69 @@ void XmaContext::Release() {
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 }
 
+void XmaContext::LogState() {
+  if (!is_allocated()) return;
+  std::lock_guard<std::mutex> lock(lock_);
+  XMA_CONTEXT_DATA d(memory()->TranslateVirtual(guest_ptr()));
+  if (!d.input_buffer_0_valid && !d.input_buffer_1_valid && !d.output_buffer_valid) return;
+  REXLOG_INFO("xma state: ctx {} enabled {} valid {}{} cur {} read {} pkts {}/{} out valid {} w/r {}/{} blocks {} "
+              "err {} subframes left {} loop {} stereo {} rate {}",
+              id_, is_enabled(), uint32_t(d.input_buffer_0_valid), uint32_t(d.input_buffer_1_valid),
+              uint32_t(d.current_buffer), uint32_t(d.input_buffer_read_offset),
+              uint32_t(d.input_buffer_0_packet_count), uint32_t(d.input_buffer_1_packet_count),
+              uint32_t(d.output_buffer_valid), uint32_t(d.output_buffer_write_offset),
+              uint32_t(d.output_buffer_read_offset), uint32_t(d.output_buffer_block_count),
+              uint32_t(d.error_status), current_frame_remaining_subframes_, uint32_t(d.loop_count),
+              uint32_t(d.is_stereo), uint32_t(d.sample_rate));
+}
+
+// The decoder's output lags the bitstream by kDecoderStartPadding samples: each frame's last part
+// is carried until the next frame is decoded. With no input left, emit it now (the rest of that
+// frame, the codec's overlap tail, as silence) so the block's sample count is complete. A later
+// refill starts a fresh carry, so the stream stays sample-aligned either way.
+bool XmaContext::FlushCarry(const XMA_CONTEXT_DATA& data) {
+  if (!REXCVAR_GET(xma_flush_tail) || !carry_valid_ || current_frame_remaining_subframes_ != 0) return false;
+  const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data.is_stereo;
+  const size_t carry_bytes = (kBytesPerFrameChannel << data.is_stereo) - pad_bytes;
+  std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+  std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
+  current_frame_remaining_subframes_ = 4 << data.is_stereo;
+  loop_frame_output_limit_ = pending_output_limit_;
+  current_frame_remaining_subframes_ -= std::min(pending_start_skip_, current_frame_remaining_subframes_);
+  pending_output_limit_ = 0;
+  pending_start_skip_ = 0;
+  carry_valid_ = false;
+  if (REXCVAR_GET(xma_trace_buffers)) REXLOG_INFO("xma: ctx {} input done: flushed the last frame's tail", id_);
+  return true;
+}
+
+void XmaContext::WatchRegisters() {
+  if (!is_allocated() || !dumped_ptr_ || watch_logs_ >= 20000) return;
+  const auto* p = reinterpret_cast<const uint32_t*>(memory()->TranslateVirtual(guest_ptr()));
+  uint32_t now[16];
+  for (int i = 0; i < 16; i++) now[i] = rex::byte_swap(p[i]);
+  std::string diff;
+  for (int i = 0; i < 16; i++)
+    if (now[i] != watched_[i]) diff += fmt::format(" d{}:{:08X}->{:08X}", i, watched_[i], now[i]);
+  if (diff.empty()) return;
+  std::memcpy(watched_, now, sizeof(now));
+  ++watch_logs_;
+  REXLOG_INFO("xma watch: ctx {} en {}{}", id_, is_enabled(), diff);
+}
+
+void XmaContext::LogKick(const char* what) {
+  if (dumped_ptr_ && watch_logs_ < 20000) {
+    ++watch_logs_;
+    REXLOG_INFO("xma watch: ctx {} {}", id_, what);
+  }
+}
+
 void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
+  if (REXCVAR_GET(xma_trace_buffers))
+    REXLOG_INFO("xma: ctx {} swap: buffer {} done (read offset {} bits, {} packets), other valid {}", g_trace_ctx,
+                uint32_t(data->current_buffer), uint32_t(data->input_buffer_read_offset),
+                data->GetCurrentInputBufferPacketCount(),
+                uint32_t(data->current_buffer ? data->input_buffer_0_valid : data->input_buffer_1_valid));
   if (data->current_buffer == 0) {
     data->input_buffer_0_valid = 0;
   } else {
@@ -870,8 +1206,13 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
   memory::RingBuffer output_rb(output_buffer, output_capacity);
   output_rb.set_read_offset(output_read_offset);
   output_rb.set_write_offset(output_write_offset);
-  remaining_subframe_blocks_in_output_buffer_ =
-      static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
+  // One block always stays free: write == read must keep meaning "empty". A pass that filled the
+  // ring exactly (3 frames = 12 blocks, the usual first pass) left write == read, which the game reads
+  // as no audio: a cutscene track's pre-loaded next block then looked empty at the switch and the
+  // dialogue stopped after its first block (~7 s; issues #3, #4).
+  int32_t space = static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
+  if (REXCVAR_GET(xma_output_keep_free_block)) space = std::max(0, space - 1);
+  remaining_subframe_blocks_in_output_buffer_ = space;
 
   return output_rb;
 }
@@ -954,10 +1295,31 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
     fresh.output_buffer_valid = 0;
   }
 
-  fresh.input_buffer_read_offset = data.input_buffer_read_offset;
+  // The game may seek (write the input read offset / current buffer) while a decode pass runs on
+  // the worker thread: its value wins, and the decoder drops the frame state of the old position.
+  // Writing the pass's offset back over it undid the seek: one channel of a cutscene track stayed
+  // at the block start while its siblings were seeked, and the track stalled (issues #3, #4).
+  const bool game_seeked = fresh.input_buffer_read_offset != initial_data.input_buffer_read_offset ||
+                           fresh.current_buffer != initial_data.current_buffer;
+  if (!game_seeked) {
+    fresh.input_buffer_read_offset = data.input_buffer_read_offset;
+    fresh.current_buffer = data.current_buffer;
+  } else {
+    if (REXCVAR_GET(xma_trace_buffers))
+      REXLOG_INFO("xma: ctx {} game seeked during a pass: read {} -> {} (pass reached {})", id_,
+                  uint32_t(initial_data.input_buffer_read_offset), uint32_t(fresh.input_buffer_read_offset),
+                  uint32_t(data.input_buffer_read_offset));
+    current_frame_remaining_subframes_ = 0;
+    carry_valid_ = false;
+  }
   fresh.error_status = data.error_status;
-  fresh.current_buffer = data.current_buffer;
-  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+  // The output read offset is the game's: it advances it as it plays the decoded audio, also while
+  // a decode pass runs. Writing back the pass's snapshot undid that progress (a stream context sat
+  // at write 4 / read 0, the game waiting for audio it had already taken; GTA V cutscene dialogue
+  // stopped after the first block). Only a starved reset (which moves the write offset) touches it.
+  if (data.output_buffer_read_offset != initial_data.output_buffer_read_offset) {
+    fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+  }
 
   fresh.Store(context_ptr);
 }
@@ -1032,7 +1394,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
       av_context_->channels != static_cast<int>(channels)) {
     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
                        av_context_->sample_rate, sample_rate, av_context_->channels, channels);
-    avcodec_free_context(&av_context_);
+    for (auto& spare : spare_contexts_) {
+      if (REXCVAR_GET(xma_flush_streams) && spare && spare->sample_rate == sample_rate &&
+          spare->channels == static_cast<int>(channels)) {
+        std::swap(av_context_, spare);  // the current one is kept for its format
+        if (!spare->sample_rate) avcodec_free_context(&spare);  // never opened
+        avcodec_flush_buffers(av_context_);  // a new stream
+        return 1;
+      }
+    }
+    if (av_context_->sample_rate && REXCVAR_GET(xma_flush_streams)) {  // keep it, replacing the oldest spare
+      auto& slot = spare_contexts_[next_spare_++ % spare_contexts_.size()];
+      if (slot) avcodec_free_context(&slot);
+      slot = av_context_;
+    } else if (!REXCVAR_GET(xma_flush_streams)) {
+      if (AVCodecContext* fresh = FreshContexts::Get().Take(av_codec_, sample_rate, int(channels))) {
+        FreshContexts::Get().Free(av_context_);
+        av_context_ = fresh;
+        return 1;
+      }
+      FreshContexts::Get().Free(av_context_);
+      av_context_ = nullptr;
+    } else {
+      avcodec_free_context(&av_context_);
+    }
     av_context_ = avcodec_alloc_context3(av_codec_);
 
     av_context_->sample_rate = sample_rate;
@@ -1225,35 +1610,102 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t padding_start =
       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
 
-  raw_frame_.fill(0);
+  decoded_frame_.fill(0);
 
-  if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) < 0) {
+  const int prepared = PrepareDecoder(data->sample_rate, bool(data->is_stereo));
+  if (prepared < 0) {
     data->error_status = 4;
     return;
   }
+  if (prepared == 1) {
+    // Reopening the codec restarts its output; the carried tail belongs to the
+    // old stream.
+    carry_valid_ = false;
+  }
   PreparePacket(packet_info.current_frame_size_, padding_start);
   const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  if (REXCVAR_GET(xma_trace_buffers) && dumped_ptr_ && traced_frames_ < 2000 &&
+      data->GetCurrentInputBufferAddress() == dumped_ptr_) {
+    ++traced_frames_;
+    REXLOG_INFO("xma: ctx {} frame at bit {} (packet {}, rel {}) size {} bits, padding {}, decoded {}, carry {}, "
+                "codec rate {} ch {}, last frame in packet {}",
+                id_, uint32_t(data->input_buffer_read_offset), packet_index, relative_offset,
+                packet_info.current_frame_size_, padding_start, decoded, carry_valid_,
+                av_context_ ? av_context_->sample_rate : -1, av_context_ ? av_context_->channels : -1,
+                packet_info.isLastFrameInPacket());
+  }
   if (decoded) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
-                 raw_frame_.data());
+                 decoded_frame_.data());
     // Diagnostic (audio_dump_xma_s): the whole frame as it comes out of FFmpeg.
-    DumpXma(id(), 0, GetSampleRate(data->sample_rate), data->is_stereo ? 2 : 1, raw_frame_.data(),
+    DumpXma(id(), 0, GetSampleRate(data->sample_rate), data->is_stereo ? 2 : 1, decoded_frame_.data(),
               size_t(kBytesPerFrameChannel) << data->is_stereo);
+    // --xma_dump_raw=PATH: every decoded frame as {u32 context, u32 sample rate, u32 channels,
+    // u32 samples per channel, u32 steady-clock ms} + the big-endian int16 PCM the guest reads, to
+    // tell decoder artifacts from the game mixer's. The clock lines up with --audio_dump_raw's
+    // "audio dump starts at steady ms" log line.
+    if (const std::string& path = REXCVAR_GET(xma_dump_raw); !path.empty()) {
+      static std::mutex dump_mutex;
+      static FILE* dump = nullptr;
+      std::lock_guard lock(dump_mutex);
+      if (!dump) dump = std::fopen(path.c_str(), "wb");
+      if (dump) {
+        const uint32_t ms = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+        uint32_t header[5] = {id_, uint32_t(av_context_->sample_rate), 1u + uint32_t(data->is_stereo),
+                              uint32_t(kSamplesPerFrame), ms};
+        std::fwrite(header, sizeof(header), 1, dump);
+        std::fwrite(decoded_frame_.data(), 1, kBytesPerFrameChannel << data->is_stereo, dump);
+      }
+    }
+    if (REXCVAR_GET(xma_trace)) {
+      static uint32_t last_peak[512];
+      uint32_t& last = last_peak[id_ & 511];
+      const uint32_t peak = FramePeak(decoded_frame_.data(), kBytesPerFrameChannel << data->is_stereo);
+      if (peak >= 29000 || (peak >= 3000 && peak > last * 10))
+        REXLOG_INFO("xma: ctx {} loud frame peak {} (previous {}), stereo {}, input offset {}, out w/r {}/{}",
+                    id_, peak, last, uint32_t(data->is_stereo), uint32_t(data->input_buffer_read_offset),
+                    uint32_t(data->output_buffer_write_offset), uint32_t(data->output_buffer_read_offset));
+      last = peak;
+    }
 
-    // The game discards 384 samples at the start of each sound.
-    // Deliver the decoder's whole block: shifting it by 192 samples and holding
-    // its tail until the next frame also dropped a final block of 512. The
-    // consumer ran out of input and waited forever.
-    current_frame_remaining_subframes_ = 4 << data->is_stereo;
-    loop_frame_output_limit_ =
+    // Realign the decoder's output onto the bitstream's sample numbering: the
+    // samples of the frame just decoded run from kDecoderStartPadding into this
+    // block and finish in the head of the next one.
+    const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data->is_stereo;
+    const size_t carry_bytes = (kBytesPerFrameChannel << data->is_stereo) - pad_bytes;
+
+    // Loop end: limit output to subframes 0..loop_subframe_end.
+    const uint8_t decoded_output_limit =
         is_loop_end_frame ? static_cast<uint8_t>((data->loop_subframe_end + 1) << data->is_stereo)
                           : 0;
+    // Loop start: skip leading subframes per loop_subframe_skip. skip == 4
+    // means the whole frame is a warm-up frame (frame-aligned loop start):
+    // decode seeds the codec state, output is fully discarded.
     const uint8_t decoded_start_skip =
         loop_start_skip_pending_ ? static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo)
                                  : 0;
     loop_start_skip_pending_ = false;
-    current_frame_remaining_subframes_ -=
-        std::min(decoded_start_skip, current_frame_remaining_subframes_);
+
+    if (carry_valid_) {
+      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+      std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);
+
+      current_frame_remaining_subframes_ = 4 << data->is_stereo;
+      loop_frame_output_limit_ = pending_output_limit_;
+      current_frame_remaining_subframes_ -=
+          std::min(pending_start_skip_, current_frame_remaining_subframes_);
+    }
+
+    std::memcpy(carry_frame_.data(), decoded_frame_.data() + pad_bytes, carry_bytes);
+    carry_valid_ = true;
+    pending_output_limit_ = decoded_output_limit;
+    pending_start_skip_ = decoded_start_skip;
+  } else {
+    // A dropped frame breaks the carry's adjacency; re-prime rather than splice
+    // two blocks that are not neighbors.
+    carry_valid_ = false;
   }
 
   // Compute where to go next.

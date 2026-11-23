@@ -189,6 +189,8 @@ class XObject {
 
   void SetAttributes(uint32_t obj_attributes_ptr);
 
+  void ReportLongWait();
+  void TraceHandleOp(const char* op);
   X_STATUS Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                 uint64_t* opt_timeout);
   static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
@@ -222,8 +224,10 @@ class XObject {
 
   // Stash native pointer into X_DISPATCH_HEADER
   static void StashHandle(X_DISPATCH_HEADER* header, uint32_t handle) {
-    header->wait_list_flink = kXObjSignature;
+    // Handle first, then the signature: GetNativeObject reads them without the global lock.
     header->wait_list_blink = handle;
+    std::atomic_thread_fence(std::memory_order_release);
+    header->wait_list_flink = kXObjSignature;
   }
 
   static uint32_t TimeoutTicksToMs(int64_t timeout_ticks);

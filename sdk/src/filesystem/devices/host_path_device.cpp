@@ -202,8 +202,22 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
        * incomplete and marking it complete would make lookups of its siblings fail falsely. The mark
        * is set by PopulateEntry, which does add them all.
        */
-      g_swept_in_sd.fetch_add(1, std::memory_order_relaxed);
-      auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
+      // Only a listing finds a name whose case differs from the host file. The
+      // game probes missing files every frame (GTA V asks for game:\xbox360 ten
+      // times a second), the VFS holds the global lock here, and listing a
+      // directory on a USB/exFAT disk takes tens of milliseconds: re-listing on
+      // every miss stalled every kernel call on every thread. Keep the listing
+      // on the entry and reuse it while the directory's write time is unchanged.
+      rex::filesystem::FileInfo dir_info;
+      const bool have_dir_info = rex::filesystem::GetInfo(current_entry->host_path(), &dir_info);
+      if (!current_entry->scan_valid_ || !have_dir_info ||
+          dir_info.write_timestamp != current_entry->scan_write_timestamp_) {
+        g_swept_in_sd.fetch_add(1, std::memory_order_relaxed);
+        current_entry->scan_ = rex::filesystem::ListFiles(current_entry->host_path());
+        current_entry->scan_valid_ = true;
+        current_entry->scan_write_timestamp_ = have_dir_info ? dir_info.write_timestamp : 0;
+      }
+      const auto& child_infos = current_entry->scan_;
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
         return rex::string::utf8_equal_case(rex::path_to_utf8(info.name), part);
       });

@@ -412,6 +412,8 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
 
     XCONTENT_AGGREGATE_DATA content_data;
+    // ReadContentHeaderFile returns Win32 codes; XSUCCEEDED treats X_ERROR_FILE_NOT_FOUND (2) as
+    // success, which left content_data uninitialized for packages without a header file.
     if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
                               content_data) == X_ERROR_SUCCESS) {
       result.emplace_back(std::move(content_data));

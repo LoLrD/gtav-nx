@@ -6,6 +6,8 @@ out/
 sdk/out/
 sdk/thirdparty/*
 !sdk/thirdparty/CMakeLists.txt
+!sdk/thirdparty/imgui_rex_config.h
+!sdk/thirdparty/imgui_rex_context.cpp
 !sdk/thirdparty/FFmpeg/
 sdk/thirdparty/FFmpeg/*
 !sdk/thirdparty/FFmpeg/config_masseffect_wmv3.h
@@ -37,3 +39,7 @@ build/
 *.rej
 *.orig
 data/
+thirdparty/XenosRecomp/thirdparty/dxc-bin/
+tools/console-test/credentials.env
+tools/scripttools/*.dis
+tools/scripttools/*.code

@@ -15,12 +15,18 @@
 #include <cstring>
 #include <utility>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
 #include <sys/mman.h>
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <dlfcn.h>
+#include <execinfo.h>
 #endif
 
 #include <fmt/format.h>
 
+#include <rex/ppc/context.h>
+#include <rex/system/thread_state.h>
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -512,6 +518,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
   // side if system allocation granularity is bigger than 4 KB.
   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+#if REX_PLATFORM_ANDROID
+  // The views are mapped with MAP_FIXED, which silently replaces whatever is already there. On a
+  // desktop the low 64 GB are empty, but on Android the GPU driver, Scudo and ART map there, and
+  // a replaced driver mapping faults forever (vkCreateSwapchainKHR spun in the fault handler).
+  // Reserve the whole span without replacing anything first; the views then replace only it.
+  {
+    uint64_t span = 0;
+    for (size_t n = 0; n < rex::countof(map_info); n++) {
+      span = std::max<uint64_t>(span, map_info[n].virtual_address_end + 1);
+    }
+    void* reserved = mmap(mapping_base, span, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (reserved == MAP_FAILED) {
+      return 1;
+    }
+    if (reserved != mapping_base) {
+      munmap(reserved, span);
+      return 1;
+    }
+  }
+#endif
   for (size_t n = 0; n < rex::countof(map_info); n++) {
     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
         mapping_, mapping_base + map_info[n].virtual_address_start,
@@ -788,6 +815,25 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         rex::thread::current_thread_id());
 #if REX_PLATFORM_SWITCH
     DumpGuestCrashContext(virtual_membase_);
+#else
+    // Where in the game: the guest LR (return address of the last call made) and stack pointer.
+    if (auto* ts = runtime::ThreadState::Get(); ts && ts->context()) {
+      const auto* ctx = ts->context();
+      REXSYS_ERROR("  guest lr 0x{:08X} sp 0x{:08X} r3 0x{:08X} r31 0x{:08X}", uint32_t(ctx->lr), ctx->r1.u32,
+                   ctx->r3.u32, ctx->r31.u32);
+    }
+#if defined(__linux__) && !defined(__ANDROID__)
+    // The host frames (module + offset, symbolize with addr2line/nm): which generated functions.
+    void* frames[32];
+    int n = backtrace(frames, 32);
+    for (int i = 0; i < n; ++i) {
+      Dl_info info{};
+      if (dladdr(frames[i], &info) && info.dli_fname)
+        REXSYS_ERROR("  host #{} {}+0x{:x} {}", i, info.dli_fname,
+                     reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(info.dli_fbase),
+                     info.dli_sname ? info.dli_sname : "");
+    }
+#endif
 #endif
     return false;
   }

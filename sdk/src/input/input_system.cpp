@@ -11,13 +11,18 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <mutex>
 #include <cmath>
+#include <vector>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
+#include <rex/input/pad_remap.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #if REX_PLATFORM_SWITCH
@@ -41,9 +46,92 @@ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-thro
 REXCVAR_DEFINE_BOOL(input_rumble, false, "Input",
                     "Controller vibration (off by default: controllers only get "
                     "zero vibration). true = the game's vibration");
+REXCVAR_DEFINE_STRING(input_script, "", "Input",
+                      "Scripted pad for unattended runs: once this file exists, user 0 plays its lines "
+                      "'start_s dur_s buttons_hex lt rt lx ly rx ry' in a loop instead of the real pads");
 namespace rex::input {
 
 namespace {
+
+// --input_script: lets an unattended (hidden) run play the game, e.g. to reproduce audio glitches
+// that only happen during gameplay. The clock starts when the file first appears, so a capture
+// script can write it once the world is loaded.
+class InputScript {
+ public:
+  static InputScript& Get() {
+    static InputScript script;
+    return script;
+  }
+  bool State(X_INPUT_STATE* out) {
+    const std::string& path = REXCVAR_GET(input_script);
+    if (path.empty()) return false;
+    const auto now = std::chrono::steady_clock::now();
+    // Checked once a second: a rewritten file restarts the script from its new steps (so a
+    // capture script can drive a run step by step), a deleted one hands input back to the pads.
+    if (now >= next_check_) {
+      next_check_ = now + std::chrono::seconds(1);
+      std::error_code ec;
+      const auto stamp = std::filesystem::last_write_time(path, ec);
+      if (ec) {
+        steps_.clear();
+        loaded_stamp_ = {};
+      } else if (stamp != loaded_stamp_) {
+        loaded_stamp_ = stamp;
+        steps_.clear();
+        length_ = 0;
+        Load(path);
+        start_ = now;
+        REXLOG_INFO("input script: {} steps, loop {:.1f} s", steps_.size(), length_);
+      }
+    }
+    if (steps_.empty()) return false;
+    const double t = std::fmod(std::chrono::duration<double>(now - start_).count(), length_);
+    X_INPUT_GAMEPAD pad = {};
+    for (const Step& s : steps_) {
+      if (t < s.start || t >= s.start + s.duration) continue;
+      pad.buttons = uint16_t(pad.buttons | s.buttons);
+      pad.left_trigger = std::max<uint8_t>(pad.left_trigger, s.lt);
+      pad.right_trigger = std::max<uint8_t>(pad.right_trigger, s.rt);
+      if (s.lx || s.ly) pad.thumb_lx = s.lx, pad.thumb_ly = s.ly;
+      if (s.rx || s.ry) pad.thumb_rx = s.rx, pad.thumb_ry = s.ry;
+    }
+    out->packet_number = ++packet_;
+    out->gamepad = pad;
+    return true;
+  }
+
+ private:
+  struct Step {
+    double start, duration;
+    uint16_t buttons;
+    uint8_t lt, rt;
+    int16_t lx, ly, rx, ry;
+  };
+  void Load(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+      double start, duration;
+      unsigned buttons, lt, rt;
+      int lx, ly, rx, ry;
+      if (std::sscanf(line, "%lf %lf %x %u %u %d %d %d %d", &start, &duration, &buttons, &lt, &rt, &lx,
+                      &ly, &rx, &ry) != 9)
+        continue;
+      steps_.push_back({start, duration, uint16_t(buttons), uint8_t(std::min(lt, 255u)),
+                        uint8_t(std::min(rt, 255u)), int16_t(std::clamp(lx, -32768, 32767)),
+                        int16_t(std::clamp(ly, -32768, 32767)), int16_t(std::clamp(rx, -32768, 32767)),
+                        int16_t(std::clamp(ry, -32768, 32767))});
+      length_ = std::max(length_, start + duration);
+    }
+    std::fclose(f);
+  }
+  std::vector<Step> steps_;
+  double length_ = 0;
+  uint32_t packet_ = 0;
+  std::chrono::steady_clock::time_point start_, next_check_;
+  std::filesystem::file_time_type loaded_stamp_{};
+};
 
 // Synthetic devices are parked past every physical ordinal so they cannot push
 // a real pad off guest user 0. SlotAssignment routes them by their synthetic
@@ -219,6 +307,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -227,6 +316,17 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
   if (ids.empty()) {
+    if (user_index == 0 && !REXCVAR_GET(input_script).empty()) {
+      // --input_script stands in for a standard pad when none is connected.
+      *out_caps = {};
+      out_caps->type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
+      out_caps->sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
+      out_caps->gamepad.buttons = 0xF3FF;
+      out_caps->gamepad.left_trigger = out_caps->gamepad.right_trigger = 0xFF;
+      out_caps->gamepad.thumb_lx = out_caps->gamepad.thumb_ly = int16_t(0xFFC0);
+      out_caps->gamepad.thumb_rx = out_caps->gamepad.thumb_ry = int16_t(0xFFC0);
+      return X_ERROR_SUCCESS;
+    }
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -246,6 +346,14 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+  if (user_index == 0) {
+    X_INPUT_STATE scripted = {};
+    if (InputScript::Get().State(&scripted)) {
+      if (out_state) *out_state = scripted;
+      return X_ERROR_SUCCESS;
+    }
+  }
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -264,6 +372,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     X_INPUT_STATE state = {};
     if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
       continue;
+    }
+    if (const DeviceInfo* info = DeviceInfoFor(id); info && !info->synthetic) {
+      ApplyPadRemap(state);  // the title's controller remap (real pads only)
     }
     active_devices_.Observe(user_index, id, state.gamepad);
     if (!any) {
@@ -285,6 +396,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -333,6 +445,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

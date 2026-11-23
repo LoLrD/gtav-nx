@@ -82,6 +82,8 @@ std::string BuilderContext::v(size_t index) {
   return fmt::format("ctx.v{}", index);
 }
 
+// A share_registers function (an SEH funclet, a fragment split off another function) keeps CR,
+// CTR and XER in ctx too: its "caller" may have set them before branching into it.
 std::string BuilderContext::cr(size_t index) {
   if (config().crRegistersAsLocalVariables && !fn.sharesRegisters()) {
     locals.cr[index] = true;
@@ -281,8 +283,7 @@ bool BuilderContext::localizesAnything() const {
   if (fn.sharesRegisters())
     return false;
   const auto& cfg = config();
-  return cfg.nonVolatileRegistersAsLocalVariables || cfg.nonArgumentRegistersAsLocalVariables ||
-         cfg.crRegistersAsLocalVariables || cfg.ctrAsLocalVariable || cfg.xerAsLocalVariable;
+  return cfg.nonVolatileRegistersAsLocalVariables || cfg.nonArgumentRegistersAsLocalVariables;
 }
 
 void BuilderContext::emit_call_sharing_registers(const std::string& call, bool copyBack,

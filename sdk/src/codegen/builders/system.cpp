@@ -30,25 +30,22 @@ bool build_attn(BuilderContext& ctx) {
   return true;
 }
 
+// The barriers become REX_SYNC / REX_LWSYNC / REX_EIEIO (pch_h.inja): on x86 (strongly
+// ordered) lwsync and eieio only stop the compiler moving guest loads and stores across them,
+// but ARM64 reorders stores, so a lock released with "lwsync; stw 0" would publish the unlock
+// before the writes made under the lock without a dmb.
 bool build_sync(BuilderContext& ctx) {
-  // PPC sync is a heavyweight ordering point. Emitting a portable C++ fence
-  // is required on weakly ordered hosts such as ARM64 (and is harmless on
-  // hosts where the hardware memory model is already stronger).
-  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+  ctx.println("\tREX_SYNC();");
   return true;
 }
 
 bool build_lwsync(BuilderContext& ctx) {
-  // lwsync orders the producer/consumer traffic used by many Xenon lock-free
-  // queues. acquire-release is the closest portable C++ fence strength.
-  ctx.println("\tstd::atomic_thread_fence(std::memory_order_acq_rel);");
+  ctx.println("\tREX_LWSYNC();");
   return true;
 }
 
 bool build_eieio(BuilderContext& ctx) {
-  // Preserve ordering even when an eieio is not consumed as part of a
-  // recognized MMIO access sequence.
-  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+  ctx.println("\tREX_EIEIO();");
   return true;
 }
 

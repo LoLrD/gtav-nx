@@ -52,11 +52,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
 )
 
 # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
+if(TARGET rexglue)
 install(TARGETS rexglue
     EXPORT rexglueTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     CONFIGURATIONS Release
 )
+endif()
 
 if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
     install(TARGETS ${REXGLUE_INSTALL_FIDELITYFX_TARGETS}
@@ -137,7 +139,7 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
-if(APPLE AND REXGLUE_USE_VULKAN)
+if(APPLE AND REXGLUE_USE_VULKAN AND NOT REX_IOS)
     install(FILES "$<TARGET_FILE:Vulkan::Loader>"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}
         CONFIGURATIONS Release

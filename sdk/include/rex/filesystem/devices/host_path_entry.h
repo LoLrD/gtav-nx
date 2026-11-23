@@ -12,6 +12,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/entry.h>
@@ -72,6 +73,13 @@ class HostPathEntry : public Entry {
 
   std::filesystem::path host_path_;
   bool children_complete_ = false;
+
+  // Host listing of this directory, kept for the case-insensitive lookup in
+  // HostPathDevice::ResolvePath and reused while the directory's write time
+  // is unchanged (listing a directory on a USB/exFAT disk costs tens of ms).
+  bool scan_valid_ = false;
+  uint64_t scan_write_timestamp_ = 0;
+  std::vector<rex::filesystem::FileInfo> scan_;
 };
 
 }  // namespace rex::filesystem

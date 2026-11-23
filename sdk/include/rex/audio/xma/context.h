@@ -212,11 +212,25 @@ class XmaContext {
   static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
   static const uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
 
+  // The bitstream declares a start padding that the hardware discards. FFmpeg's
+  // xmaframes decoder parses that field and drops it on the floor
+  // (wmaprodec.c decode_frame, "start skip"), emitting the padding as ordinary
+  // output, so its sample numbering runs this far ahead of the numbering the
+  // guest's loop offsets use. Measured at 192 on every wave checked. Left
+  // uncorrected it costs each loop wrap its final 192 samples.
+  static const uint32_t kDecoderStartPadding = 192;
+  static_assert(kDecoderStartPadding < kSamplesPerFrame,
+                "start padding must fit inside one decoded frame");
+
   explicit XmaContext();
   ~XmaContext();
 
   int Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr);
   bool Work();
+  void LogState();  // xma_trace_buffers state dump
+  void WatchRegisters();  // xma_trace_buffers: log guest writes to a stream context's registers
+  void LogKick(const char* what);
+  bool FlushCarry(const XMA_CONTEXT_DATA& data);
 
   void Enable();
   bool Block(bool poll);
@@ -282,6 +296,14 @@ class XmaContext {
   std::unique_ptr<rex::thread::Event> work_completion_event_;
 
   uint32_t id_ = 0;
+
+  uint32_t traced_valid_ = 0;  // xma_trace_buffers
+  uint32_t stalled_passes_ = 0;
+  uint32_t dumped_ptr_ = 0;
+  uint32_t watched_[16] = {};
+  uint32_t watch_logs_ = 0;
+  uint32_t traced_passes_ = 0;
+  uint32_t traced_frames_ = 0;
   uint32_t guest_ptr_ = 0;
   std::mutex lock_;
   // Fork addition: silence watchdog, measurement only (see NoteProduction in xma_context.cpp).
@@ -307,6 +329,10 @@ class XmaContext {
   AVPacket* av_packet_ = nullptr;
   AVCodec* av_codec_ = nullptr;
   AVCodecContext* av_context_ = nullptr;
+  // Opened contexts of other formats (sample rate, channels): sounds switch between a few, and
+  // opening one builds its MDCT / sine window / VLC tables (PrepareDecoder).
+  std::array<AVCodecContext*, 1> spare_contexts_{};  // ~450 KB each (8 channels of output)
+  uint32_t next_spare_ = 0;
   AVFrame* av_frame_ = nullptr;
 
   // Packet data buffer (two packets worth for split frame handling)
@@ -315,6 +341,10 @@ class XmaContext {
   std::array<uint8_t, 1 + 4096> xma_frame_;
   // Conversion buffer for up to 2-channel frame
   std::array<uint8_t, kBytesPerFrameChannel * 2> raw_frame_;
+  // Freshly decoded block, before start-padding realignment
+  std::array<uint8_t, kBytesPerFrameChannel * 2> decoded_frame_;
+  // Tail of the previous decoded block, awaiting the next block's padding head
+  std::array<uint8_t, kBytesPerFrameChannel * 2> carry_frame_;
 
   // Output buffer tracking
   int32_t remaining_subframe_blocks_in_output_buffer_ = 0;
@@ -324,6 +354,12 @@ class XmaContext {
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
 
+  // Start-padding realignment state. Attributes belong to the frame whose
+  // samples are still being assembled, so they land one decode after the frame
+  // they describe.
+  bool carry_valid_ = false;
+  uint8_t pending_output_limit_ = 0;
+  uint8_t pending_start_skip_ = 0;
 };
 
 }  // namespace rex::audio

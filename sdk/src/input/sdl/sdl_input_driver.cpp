@@ -12,6 +12,8 @@
 #include <array>
 #include <filesystem>
 
+#include <atomic>
+#include <chrono>
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -669,7 +671,17 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
-  // Pump SDL events to ensure controller state is up to date.
+  // Pump SDL events to ensure controller state is up to date. Titles poll every pad several times
+  // a frame; pumping on each poll kept the UI thread busy (on Android a whole big core, mostly in
+  // SDL's joystick detection), so pump at most every 4 ms.
+  static std::atomic<int64_t> last_pump_ns{0};
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  if (now_ns - last_pump_ns.load(std::memory_order_relaxed) < 4000000) {
+    return;
+  }
+  last_pump_ns.store(now_ns, std::memory_order_relaxed);
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {

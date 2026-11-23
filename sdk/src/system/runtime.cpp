@@ -28,6 +28,8 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+REXCVAR_DEFINE_BOOL(mount_gamecache, false, "Storage",
+                    "Mount gamecache: (GTA V's streaming cache) on <user_data_root>/gamecache");
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
@@ -364,6 +366,20 @@ bool Runtime::SetupVfs() {
   if (null_device->Initialize()) {
     file_system_->RegisterDevice(std::move(null_device));
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
+  }
+
+  // --mount_gamecache: GTA V opens gamecache:\data\gta5_cache_x.dat (its streaming cache on the
+  // 360's HDD cache partition). Experiment: give it a writable host folder.
+  if (REXCVAR_GET(mount_gamecache) && !user_data_root_.empty()) {
+    auto cache_dir = std::filesystem::absolute(user_data_root_) / "gamecache";
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir / "data", ec);
+    auto cache_mount = "\\Device\\GtavGameCache";
+    auto cache_device = std::make_unique<rex::filesystem::HostPathDevice>(cache_mount, cache_dir, false);
+    if (cache_device->Initialize() && file_system_->RegisterDevice(std::move(cache_device))) {
+      file_system_->RegisterSymbolicLink("gamecache:", cache_mount);
+      REXSYS_INFO("  Mounted {} at gamecache:", cache_dir.string());
+    }
   }
 
   // NOTE: Do NOT register a device for cache: paths

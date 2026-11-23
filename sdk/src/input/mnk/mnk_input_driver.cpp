@@ -24,6 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <chrono>
+#include <iterator>
+#include <vector>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
@@ -32,33 +35,36 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
 
-REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
-REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
-REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
-REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button");
-REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger");
-REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger");
-REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder");
-REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder");
+REXCVAR_DEFINE_STRING(keybind_a, "Shift,Return", "Input/Keybinds/Controller", "A button");
+REXCVAR_DEFINE_STRING(keybind_b, "R,Backspace", "Input/Keybinds/Controller", "B button");
+REXCVAR_DEFINE_STRING(keybind_x, "Space", "Input/Keybinds/Controller", "X button");
+REXCVAR_DEFINE_STRING(keybind_y, "F", "Input/Keybinds/Controller", "Y button");
+REXCVAR_DEFINE_STRING(keybind_left_trigger, "RMB", "Input/Keybinds/Controller", "Left trigger");
+REXCVAR_DEFINE_STRING(keybind_right_trigger, "LMB", "Input/Keybinds/Controller", "Right trigger");
+REXCVAR_DEFINE_STRING(keybind_left_shoulder, "Tab", "Input/Keybinds/Controller", "Left shoulder");
+REXCVAR_DEFINE_STRING(keybind_right_shoulder, "Q", "Input/Keybinds/Controller", "Right shoulder");
 REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
 REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down");
 REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
 REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
-REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press");
-REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up");
-REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down");
-REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left");
-REXCVAR_DEFINE_STRING(keybind_rstick_right, "Right", "Input/Keybinds/Controller",
+REXCVAR_DEFINE_STRING(keybind_lstick_press, "Control", "Input/Keybinds/Controller", "Left stick press");
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "", "Input/Keybinds/Controller", "Right stick up");
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "", "Input/Keybinds/Controller", "Right stick down");
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "", "Input/Keybinds/Controller", "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_rstick_right, "", "Input/Keybinds/Controller",
                       "Right stick right");
-REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press");
-REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up");
-REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down");
-REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left");
-REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller",
+REXCVAR_DEFINE_STRING(keybind_rstick_press, "C", "Input/Keybinds/Controller", "Right stick press");
+REXCVAR_DEFINE_STRING(keybind_dpad_up, "Up", "Input/Keybinds/Controller", "D-pad up");
+REXCVAR_DEFINE_STRING(keybind_dpad_down, "Alt,Down", "Input/Keybinds/Controller", "D-pad down");
+REXCVAR_DEFINE_STRING(keybind_dpad_left, "G,Left", "Input/Keybinds/Controller", "D-pad left");
+REXCVAR_DEFINE_STRING(keybind_dpad_right, "E,Right", "Input/Keybinds/Controller",
                       "D-pad right");
-REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button");
-REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
+REXCVAR_DEFINE_STRING(keybind_back, "V", "Input/Keybinds/Controller", "Back button");
+REXCVAR_DEFINE_STRING(keybind_start, "P", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
+REXCVAR_DEFINE_BOOL(mnk_pc_layout, true, "Input",
+                    "GTA V PC keyboard/mouse layout: per-context key tables (on foot, vehicles, aircraft, "
+                    "parachute, pause menu) from the PC game's defaults; off = the keybind_* cvars");
 
 namespace rex::input::mnk {
 
@@ -73,6 +79,9 @@ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x
 // it. That is what lets the D-pad share the arrow keys. A consequence is
 // that binding a bare modifier name ("Shift") can never fire, since holding it
 // makes the live mask non-zero while the bind wants zero.
+// Unassigned virtual-key codes standing for one mouse wheel detent (PC binds "WheelUp/WheelDown").
+constexpr uint16_t kWheelUpKey = 0x0E;
+constexpr uint16_t kWheelDownKey = 0x0F;
 constexpr uint8_t kModShift = 1u << 0;
 constexpr uint8_t kModCtrl = 1u << 1;
 constexpr uint8_t kModAlt = 1u << 2;
@@ -125,10 +134,14 @@ std::string_view TrimSpaces(std::string_view s) {
 }
 
 bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
+  // A prefixed bind ("Shift+Up") needs its modifiers held; a bare one fires whatever else is held,
+  // so Shift (sprint) or Ctrl (stealth) can be held while moving and can be bound on their own.
   uint8_t want = TakeModifiers(token);
-  if (want != live_mods) {
+  if ((want & live_mods) != want) {
     return false;
   }
+  if (token == "WheelUp") return key_down[kWheelUpKey];
+  if (token == "WheelDown") return key_down[kWheelDownKey];
   rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
   if (vk == rex::ui::VirtualKey::kNone) {
     return false;
@@ -138,11 +151,103 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
 }
 
 std::atomic<bool> mouse_look_active{true};
+std::atomic<bool> vehicle_context{false};
+std::atomic<int> input_context{0};
+std::atomic<bool> frontend_active{false};
+std::mutex request_mutex;
+std::vector<int> weapon_requests;
 
 }  // namespace
 
 void SetMouseLookActive(bool active) {
   mouse_look_active.store(active, std::memory_order_relaxed);
+}
+
+void SetVehicleContext(bool in_vehicle) {
+  vehicle_context.store(in_vehicle, std::memory_order_relaxed);
+}
+
+void SetInputContext(InputContext context) {
+  input_context.store(int(context), std::memory_order_relaxed);
+  vehicle_context.store(context != InputContext::kOnFoot && context != InputContext::kParachute &&
+                            context != InputContext::kFrontend,
+                        std::memory_order_relaxed);
+}
+
+InputContext GetInputContext() {
+  if (frontend_active.load(std::memory_order_relaxed)) return InputContext::kFrontend;
+  return InputContext(input_context.load(std::memory_order_relaxed));
+}
+
+InputContext GetGameplayContext() { return InputContext(input_context.load(std::memory_order_relaxed)); }
+
+void SetFrontendActive(bool active) { frontend_active.store(active, std::memory_order_relaxed); }
+
+int TakeWeaponRequest() {
+  std::lock_guard lock(request_mutex);
+  if (weapon_requests.empty()) return 0;
+  int r = weapon_requests.front();
+  weapon_requests.erase(weapon_requests.begin());
+  return r;
+}
+
+namespace {
+void PushWeaponRequest(int r) {
+  std::lock_guard lock(request_mutex);
+  if (weapon_requests.size() < 8) weapon_requests.push_back(r);
+}
+
+using rex::input::mnk::PadOutput;
+constexpr int kOutCount = int(PadOutput::kCount);
+
+struct Bind {
+  const char* keys;
+  PadOutput out;
+};
+using O = PadOutput;
+// Fallback when the title sets no bindings: GTA V on PC's default keys per input action, as the
+// pad button the action has (docs.fivem.net/docs/game-references/controls).
+constexpr Bind kSharedDefault[] = {
+    {"V", O::kBack}, {"P,Escape", O::kStart}, {"Up,MMB", O::kDUp}, {"Alt,Z,Down", O::kDDown}, {"C", O::kR3},
+    {"Return", O::kA}, {"Backspace", O::kB}, {"Delete", O::kY}, {"Left", O::kDLeft}, {"Right", O::kDRight},
+};
+constexpr Bind kFootDefault[] = {
+    {"W", O::kLSUp}, {"S", O::kLSDown}, {"A", O::kLSLeft}, {"D", O::kLSRight}, {"Shift", O::kA},
+    {"Space", O::kX}, {"F", O::kY}, {"LMB", O::kRT}, {"RMB", O::kLT}, {"R", O::kB}, {"Q", O::kRB},
+    {"E", O::kDRight}, {"G", O::kDLeft}, {"Tab", O::kLB}, {"Control", O::kL3}, {"CapsLock", O::kBothSticks},
+    {"WheelDown", O::kWeaponNext}, {"WheelUp", O::kWeaponPrevious},
+};
+
+std::mutex binds_mutex;
+struct RuntimeBind {
+  std::string keys;
+  int out;
+};
+// Index: InputContext, then kSharedTable.
+constexpr int kSharedTable = int(rex::input::mnk::InputContext::kFrontend) + 1;
+std::vector<RuntimeBind> context_binds[kSharedTable + 1];
+bool binds_set[kSharedTable + 1] = {};
+
+std::atomic<float> mouse_scale[kSharedTable] = {};
+std::atomic<bool> mouse_invert[kSharedTable] = {};
+std::atomic<bool> mouse_options_set{false};
+}  // namespace
+
+void SetContextBindings(int table, std::vector<std::pair<std::string, PadOutput>> binds) {
+  if (table < 0 || table > kSharedTable) return;
+  std::lock_guard lock(binds_mutex);
+  auto& dst = context_binds[table];
+  dst.clear();
+  for (auto& [keys, out] : binds) dst.push_back({std::move(keys), int(out)});
+  binds_set[table] = true;
+}
+
+void SetMouseOptions(InputContext context, float scale, bool invert) {
+  const int i = int(context);
+  if (i < 0 || i >= kSharedTable) return;
+  mouse_scale[i] = scale;
+  mouse_invert[i] = invert;
+  mouse_options_set = true;
 }
 
 bool IsMouseLookActive() {
@@ -151,10 +256,56 @@ bool IsMouseLookActive() {
 
 using rex::ui::VirtualKey;
 
+namespace {
+std::atomic<MnkInputDriver*> g_driver{nullptr};
+}  // namespace
+
+void InjectKey(uint16_t virtual_key, bool down) {
+  if (auto* d = g_driver.load()) d->Inject(virtual_key, down);
+}
+void InjectMouseMotion(float dx, float dy) {
+  if (auto* d = g_driver.load()) d->InjectMotion(dx, dy);
+}
+void InjectMouseWheel(int32_t delta) {
+  if (auto* d = g_driver.load()) d->InjectWheel(delta);
+}
+void InjectFocus(bool focused) {
+  if (auto* d = g_driver.load()) d->InjectFocusState(focused);
+}
+
+void MnkInputDriver::Inject(uint16_t vk, bool down) {
+  if (!IsEnabled()) return;
+  std::lock_guard lock(state_mutex_);
+  SetKeyState(vk, down);
+}
+void MnkInputDriver::InjectMotion(float dx, float dy) {
+  if (!IsEnabled()) return;
+  std::lock_guard lock(state_mutex_);
+  mouse_dx_ += dx;
+  mouse_dy_ += dy;
+}
+void MnkInputDriver::InjectWheel(int32_t delta) {
+  if (!IsEnabled()) return;
+  std::lock_guard lock(state_mutex_);
+  wheel_accum_ += delta;
+}
+void MnkInputDriver::InjectFocusState(bool focused) {
+  has_focus_ = focused;
+  if (!focused) {
+    std::lock_guard lock(state_mutex_);
+    std::memset(key_down_, 0, sizeof(key_down_));
+    mouse_dx_ = mouse_dy_ = 0.0f;
+  }
+}
+
 MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
-    : InputDriver(window, window_z_order) {}
+    : InputDriver(window, window_z_order) {
+  g_driver = this;
+}
 
 MnkInputDriver::~MnkInputDriver() {
+  MnkInputDriver* self = this;
+  g_driver.compare_exchange_strong(self, nullptr);
   // Detach handled by OnClosing; if window outlives the driver, clean up here.
   DetachFromWindow();
 }
@@ -328,50 +479,38 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   }
 
   uint16_t buttons = 0;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_a)))
-    buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_b)))
-    buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_x)))
-    buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_y)))
-    buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_shoulder)))
-    buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_shoulder)))
-    buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_press)))
-    buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_press)))
-    buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_back)))
-    buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_start)))
-    buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_guide)))
-    buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_up)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_down)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_left)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_dpad_right)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
-
-  uint8_t lt = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(sampled_keys, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
-
+  uint8_t lt = 0, rt = 0;
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_left)))
-    lx -= INT16_MAX;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_right)))
-    lx += INT16_MAX;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_up)))
-    ly += INT16_MAX;
-  if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_lstick_down)))
-    ly -= INT16_MAX;
+  if (REXCVAR_GET(mnk_pc_layout)) {
+    MapPcLayout(&buttons, &lt, &rt, &lx, &ly);
+  } else {
+    auto pressed = [&](const std::string& bind) { return IsBindPressed(sampled_keys, bind); };
+    auto set = [&](bool on, uint16_t bit) {
+      if (on) buttons |= bit;
+    };
+    set(pressed(REXCVAR_GET(keybind_a)), X_INPUT_GAMEPAD_A);
+    set(pressed(REXCVAR_GET(keybind_b)), X_INPUT_GAMEPAD_B);
+    set(pressed(REXCVAR_GET(keybind_x)), X_INPUT_GAMEPAD_X);
+    set(pressed(REXCVAR_GET(keybind_y)), X_INPUT_GAMEPAD_Y);
+    set(pressed(REXCVAR_GET(keybind_left_shoulder)), X_INPUT_GAMEPAD_LEFT_SHOULDER);
+    set(pressed(REXCVAR_GET(keybind_right_shoulder)), X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+    set(pressed(REXCVAR_GET(keybind_lstick_press)), X_INPUT_GAMEPAD_LEFT_THUMB);
+    set(pressed(REXCVAR_GET(keybind_rstick_press)), X_INPUT_GAMEPAD_RIGHT_THUMB);
+    set(pressed(REXCVAR_GET(keybind_back)), X_INPUT_GAMEPAD_BACK);
+    set(pressed(REXCVAR_GET(keybind_start)), X_INPUT_GAMEPAD_START);
+    set(pressed(REXCVAR_GET(keybind_guide)), X_INPUT_GAMEPAD_GUIDE);
+    set(pressed(REXCVAR_GET(keybind_dpad_up)), X_INPUT_GAMEPAD_DPAD_UP);
+    set(pressed(REXCVAR_GET(keybind_dpad_down)), X_INPUT_GAMEPAD_DPAD_DOWN);
+    set(pressed(REXCVAR_GET(keybind_dpad_left)), X_INPUT_GAMEPAD_DPAD_LEFT);
+    set(pressed(REXCVAR_GET(keybind_dpad_right)), X_INPUT_GAMEPAD_DPAD_RIGHT);
+    lt = pressed(REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+    rt = pressed(REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+    if (pressed(REXCVAR_GET(keybind_lstick_left))) lx -= INT16_MAX;
+    if (pressed(REXCVAR_GET(keybind_lstick_right))) lx += INT16_MAX;
+    if (pressed(REXCVAR_GET(keybind_lstick_up))) ly += INT16_MAX;
+    if (pressed(REXCVAR_GET(keybind_lstick_down))) ly -= INT16_MAX;
+  }
 
   int32_t rx = 0;
   int32_t ry = 0;
@@ -384,11 +523,27 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (IsBindPressed(sampled_keys, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
+  ry += rs_pulse_y_;
+  rx += rs_pulse_x_;
+  rs_pulse_y_ = rs_pulse_x_ = 0;
+  if (switch_stick_x_ || switch_stick_y_) {
+    rx = switch_stick_x_, ry = switch_stick_y_;
+    mouse_dx_ = mouse_dy_ = 0.0f;
+  }
   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
     double sensitivity = REXCVAR_GET(mnk_sensitivity);
+    double invert = 1.0;
+    if (mouse_options_set) {  // the title's per-context scale and invert (PC: on foot, driving, ...)
+      const int c = int(GetInputContext());
+      if (c >= 0 && c < kSharedTable) {
+        const float scale = mouse_scale[c];
+        if (scale > 0.0f) sensitivity *= scale;
+        if (mouse_invert[c]) invert = -1.0;
+      }
+    }
     constexpr double kBaseScale = 200.0;
     rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale * invert);
   }
   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
   // mouse is off, and toggling it on would otherwise dump the whole backlog
@@ -612,6 +767,130 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   if (mouse_captured_ && !relative_mouse_mode_) {
     RecenterCursorFromUIThread(x, y);
   }
+}
+
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_)
+    return;
+  std::lock_guard lock(state_mutex_);
+  wheel_accum_ += e.scroll_y();
+}
+
+// state_mutex_ held (GetDeviceState). The PC game's key for each action in the current context,
+// as the pad button that action has on the console (tables above); the mouse wheel and the
+// number keys become what they do on PC (weapon selection by the title, zoom, scrolling).
+// state_mutex_ held (GetDeviceState). The title's bindings for the current context (key -> pad
+// output of the same game action) plus the shared ones; the mouse wheel is two keys (WheelUp,
+// WheelDown) held for one poll per detent. Outputs past the pad's are actions the title performs
+// (weapon selection) or short presses (vehicle weapon, scrolling) and character switches.
+void MnkInputDriver::MapPcLayout(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int32_t* lx, int32_t* ly) {
+  using Clock = std::chrono::steady_clock;
+  const auto now = Clock::now();
+  const InputContext context = GetInputContext();
+
+  // One wheel detent per poll, as the WheelUp / WheelDown pseudo keys.
+  constexpr int32_t kDetent = int32_t(rex::ui::MouseEvent::kScrollPerDetent);  // unsigned in ui_event.h
+  key_down_[kWheelUpKey] = key_down_[kWheelDownKey] = false;
+  if (wheel_accum_ >= kDetent) {
+    wheel_accum_ -= kDetent;
+    key_down_[kWheelUpKey] = true;
+  } else if (wheel_accum_ <= -kDetent) {
+    wheel_accum_ += kDetent;
+    key_down_[kWheelDownKey] = true;
+  }
+  const bool wheel = key_down_[kWheelUpKey] || key_down_[kWheelDownKey];
+
+  bool out[kOutCount] = {};
+  int table_index = int(context);
+  {
+    std::lock_guard lock(binds_mutex);
+    auto apply_runtime = [&](int t) {
+      for (const auto& b : context_binds[t])
+        if (IsBindPressed(key_down_, b.keys)) out[b.out] = true;
+    };
+    auto apply_default = [&](const Bind* table, size_t count) {
+      for (size_t i = 0; i < count; ++i)
+        if (IsBindPressed(key_down_, table[i].keys)) out[int(table[i].out)] = true;
+    };
+    if (binds_set[table_index]) apply_runtime(table_index);
+    else if (context == InputContext::kOnFoot) apply_default(kFootDefault, std::size(kFootDefault));
+    if (context != InputContext::kFrontend) {
+      if (binds_set[kSharedTable]) apply_runtime(kSharedTable);
+      else apply_default(kSharedDefault, std::size(kSharedDefault));
+    }
+  }
+
+  // PC behaviour of the wheel beyond the plain bindings: in the open weapon wheel it steps through
+  // the slot (pad: D-pad), while aiming it zooms the scope (pad: left stick).
+  if (wheel && context == InputContext::kOnFoot) {
+    const bool up = key_down_[kWheelUpKey];
+    if (out[int(O::kLB)]) {
+      out[int(O::kWeaponNext)] = out[int(O::kWeaponPrevious)] = false;
+      pulse_until_[int(up ? O::kDLeft : O::kDRight)] = now + std::chrono::milliseconds(80);
+    } else if (out[int(O::kLT)]) {
+      out[int(O::kWeaponNext)] = out[int(O::kWeaponPrevious)] = false;
+      pulse_until_[int(up ? O::kLSUp : O::kLSDown)] = now + std::chrono::milliseconds(80);
+    }
+  }
+
+  // Edge-triggered outputs: on the press only.
+  auto pressed_now = [&](O o) {
+    const int i = int(o);
+    const bool fire = out[i] && !special_down_[i];
+    special_down_[i] = out[i];
+    return fire;
+  };
+  if (pressed_now(O::kWeaponNext)) PushWeaponRequest(kWeaponNext);
+  if (pressed_now(O::kWeaponPrevious)) PushWeaponRequest(kWeaponPrevious);
+  for (int k = 0; k < 9; ++k)
+    if (pressed_now(O(int(O::kWeaponUnarmed) + k))) PushWeaponRequest(k + 1);
+  if (pressed_now(O::kVehicleWeaponNext)) pulse_until_[int(O::kX)] = now + std::chrono::milliseconds(80);
+  if (pressed_now(O::kAircraftWeaponNext)) pulse_until_[int(O::kDLeft)] = now + std::chrono::milliseconds(80);
+  if (pressed_now(O::kScrollUp)) rs_pulse_y_ += INT16_MAX;
+  if (pressed_now(O::kScrollDown)) rs_pulse_y_ -= INT16_MAX;
+  for (int k = 0; k < 3; ++k)
+    if (pressed_now(O(int(O::kSwitchMichael) + k)) && switch_start_ == decltype(switch_start_){}) {
+      switch_target_ = k;
+      switch_start_ = now;
+    }
+  for (int i = 0; i < kOutCount; ++i)
+    if (pulse_until_[i] > now) out[i] = true;
+
+  // The console's switch: hold D-pad down (character wheel), push the right stick at the character
+  // (Michael left, Franklin up, Trevor right), let go.
+  if (switch_start_ != decltype(switch_start_){}) {
+    const auto t = now - switch_start_;
+    if (t < std::chrono::milliseconds(300)) {
+      out[int(O::kDDown)] = true;
+    } else if (t < std::chrono::milliseconds(600)) {
+      out[int(O::kDDown)] = true;
+      switch_stick_x_ = switch_target_ == 0 ? -INT16_MAX : switch_target_ == 2 ? INT16_MAX : 0;
+      switch_stick_y_ = switch_target_ == 1 ? INT16_MAX : 0;
+    } else if (t < std::chrono::milliseconds(700)) {
+      switch_stick_x_ = switch_stick_y_ = 0;  // released
+    } else {
+      switch_start_ = {};
+    }
+  }
+
+  const uint16_t bits[] = {X_INPUT_GAMEPAD_A, X_INPUT_GAMEPAD_B, X_INPUT_GAMEPAD_X, X_INPUT_GAMEPAD_Y,
+                           X_INPUT_GAMEPAD_LEFT_SHOULDER, X_INPUT_GAMEPAD_RIGHT_SHOULDER,
+                           X_INPUT_GAMEPAD_LEFT_THUMB, X_INPUT_GAMEPAD_RIGHT_THUMB, X_INPUT_GAMEPAD_BACK,
+                           X_INPUT_GAMEPAD_START, X_INPUT_GAMEPAD_DPAD_UP, X_INPUT_GAMEPAD_DPAD_DOWN,
+                           X_INPUT_GAMEPAD_DPAD_LEFT, X_INPUT_GAMEPAD_DPAD_RIGHT};
+  for (int i = int(O::kA); i <= int(O::kDRight); ++i)
+    if (out[i]) *buttons |= bits[i];
+  if (out[int(O::kBothSticks)]) *buttons |= X_INPUT_GAMEPAD_LEFT_THUMB | X_INPUT_GAMEPAD_RIGHT_THUMB;
+  *lt = out[int(O::kLT)] ? 0xFF : 0;
+  *rt = out[int(O::kRT)] ? 0xFF : 0;
+  if (out[int(O::kLSLeft)]) *lx -= INT16_MAX;
+  if (out[int(O::kLSRight)]) *lx += INT16_MAX;
+  if (out[int(O::kLSUp)]) *ly += INT16_MAX;
+  if (out[int(O::kLSDown)]) *ly -= INT16_MAX;
+  if (out[int(O::kRSUp)]) rs_pulse_y_ += INT16_MAX;
+  if (out[int(O::kRSDown)]) rs_pulse_y_ -= INT16_MAX;
+  if (out[int(O::kRSLeft)]) rs_pulse_x_ -= INT16_MAX;
+  if (out[int(O::kRSRight)]) rs_pulse_x_ += INT16_MAX;
 }
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {

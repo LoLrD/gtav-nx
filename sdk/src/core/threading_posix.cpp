@@ -54,11 +54,12 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/thread/timer_queue.h>
 
 #include <sched.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+#include <string>
 
 #if REX_PLATFORM_ANDROID
-#include <dlfcn.h>
-
-#include <rex/main_android.h>
 #include <rex/string.h>
 #endif
 
@@ -90,30 +91,14 @@ REXCVAR_DEFINE_INT32(thread_multiwait_safety_ms, 20, "Threading",
 namespace rex::thread {
 
 #if REX_PLATFORM_ANDROID
-// May be null if no dynamically loaded functions are required.
-static void* android_libc_;
-// API 26+.
-static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
+// The port targets API 30+, where Bionic has pthread_getname_np (API 26+), so the pre-26 name
+// fallback below is never taken.
+static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf,
+                                          size_t n) = pthread_getname_np;
 
-void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
-    android_libc_ = dlopen("libc.so", RTLD_NOW);
-    assert_not_null(android_libc_);
-    if (android_libc_) {
-      android_pthread_getname_np_ = reinterpret_cast<decltype(android_pthread_getname_np_)>(
-          dlsym(android_libc_, "pthread_getname_np"));
-      assert_not_null(android_pthread_getname_np_);
-    }
-  }
-}
+void AndroidInitialize() {}
 
-void AndroidShutdown() {
-  android_pthread_getname_np_ = nullptr;
-  if (android_libc_) {
-    dlclose(android_libc_);
-    android_libc_ = nullptr;
-  }
-}
+void AndroidShutdown() {}
 #endif
 
 template <typename _Rep, typename _Period>
@@ -306,7 +291,7 @@ struct WakePoint {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
     // Use robust mutexes so waits can recover if owner thread terminates.
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr) == 0) {
@@ -385,7 +370,7 @@ class PosixConditionBase {
         std::this_thread::sleep_for(std::min(remaining, std::chrono::microseconds(100)));
       }
     }
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
@@ -487,7 +472,7 @@ class PosixConditionBase {
       bool all_locked = true;
 
       for (size_t i = 0; i < count; ++i) {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
         int result = pthread_mutex_trylock(native_mutex);
         if (result == 0 || result == EOWNERDEAD) {
@@ -1853,6 +1838,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   }
 #endif
   set_current_thread_name("");
+#if defined(__APPLE__)
+  // Without a QoS class the scheduler may run guest threads on the efficiency cores (a process
+  // started from a shell in the background has no app to inherit one from). REX_THREAD_QOS=0: off.
+  {
+    static const bool qos = !getenv("REX_THREAD_QOS") || std::string(getenv("REX_THREAD_QOS")) != "0";
+    if (qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+  }
+#endif
+#if REX_PLATFORM_ANDROID
+  // Same problem on phones (big.LITTLE): the scheduler kept the title's threads on the little
+  // cores, about 3x slower for recompiled code. Keep them on the upper half of the CPU numbers
+  // (the mid and prime clusters). Opt in with REX_THREAD_BIG_CORES=1: with ~20 title threads on
+  // four cores the renderer competed for them (not yet measured on a cool phone).
+  {
+    static const bool big = getenv("REX_THREAD_BIG_CORES") && std::string(getenv("REX_THREAD_BIG_CORES")) == "1";
+    int n = int(sysconf(_SC_NPROCESSORS_CONF));
+    if (big && n >= 4) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      for (int i = n / 2; i < n; i++) CPU_SET(i, &set);
+      sched_setaffinity(0, sizeof(set), &set);
+    }
+  }
+#endif
 
   auto start_data = static_cast<ThreadStartData*>(parameter);
   assert_not_null(start_data);

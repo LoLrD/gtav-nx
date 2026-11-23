@@ -12,6 +12,14 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
+#include <rex/ppc/context.h>
+#include <chrono>
+#include <filesystem>
+#include <thread>
+
+REXCVAR_DECLARE(bool, xma_trace_buffers);
+REXCVAR_DECLARE(bool, xma_persistent_enable);
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -174,6 +182,16 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
     worker_thread_->thread()->set_priority(15);
   }
 #endif
+
+  if (REXCVAR_GET(xma_trace_buffers)) {
+    // Register watcher: what the game writes to stream contexts between kicks.
+    std::thread([this]() {
+      while (worker_running_) {
+        for (uint32_t n = 0; n < kContextCount; n++) contexts_[n].WatchRegisters();
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+      }
+    }).detach();
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -349,6 +367,18 @@ void XmaDecoder::WorkerThreadMain() {
       }
     }
 
+    // xma_trace_buffers: <xma_state_file> appearing dumps every allocated context's registers.
+    if (REXCVAR_GET(xma_trace_buffers)) {
+      static auto next = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() >= next) {
+        next = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        std::error_code ec;
+        if (std::filesystem::exists("/tmp/xma_state_request", ec)) {
+          std::filesystem::remove("/tmp/xma_state_request", ec);
+          for (uint32_t n = 0; n < kContextCount; n++) contexts_[n].LogState();
+        }
+      }
+    }
     if (paused_) {
       pause_fence_.Signal();
       resume_fence_.Wait();
@@ -357,8 +387,13 @@ void XmaDecoder::WorkerThreadMain() {
     if (did_work) {
       continue;
     }
-    // No work done this iteration, block until signaled.
-    rex::thread::Wait(work_event_.get(), false);
+    // No work done this iteration, block until signaled. With persistent enables the game can
+    // refill an enabled context without a kick: look again every few ms.
+    if (REXCVAR_GET(xma_persistent_enable)) {
+      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(4));
+    } else {
+      rex::thread::Wait(work_event_.get(), false);
+    }
   }
 }
 
@@ -488,6 +523,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+        if (REXCVAR_GET(xma_trace_buffers)) {
+          context.WatchRegisters();
+          const auto* ts = runtime::ThreadState::Get(); const PPCContext* ppc = ts ? ts->context() : nullptr;
+          context.LogKick(fmt::format("kick from lr {:08X}", ppc ? uint32_t(ppc->lr) : 0).c_str());
+        }
         context.Enable();
       }
     }
@@ -532,9 +572,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         if (worker_mode != 0) {
           g_measurement_xma.contexts_backup.fetch_add(1, std::memory_order_relaxed);
         }
-        if (context.Work()) {
-          context.SignalWorkDone();
-        }
+        context.Work();
+        context.SignalWorkDone();  // a kick always completes (Work may report no progress)
       }
     }
     // Measurement only: how much decoding right here costs the thread requesting the kick.
@@ -562,6 +601,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         ++lock_contexts;
+        if (REXCVAR_GET(xma_trace_buffers)) {
+          context.WatchRegisters();
+          const auto* ts = runtime::ThreadState::Get(); const PPCContext* ppc = ts ? ts->context() : nullptr;
+          context.LogKick(fmt::format("lock (disable) from lr {:08X}", ppc ? uint32_t(ppc->lr) : 0).c_str());
+        }
         context.Disable();
         // [XMA fix] Added Block(false) after Disable(). Without this, the game
         // could call XMADisableContext and start modifying the context struct
@@ -588,6 +632,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         XmaContext& context = contexts_[context_id];
+        if (REXCVAR_GET(xma_trace_buffers)) context.LogKick("clear");
         context.Clear();
       }
     }

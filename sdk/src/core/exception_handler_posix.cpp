@@ -28,6 +28,11 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_ANDROID
+#include <dlfcn.h>
+#include <unistd.h>
+#include <cstdio>
+#endif
 
 #include <ucontext.h>
 
@@ -225,6 +230,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
         access_violation_operation = (mcontext_esr->esr & (UINT64_C(1) << 6))
                                          ? Exception::AccessViolationOperation::kWrite
                                          : Exception::AccessViolationOperation::kRead;
+      } else if ((mcontext_esr && ((mcontext_esr->esr >> 26) & 0b111110) == 0b100000) ||
+                 reinterpret_cast<uint64_t>(signal_info->si_addr) == mcontext.pc) {
+        // Instruction abort (a jump to an unmapped address, e.g. a null function pointer):
+        // there is no instruction to decode, and reading it here would fault again inside the
+        // handler, which the kernel answers by killing the process without any report.
+        access_violation_operation = Exception::AccessViolationOperation::kUnknown;
       } else {
         // Determine the memory access direction based on which instruction has
         // requested it.
@@ -416,6 +427,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
 #endif  // REX_ARCH
       return;
     }
+  }
+#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
+  // Under ART the restored handler is not debuggerd's, so no tombstone is written: report the
+  // fault (pc, lr and a frame-pointer walk as module+offset) on stderr first.
+  {
+    auto print_frame = [](const char* tag, uint64_t pc) {
+      Dl_info info{};
+      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
+        fprintf(stderr, "  %s %016llx %s+0x%llx %s\n", tag, (unsigned long long)pc, info.dli_fname,
+                (unsigned long long)(pc - uint64_t(info.dli_fbase)), info.dli_sname ? info.dli_sname : "");
+      } else {
+        fprintf(stderr, "  %s %016llx ?\n", tag, (unsigned long long)pc);
+      }
+    };
+    fprintf(stderr, "unhandled signal %d at %p (thread %d)\n", signal_number, signal_info->si_addr,
+            int(gettid()));
+    print_frame("pc", thread_context.pc);
+    print_frame("lr", thread_context.x[30]);
+    uint64_t fp = thread_context.x[29];
+    for (int i = 0; i < 32 && fp && (fp & 7) == 0; i++) {
+      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
+      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
+      if (!ret) break;
+      print_frame("fp", ret);
+      if (next <= fp) break;
+      fp = next;
+    }
+    fflush(stderr);
+  }
+#endif
+  // No handler claimed the fault: returning would re-run the faulting instruction forever (a
+  // silent spin, as seen in a Vulkan driver on Android). Put the previous handler back so the
+  // re-executed fault reaches it (the system crash reporter / debuggerd tombstone).
+  switch (signal_number) {
+    case SIGILL:
+      sigaction(SIGILL, &original_sigill_handler_, nullptr);
+      break;
+    case SIGSEGV:
+      sigaction(SIGSEGV, &original_sigsegv_handler_, nullptr);
+      break;
+#if REX_PLATFORM_MAC
+    case SIGBUS:
+      sigaction(SIGBUS, &original_sigbus_handler_, nullptr);
+      break;
+#endif
+    default:
+      break;
   }
 }
 
