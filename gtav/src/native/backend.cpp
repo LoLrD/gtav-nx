@@ -1650,7 +1650,12 @@ struct Backend::Impl {
   PipelineCompiler pipeline_compiler;
   PipelineWarmer pipeline_warmer;
   std::unordered_map<uint64_t, RenderTarget> targets;
+  // Direct-mapped memos in front of `targets` and `shaders` (a few lookups per draw): `targets` never
+  // erases, and `shaders` keeps its non-null entries.
+  std::array<std::pair<uint64_t, RenderTarget*>, 16> target_memo{};
+  std::array<std::pair<uint64_t, RenderShader*>, 64> shader_memo{};
   std::unordered_set<uint64_t> depth_formats_seen;  // diagnostic log of depth target variants
+  uint64_t last_depth_seen = ~0ull;
   RenderCommandList* grow_list = nullptr;  // the frame's command list (Target copies grown targets on it)
   uint32_t grow_logged_ = 0;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers;
@@ -2784,10 +2789,16 @@ struct Backend::Impl {
     if (!hash) return nullptr;
     const bool tile_override = pixel && TileOverride(hash);
     uint64_t key = hash ^ (pixel ? 1ull << 63 : 0) ^ (tile_override ? 1ull << 62 : 0);
+    auto& memo = shader_memo[(key ^ key >> 29) & (shader_memo.size() - 1)];
+    if (memo.first == key && memo.second) return memo.second;
     auto it = shaders.find(key);
     if (it != shaders.end()) {
+      if (it->second) {
+        memo = {key, it->second.get()};
+        return memo.second;
+      }
       // A miss is retried once the background compiler produced something new.
-      if (it->second || shader_generation == CompileGeneration()) return it->second.get();
+      if (shader_generation == CompileGeneration()) return nullptr;
       uint64_t gen = CompileGeneration();
       for (auto i = shaders.begin(); i != shaders.end();) i = i->second ? std::next(i) : shaders.erase(i);
       shader_generation = gen;
@@ -2870,13 +2881,18 @@ struct Backend::Impl {
     // they share a target; keyed apart, a pass naming the other format tested an empty depth buffer.
     if (depth) {
       uint64_t seen = uint64_t(base) | uint64_t(format) << 12 | uint64_t(pitch) << 17 | uint64_t(msaa) << 31;
-      if (depth_formats_seen.insert(seen).second && depth_formats_seen.size() <= 40)
-        REXLOG_INFO("[native] depth target base {:03X} pitch {} msaa {} float24 {}", base, pitch, msaa, format);
+      if (seen != last_depth_seen) {
+        last_depth_seen = seen;
+        if (depth_formats_seen.insert(seen).second && depth_formats_seen.size() <= 40)
+          REXLOG_INFO("[native] depth target base {:03X} pitch {} msaa {} float24 {}", base, pitch, msaa, format);
+      }
       format = 0;
     }
     uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(depth) << 16 | uint64_t(pitch) << 17 |
                    uint64_t(msaa) << 31;
-    auto& t = targets[key];
+    auto& memo = target_memo[(key ^ key >> 12 ^ key >> 17) & (target_memo.size() - 1)];
+    if (memo.first != key || !memo.second) memo = {key, &targets[key]};
+    auto& t = *memo.second;
     if (t.texture && t.height >= height) return &t;
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
     // tiling (EDRAM holds only a tile of them), but D3D-level draws arrive once for the whole
@@ -3832,6 +3848,7 @@ struct Backend::Impl {
     uint32_t cur = 0;
     UploadAllocation gpu{};
     bool valid = false;
+    bool records[2] = {true, true};  // cpu[i] past the slots and words may hold fetch records (else zeros)
   };
 
   // Big-endian 16- or 32-bit indices to host order, 16 bytes at a time.
@@ -5188,11 +5205,15 @@ struct Backend::Impl {
     const bool const_reuse = REXCVAR_GET(gtav_native_const_reuse);
     const bool same_shared = const_reuse && rc.last_shared.valid && !rec.indirect && rc.shared_slots == rec.slots &&
                              std::memcmp(rc.shared_words, rec.words, sizeof(rec.words)) == 0;
-    uint8_t* shared_cpu = rc.last_shared.cpu[rc.last_shared.cur ^ 1];
+    const uint32_t building = rc.last_shared.cur ^ 1;
+    uint8_t* shared_cpu = rc.last_shared.cpu[building];
     if (!same_shared) {
       std::memcpy(shared_cpu, rec.slots, 192 * 4);
       std::memcpy(shared_cpu + 128 * 4, rec.words, sizeof(rec.words));
-      std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
+      if (rc.last_shared.records[building]) {
+        std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
+        rc.last_shared.records[building] = false;
+      }
     }
     rc.prof.Mark(rc.prof.consts);
 
@@ -5293,6 +5314,7 @@ struct Backend::Impl {
     // Vertex shaders that fetch by a computed index read the guest streams as they are (raw,
     // still big-endian): one record per declared element, see vfetchIndirect in shader_common.h.
     if (rec.indirect) {
+      rc.last_shared.records[building] = true;
       uint64_t raw[kMaxStreams];
       std::memcpy(raw, rec.raw, sizeof(raw));
       for (uint32_t n = 0; n < d.element_count; n++) {
@@ -5338,8 +5360,9 @@ struct Backend::Impl {
     if (same_shared) {
       shared = rc.last_shared.gpu;
     } else {
+      const bool records = rc.last_shared.records[0] || rc.last_shared.records[1];
       if (const_reuse && rc.last_shared.valid &&
-          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, kSharedConstantsSize) == 0) {
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0) {
         shared = rc.last_shared.gpu;
       } else {
         shared = ContextUpload(rc, kSharedConstantsSize);
