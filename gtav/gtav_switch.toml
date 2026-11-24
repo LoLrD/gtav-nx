@@ -20,6 +20,3 @@ gtav_light_shadows = false
 gtav_procobj = false
 gtav_distant_cars = false
 gtav_audio_reverb = false
-gtav_switch_cpu_mhz = 1785
-gtav_switch_gpu_mhz = 614
-gtav_switch_mem_mhz = 1600
