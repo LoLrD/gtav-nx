@@ -99,6 +99,14 @@ REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
                     "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
                     "frame was recorded (the game may reuse that memory from then on)");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_release, false, "GTAV",
+                    "The game sees a GPU fence only once the renderer recorded every draw issued before it (no copies "
+                    "and no command processor waits); draw data is copied only when the game blocks on a fence of the "
+                    "frame it is still building");
+REXCVAR_DEFINE_INT32(gtav_native_fence_release_stall_ms, 250, "GTAV",
+                     "With --gtav_native_fence_release: held GPU fences are released anyway (copying the draw data) "
+                     "once the command processor idled this long without the renderer releasing any (a game thread "
+                     "may be polling one)");
 REXCVAR_DEFINE_BOOL(gtav_native_check_draw_data, false, "GTAV",
                     "Hash every draw's vertex and index data at capture and again at record time, and log how "
                     "many draws the game rewrote in between (diagnostic; costs ~40% of both threads)");
@@ -127,10 +135,17 @@ BoundState g_bound;  // the game renders from one thread; revisit if that change
 // Set*ShaderConstantF overwrites the register again.
 struct InlineConstants {
   uint8_t data[2][256][16];
-  bool valid[2][256];
-  bool any = false;
+  uint64_t valid[2][4] = {};
   // The pending load: its data is written by the caller after 83813580 returns.
   uint32_t pending_ptr = 0, pending_bank = 0, pending_start = 0, pending_count = 0;
+  bool Valid(uint32_t bank, uint32_t r) const { return (valid[bank][r >> 6] >> (r & 63)) & 1; }
+  bool Any(uint32_t bank) const { return (valid[bank][0] | valid[bank][1] | valid[bank][2] | valid[bank][3]) != 0; }
+  void Invalidate(uint32_t bank, uint32_t first, uint32_t end) {
+    for (uint32_t w = first >> 6; w < 4 && (w << 6) < end; w++) {
+      uint32_t lo = std::max(first, w << 6) - (w << 6), hi = std::min(end, (w + 1) << 6) - (w << 6);
+      valid[bank][w] &= ~(hi - lo == 64 ? ~0ull : ((1ull << (hi - lo)) - 1) << lo);
+    }
+  }
 };
 InlineConstants g_inline_consts;
 
@@ -139,10 +154,10 @@ void FlushInlineConstants() {
   if (!c.pending_ptr) return;
   const uint8_t* src = REX_KERNEL_MEMORY()->TranslateVirtual(c.pending_ptr);
   for (uint32_t i = 0; i < c.pending_count && c.pending_start + i < 256; i++) {
-    std::memcpy(c.data[c.pending_bank][c.pending_start + i], src + 16 * i, 16);
-    c.valid[c.pending_bank][c.pending_start + i] = true;
+    const uint32_t r = c.pending_start + i;
+    std::memcpy(c.data[c.pending_bank][r], src + 16 * i, 16);
+    c.valid[c.pending_bank][r >> 6] |= 1ull << (r & 63);
   }
-  c.any = true;
   c.pending_ptr = 0;
 }
 FramePacket g_packet;
@@ -212,17 +227,18 @@ void OnInlineConstants(uint32_t bank, uint32_t start, uint32_t count, uint32_t d
 void OnSetConstants(uint32_t bank, uint32_t start, uint32_t count) {
   FlushInlineConstants();
   auto& c = g_inline_consts;
-  if (!c.any || bank > 1) return;
-  for (uint32_t i = start; i < start + count && i < 256; i++) c.valid[bank][i] = false;
+  if (bank > 1 || start >= 256 || !c.Any(bank)) return;
+  c.Invalidate(bank, start, std::min(start + count, 256u));
 }
 
 void OnFlushConstants(uint32_t bank, uint64_t dirty_mask) {
   FlushInlineConstants();
   auto& c = g_inline_consts;
-  if (!c.any || bank > 1) return;
-  for (uint32_t group = 0; group < 64; group++)
-    if (dirty_mask & (1ull << (63 - group)))
-      for (uint32_t r = 4 * group; r < 4 * group + 4; r++) c.valid[bank][r] = false;
+  if (bank > 1) return;
+  for (uint64_t m = dirty_mask; m; m &= m - 1) {
+    const uint32_t group = 63 - uint32_t(__builtin_ctzll(m));
+    c.valid[bank][group >> 4] &= ~(0xFull << ((group & 15) * 4));
+  }
 }
 
 void OnSetVertexShader(uint32_t, uint32_t shader) { g_bound.vertex_shader = shader; }
@@ -494,7 +510,30 @@ static struct {
   double wait_ms = 0;
 } g_copy_stats;
 
+// --gtav_native_fence_release state. g_release_limit: the newest fence value the renderer allows (every draw
+// issued before it was recorded, or copied by an emergency release); the game sees min(limit, the command
+// processor's newest fence).
+static std::atomic<bool> g_release_started{false};  // the renderer recorded its first draw
+static std::atomic<uint32_t> g_release_limit{0};
+static std::atomic<uint32_t> g_fence_seen{0}, g_fence_shown{0};  // newest fence the CP reached / the game sees
+static std::atomic<uint32_t> g_last_end_fence{0};  // end_fence of the last frame handed to the renderer
+static std::atomic<int> g_urgent_waiters{0};
+static std::mutex g_emergency_mutex;
+enum ReleaseCause { kReleaseWaiter, kReleaseStall, kReleaseCauses };
+static struct {
+  std::atomic<uint64_t> stores{0}, emergencies[kReleaseCauses]{};
+  std::atomic<uint32_t> longest_hold_ms{0};
+} g_release_stats;
+
+static bool ReleaseMode() {
+  static const bool on = REXCVAR_GET(gtav_native_fence_release) && REXCVAR_GET(gtav_native_fence_copy) &&
+                         REXCVAR_GET(gtav_native) != "off";
+  return on;
+}
+static bool FenceWaitMode() { return REXCVAR_GET(gtav_native_fence_wait) || ReleaseMode(); }
+
 static void FenceReached(uint32_t value) {
+  std::lock_guard serial(g_emergency_mutex);
   std::unique_lock lock(g_copy_mutex);
   DrainIncomingCopies();
   while (!g_pending_copies.empty() && int32_t(value - g_pending_copies.front().fence) >= 0) {
@@ -510,7 +549,7 @@ static void FenceReached(uint32_t value) {
     // Being recorded: a draw reads its guest data (vertices, indices, textures) when it is recorded,
     // so only a draw the renderer has not reached yet must wait, and only until it is reached.
     // (Waiting for the whole frame stalled the GPU, and with it the game, for ~10 ms a time.)
-    if (p.frame == g_recording && !REXCVAR_GET(gtav_native_fence_wait)) {
+    if (p.frame == g_recording && !FenceWaitMode()) {
       if (g_recorded_draws.load(std::memory_order_acquire) > p.draw) {
         g_pending_copies.pop_front();
         continue;
@@ -531,7 +570,7 @@ static void FenceReached(uint32_t value) {
       if (!reached) break;
       continue;  // re-evaluate the front: it may have been recorded and popped meanwhile
     }
-    if (REXCVAR_GET(gtav_native_fence_wait) && REXCVAR_GET(gtav_native_fence_wait_draw) &&
+    if (FenceWaitMode() && REXCVAR_GET(gtav_native_fence_wait_draw) &&
         p.frame < g_frame.load(std::memory_order_relaxed)) {
       // Until this draw is recorded (it read its vertices, indices and textures then), not until
       // its whole frame is: the later draws' fences hold the game off their memory meanwhile.
@@ -563,8 +602,7 @@ static void FenceReached(uint32_t value) {
       if (recorded()) g_pending_copies.pop_front();
       continue;  // a finished frame's entries are popped at the top
     }
-    if (p.frame == g_recording ||
-        (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {
+    if (p.frame == g_recording || (FenceWaitMode() && p.frame < g_frame.load(std::memory_order_relaxed))) {
       uint64_t frame = p.frame;
       auto start = std::chrono::steady_clock::now();
       g_copy_stats.waits++;
@@ -684,6 +722,13 @@ void FenceCopiesRecorded(uint64_t frame) {
                   st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
                   g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
       st = {};
+      if (ReleaseMode()) {
+        auto& rs = g_release_stats;
+        REXLOG_INFO("[native] fence release per 300 frames: {} stores by the renderer, emergency releases {} for a "
+                    "blocked game thread and {} after a stall, longest hold {} ms",
+                    rs.stores.exchange(0), rs.emergencies[kReleaseWaiter].exchange(0),
+                    rs.emergencies[kReleaseStall].exchange(0), rs.longest_hold_ms.exchange(0));
+      }
     }
   }
   g_copy_cv.notify_all();
@@ -701,11 +746,12 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     uint8_t vs[256 * 16];
     std::memcpy(vs, Guest(device) + d3d::kDevVsConstants, sizeof(vs));
     for (uint32_t i = 0; i < 256; i++)
-      if (g_inline_consts.valid[0][i]) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
+      if (g_inline_consts.Valid(0, i)) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
     pm4scan::OnDraw(WritePointer(device), ShaderHash(g_bound.vertex_shader), vs);
   }
   const uint8_t* dev = Guest(device);
-  DrawCommand d;
+  const uint32_t index = uint32_t(g_packet.draws.size());
+  DrawCommand& d = g_packet.draws.emplace_back();
   d.indexed = indexed;
   d.primitive = primitive;
   d.base_vertex = base_vertex;
@@ -716,9 +762,10 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // way, so the hooked value was a depth pass's null shader and they came out depth-only.
   uint32_t vertex_shader = be32(dev + d3d::kDevVertexShader), pixel_shader = be32(dev + d3d::kDevPixelShader);
   if (!vertex_shader) vertex_shader = g_bound.vertex_shader;
-  d.vs_hash = ShaderHash(vertex_shader);
-  d.ps_hash = ShaderHash(pixel_shader);
-  d.ps_ucode_hash = ShaderUcodeHash(pixel_shader);
+  const ShaderInfo vs_info = ShaderLookup(vertex_shader), ps_info = ShaderLookup(pixel_shader);
+  d.vs_hash = vs_info.hash;
+  d.ps_hash = ps_info.hash;
+  d.ps_ucode_hash = ps_info.ucode_hash;
   d.regs = g_packet.Push(dev + kRegShadowBegin, kRegShadowSize);
   {
     // RB_MODECONTROL in the device shadow lags: D3D derives it while flushing the draw, after this
@@ -735,7 +782,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
   // block instead (the replay then skips the byte swap and texture lookups by offset). Compared
   // before copying: pushing 10 KB a draw and taking it back cost ~8% of the game thread.
-  const DrawCommand* prev = g_packet.draws.empty() ? nullptr : &g_packet.draws.back();
+  const DrawCommand* prev = index ? &g_packet.draws[index - 1] : nullptr;
   // Blocks keep their full size (the renderer reads them by offset), but only the registers the
   // shaders read are copied and compared (the rest of a block is undefined).
   auto push_or_share = [](const uint8_t* src, uint32_t size, const uint32_t* previous, int kind) {
@@ -750,11 +797,11 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   auto push_constants = [&](uint32_t bank, const uint8_t* shadow, const ConstantUse& use, const uint32_t* previous) {
     const uint8_t* src = shadow;
     alignas(16) uint8_t patched[kAluSize];
-    if (g_inline_consts.any) {
+    if (g_inline_consts.Any(bank)) {
       for (const auto& run : use.runs) std::memcpy(patched + 16 * run.first, shadow + 16 * run.first, 16 * run.count);
       for (const auto& run : use.runs)
         for (uint32_t i = run.first; i < uint32_t(run.first + run.count); i++)
-          if (g_inline_consts.valid[bank][i]) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
+          if (g_inline_consts.Valid(bank, i)) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
       src = patched;
     }
     uint32_t bytes = 0;
@@ -776,9 +823,9 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     for (const auto& run : use.runs) std::memcpy(dst + 16 * run.first, src + 16 * run.first, 16 * run.count);
     return at;
   };
-  const ConstantUse& vs_use = ShaderConstants(vertex_shader);
+  const ConstantUse& vs_use = *vs_info.consts;
   static const ConstantUse kNoConstants{0, {}, 0};
-  const ConstantUse& ps_use = pixel_shader ? ShaderConstants(pixel_shader) : kNoConstants;
+  const ConstantUse& ps_use = pixel_shader ? *ps_info.consts : kNoConstants;
   d.vs_const_count = uint16_t(vs_use.count);
   d.ps_const_count = uint16_t(ps_use.count);
   d.vs_use = &vs_use;
@@ -824,21 +871,21 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
+  d.fence = be32(dev + kDevFence);
   if (REXCVAR_GET(gtav_native_check_draw_data))
     d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
   if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
     SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
   } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {
     if (uint32_t done = be32(dev + kDevFenceDone)) g_fence_address = GuestPhysical(done);
-    PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
+    PendingCopy p{GuestFrame(), index, d.fence, d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
     std::lock_guard lock(g_incoming_mutex);
     g_incoming_copies.push_back(p);
   }
-  g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
-  g_packet.draws.push_back(d);
-  return &g_packet.draws.back();
+  g_packet.commands.push_back({CommandKind::kDraw, index, WritePointer(device)});
+  return &d;
 }
 
 // BeginVertices(dev, primitive, vertex count, stride) returns where the CPU writes the vertices
@@ -1203,13 +1250,17 @@ void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_a
     RecordedBuffer& b = BufferFor(begin, end);
     g_buffer_stats.recorded += TakeRecorded(begin, end, b.packet);
     if (b.packet.commands.empty()) g_buffer_stats.empty++;
-    for (const auto& c : b.packet.commands) CopyCommand(g_packet, b.packet, c, 0);
+    const uint32_t fence = be32(Guest(device) + kDevFence);
+    for (const auto& c : b.packet.commands) {
+      CopyCommand(g_packet, b.packet, c, 0);
+      if (c.kind == CommandKind::kDraw) g_packet.draws.back().fence = fence;
+    }
     g_buffer_stats.replayed += uint32_t(b.packet.commands.size());
     at += 8;
   }
 }
 
-void OnCaptureSwap(uint32_t front_buffer) {
+void OnCaptureSwap(uint32_t device, uint32_t front_buffer) {
   linux_threads::Note(linux_threads::kD3D);
   FlushIndexedVertices();
   // Commands recorded this frame into known buffers that did not run yet: they run later.
@@ -1256,6 +1307,8 @@ void OnCaptureSwap(uint32_t front_buffer) {
   if (!Active()) return;
   g_packet.index = frame;
   g_packet.front_buffer = front_buffer;
+  g_packet.end_fence = device ? be32(Guest(device) + kDevFence) : 0;
+  if (device) g_last_end_fence.store(g_packet.end_fence, std::memory_order_release);
   if (REXCVAR_GET(gtav_native) == "on") NoteGuestSwap(frame);
   {
     static size_t max_bytes = 0, max_draws = 0, max_inline = 0;
@@ -1300,14 +1353,112 @@ static void StoreFence(uint32_t address, uint32_t value, uint32_t endian) {
   std::memcpy(REX_KERNEL_MEMORY()->TranslatePhysical(address), &value, 4);
 }
 
+static bool Releasing() { return ReleaseMode() && g_release_started.load(); }
+
+// --gtav_native_fence_release, g_fence_mutex held: shows the game the newest fence the renderer allows.
+static std::chrono::steady_clock::time_point g_hold_since;  // start of the current wait for the renderer
+static bool g_holding = false;
+static void StoreReleasedLocked() {
+  const uint32_t address = g_fence_address.load(std::memory_order_relaxed);
+  if (!g_fence_any || !address) return;
+  const uint32_t limit = g_release_limit.load();
+  const uint32_t shown = int32_t(g_fence_latest - limit) > 0 ? limit : g_fence_latest;
+  const auto now = std::chrono::steady_clock::now();
+  if (int32_t(shown - g_fence_written) > 0) {
+    if (g_holding) {
+      const uint32_t held = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hold_since).count());
+      for (uint32_t longest = g_release_stats.longest_hold_ms.load(std::memory_order_relaxed);
+           held > longest && !g_release_stats.longest_hold_ms.compare_exchange_weak(longest, held);) {
+      }
+    }
+    g_fence_written = shown;
+    g_fence_shown.store(shown);
+    StoreFence(address & 0x1FFFFFFF, shown, g_fence_endian);
+    g_hold_since = now;
+  }
+  const bool holding = g_fence_written != g_fence_latest;
+  if (holding && !g_holding) g_hold_since = now;
+  g_holding = holding;
+}
+
+static void RaiseLimit(uint32_t value) {
+  for (uint32_t limit = g_release_limit.load(); int32_t(value - limit) > 0 &&
+                                                  !g_release_limit.compare_exchange_weak(limit, value);) {
+  }
+}
+
+// The game may need a fence the renderer cannot release yet (it was issued in the frame still being built):
+// copies the draw data the way --gtav_native_fence_wait does (waiting for frames already handed over) and lets
+// the game see everything the command processor reached.
+static void Emergency(uint32_t target, ReleaseCause cause) {
+  FenceReached(target);
+  RaiseLimit(target);
+  g_release_stats.emergencies[cause]++;
+}
+
+void FenceReleaseBefore(uint32_t fence) {
+  if (!ReleaseMode() || !fence) return;
+  const bool first = !g_release_started.load(std::memory_order_relaxed) && !g_release_started.exchange(true);
+  const uint32_t limit = fence - 2;  // the fence issued last before it (the kick adds 2)
+  RaiseLimit(limit);
+  const uint32_t shown = g_fence_shown.load(), seen = g_fence_seen.load();
+  if (int32_t(seen - shown) <= 0 || int32_t(limit - shown) <= 0) return;
+  // (The first time the command processor may still be in a --gtav_native_fence_wait wait under the lock.)
+  std::unique_lock lock(g_fence_mutex, std::defer_lock);
+  if (!first) lock.lock();
+  else if (!lock.try_lock()) return;
+  g_release_stats.stores++;
+  StoreReleasedLocked();
+}
+
+bool FenceWaitBegin(uint32_t fence) {
+  if (!Releasing() || int32_t(fence - g_last_end_fence.load()) < 0) return false;
+  g_urgent_waiters.fetch_add(1);
+  if (const uint32_t seen = g_fence_seen.load(); int32_t(seen - g_fence_shown.load()) > 0) {
+    Emergency(seen, kReleaseWaiter);
+    std::lock_guard lock(g_fence_mutex);
+    StoreReleasedLocked();
+  }
+  return true;
+}
+
+void FenceWaitEnd(bool urgent) {
+  if (urgent) g_urgent_waiters.fetch_sub(1);
+}
+
+// Command processor idle: shows what the renderer released meanwhile; a game thread blocked on a fence of the
+// frame being built, or no release for --gtav_native_fence_release_stall_ms, gets an emergency release.
+static void ReleaseIdle() {
+  uint32_t target;
+  bool stalled;
+  {
+    std::lock_guard lock(g_fence_mutex);
+    StoreReleasedLocked();
+    if (!g_holding) return;
+    target = g_fence_latest;
+    stalled = std::chrono::steady_clock::now() - g_hold_since >
+              std::chrono::milliseconds(std::max(1, REXCVAR_GET(gtav_native_fence_release_stall_ms)));
+  }
+  if (g_urgent_waiters.load() > 0) Emergency(target, kReleaseWaiter);
+  else if (stalled) Emergency(target, kReleaseStall);
+  else return;
+  std::lock_guard lock(g_fence_mutex);
+  StoreReleasedLocked();
+}
+
 // Releases every held-back fence (command processor thread: idle, or before its swap).
 void FenceFlush() {
   std::lock_guard lock(g_fence_mutex);
+  if (Releasing()) {
+    StoreReleasedLocked();
+    return;
+  }
   uint32_t address = g_fence_address.load(std::memory_order_relaxed);
   if (!g_fence_any || !address || g_fence_written == g_fence_latest) return;
   g_fence_written = g_fence_latest;
   FenceReached(g_fence_written);
   StoreFence(address & 0x1FFFFFFF, g_fence_written, g_fence_endian);
+  g_fence_shown.store(g_fence_written);
 }
 }  // namespace gtav::native
 
@@ -1324,12 +1475,35 @@ extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, 
   std::lock_guard lock(g_fence_mutex);
   g_fence_latest = value;
   g_fence_endian = endian;
+  g_fence_seen.store(value);
   uint32_t lag = uint32_t(std::max(0, REXCVAR_GET(gtav_native_fence_lag))) * 2;  // the kick adds 2
   uint32_t target = value - lag;
   if (!g_fence_any || int32_t(target - g_fence_written) > 0) g_fence_written = target;
   g_fence_any = true;
   FenceReached(g_fence_written);
+  g_fence_shown.store(g_fence_written);
   return g_fence_written;
 }
 
-extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_idle() { gtav::native::FenceFlush(); }
+// --gtav_native_fence_release: the command processor's EVENT_WRITE_SHD of the game's fence, written here (under
+// the lock the render thread's releases take) as min(value, what the renderer allows).
+extern "C" GTAV_HOOK_EXPORT bool rex_skip_rendering_fence_store(uint32_t address, uint32_t value, uint32_t endian) {
+  using namespace gtav::native;
+  if (!Releasing()) return false;
+  gtav::linux_threads::Note(gtav::linux_threads::kCommandProcessor);
+  const uint32_t fence = g_fence_address.load(std::memory_order_relaxed);
+  if (!fence || (address & 0x1FFFFFFF) != (fence & 0x1FFFFFFF)) return false;
+  g_fence_seen.store(value);
+  if (g_urgent_waiters.load() > 0) Emergency(value, kReleaseWaiter);
+  std::lock_guard lock(g_fence_mutex);
+  g_fence_latest = value;
+  g_fence_endian = endian;
+  g_fence_any = true;
+  StoreReleasedLocked();
+  return true;
+}
+
+extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_idle() {
+  if (gtav::native::Releasing()) gtav::native::ReleaseIdle();
+  else gtav::native::FenceFlush();
+}

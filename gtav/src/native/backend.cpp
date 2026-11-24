@@ -94,6 +94,9 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 30, "GTAV",
 #endif
 REXCVAR_DEFINE_INT32(gtav_native_texture_sample_frames, GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT, "GTAV",
                      "Frames between the sampled checks of a large cached texture (1: every frame it is used)");
+REXCVAR_DEFINE_INT32(gtav_native_texture_stable_frames, 1, "GTAV",
+                     "Frames between the checks of a cached texture whose guest bytes never changed in its last 8 "
+                     "checks (1: every frame it is used; one change makes it checked every frame for good)");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
@@ -1458,6 +1461,8 @@ struct CachedTexture {
   uint32_t pre_words[6] = {};
   bool failed = false;
   bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
+  bool unstable = false;  // its guest bytes changed after the first upload
+  uint8_t unchanged = 0;  // checks in a row that found the guest bytes unchanged (saturates)
 };
 
 struct CachedBuffer {
@@ -1650,7 +1655,12 @@ struct Backend::Impl {
   PipelineCompiler pipeline_compiler;
   PipelineWarmer pipeline_warmer;
   std::unordered_map<uint64_t, RenderTarget> targets;
+  // Direct-mapped memos in front of `targets` and `shaders` (a few lookups per draw): `targets` never
+  // erases, and `shaders` keeps its non-null entries.
+  std::array<std::pair<uint64_t, RenderTarget*>, 16> target_memo{};
+  std::array<std::pair<uint64_t, RenderShader*>, 64> shader_memo{};
   std::unordered_set<uint64_t> depth_formats_seen;  // diagnostic log of depth target variants
+  uint64_t last_depth_seen = ~0ull;
   RenderCommandList* grow_list = nullptr;  // the frame's command list (Target copies grown targets on it)
   uint32_t grow_logged_ = 0;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers;
@@ -2784,10 +2794,16 @@ struct Backend::Impl {
     if (!hash) return nullptr;
     const bool tile_override = pixel && TileOverride(hash);
     uint64_t key = hash ^ (pixel ? 1ull << 63 : 0) ^ (tile_override ? 1ull << 62 : 0);
+    auto& memo = shader_memo[(key ^ key >> 29) & (shader_memo.size() - 1)];
+    if (memo.first == key && memo.second) return memo.second;
     auto it = shaders.find(key);
     if (it != shaders.end()) {
+      if (it->second) {
+        memo = {key, it->second.get()};
+        return memo.second;
+      }
       // A miss is retried once the background compiler produced something new.
-      if (it->second || shader_generation == CompileGeneration()) return it->second.get();
+      if (shader_generation == CompileGeneration()) return nullptr;
       uint64_t gen = CompileGeneration();
       for (auto i = shaders.begin(); i != shaders.end();) i = i->second ? std::next(i) : shaders.erase(i);
       shader_generation = gen;
@@ -2870,13 +2886,18 @@ struct Backend::Impl {
     // they share a target; keyed apart, a pass naming the other format tested an empty depth buffer.
     if (depth) {
       uint64_t seen = uint64_t(base) | uint64_t(format) << 12 | uint64_t(pitch) << 17 | uint64_t(msaa) << 31;
-      if (depth_formats_seen.insert(seen).second && depth_formats_seen.size() <= 40)
-        REXLOG_INFO("[native] depth target base {:03X} pitch {} msaa {} float24 {}", base, pitch, msaa, format);
+      if (seen != last_depth_seen) {
+        last_depth_seen = seen;
+        if (depth_formats_seen.insert(seen).second && depth_formats_seen.size() <= 40)
+          REXLOG_INFO("[native] depth target base {:03X} pitch {} msaa {} float24 {}", base, pitch, msaa, format);
+      }
       format = 0;
     }
     uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(depth) << 16 | uint64_t(pitch) << 17 |
                    uint64_t(msaa) << 31;
-    auto& t = targets[key];
+    auto& memo = target_memo[(key ^ key >> 12 ^ key >> 17) & (target_memo.size() - 1)];
+    if (memo.first != key || !memo.second) memo = {key, &targets[key]};
+    auto& t = *memo.second;
     if (t.texture && t.height >= height) return &t;
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
     // tiling (EDRAM holds only a tile of them), but D3D-level draws arrive once for the whole
@@ -3002,6 +3023,15 @@ struct Backend::Impl {
     if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_sample_frames)));
         every > 1 && t.texture && t.bytes > kSmallTexture && t.sample_frame != ~0ull && frame - t.sample_frame < every)
       return t.descriptor;
+    // Stable textures (no change in their last kStableChecks checks): checked every N frames.
+    constexpr uint8_t kStableChecks = 8;
+    if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_stable_frames)));
+        every > 1 && t.texture && !t.unstable && t.unchanged >= kStableChecks &&
+        frame - std::max(t.checked_frame, t.sample_frame == ~0ull ? 0 : t.sample_frame) < every) {
+      tprof.stable++;
+      return t.descriptor;
+    }
+    auto unchanged = [&t] { t.unchanged = uint8_t(std::min<uint32_t>(t.unchanged + 1u, 255u)); };
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
@@ -3022,6 +3052,7 @@ struct Backend::Impl {
       tprof.sampled++;
       if (HashGuestTexture(words, true) == t.sampled_hash) {
         t.sample_frame = frame;
+        unchanged();
         return t.descriptor;
       }
     }
@@ -3059,8 +3090,10 @@ struct Backend::Impl {
     t.sample_frame = frame;
     if (t.texture && raw && raw == t.raw_hash) {
       t.checked_frame = frame;
+      unchanged();
       return t.descriptor;
     }
+    if (t.texture) t.unstable = true, t.unchanged = 0;
     ScopedMs timer{t_texture};
     DecodedTexture dec;
     if (!DecodeGuestTexture(words, &dec)) {
@@ -3691,7 +3724,7 @@ struct Backend::Impl {
   DrawProfile prof, prof_sum;
   uint64_t conv_bytes[4] = {}, conv_draws[4] = {};  // vertices converted: rect lists, inline, snapshots, rebuilt buffers
   struct TextureProfile {
-    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0;
+    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0, stable = 0;
     double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
   } tprof;
   // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
@@ -3815,6 +3848,7 @@ struct Backend::Impl {
   uint64_t stat_pipeline_binds = 0;  // vkCmdBindPipeline calls (5% of the render thread in the driver, 11-15)
   uint32_t prof_frames = 0;
   uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
+  uint64_t hashed_bytes[2] = {};
 
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
   // The capture shares a block between consecutive draws with equal constants (same offset).
@@ -3832,6 +3866,7 @@ struct Backend::Impl {
     uint32_t cur = 0;
     UploadAllocation gpu{};
     bool valid = false;
+    bool records[2] = {true, true};  // cpu[i] past the slots and words may hold fetch records (else zeros)
   };
 
   // Big-endian 16- or 32-bit indices to host order, 16 bytes at a time.
@@ -3986,6 +4021,7 @@ struct Backend::Impl {
     uint64_t snap_hits = 0, snap_misses = 0, rect_hits = 0, rect_misses = 0;
     uint64_t prehash_hits = 0, prehash_late = 0, prehash_misses = 0;
     uint64_t watched_buffers = 0, watch_missed = 0, watch_late = 0;
+    uint64_t hashed_bytes[2] = {};  // guest vertex/index bytes hashed: buffers, fence-copied snapshots
     void BeginFrame(bool profile) {
       draw_state = DrawState{};
       last_vs.valid = last_ps.valid = false;  // upload memory is per frame
@@ -4948,9 +4984,12 @@ struct Backend::Impl {
     // watch epoch alone: only a full hash makes the copy current.)
     constexpr uint64_t kSmallBuffer = 64 << 10;
     if (b.buffer && guest_size > kSmallBuffer && b.size == host_size && frame - b.full_frame < 8 &&
-        !REXCVAR_GET(gtav_native_exact_cache) && SampledHash(guest, guest_size) == b.sampled) {
-      b.checked_frame.store(frame, std::memory_order_release);
-      return b.buffer.get();
+        !REXCVAR_GET(gtav_native_exact_cache)) {
+      rc.hashed_bytes[0] += 16 * 256;
+      if (SampledHash(guest, guest_size) == b.sampled) {
+        b.checked_frame.store(frame, std::memory_order_release);
+        return b.buffer.get();
+      }
     }
     if (watching) {  // before reading: a write from now on is seen
       b.watch.ranges[0] = physical, b.watch.ranges[1] = uint32_t(guest_size);
@@ -4969,6 +5008,7 @@ struct Backend::Impl {
       rc.prehash_misses += prehash_on;
     }
     content = pre ? pre->raw : Hash(guest, guest_size);
+    if (!pre) rc.hashed_bytes[0] += guest_size;
     if (prehash_on && guest_size <= kSmallBuffer) rc.prehash_next.push_back({key, guest, guest_size, {}});
     b.full_frame = frame;
     if (guest_size > kSmallBuffer) b.sampled = SampledHash(guest, guest_size);
@@ -5188,11 +5228,15 @@ struct Backend::Impl {
     const bool const_reuse = REXCVAR_GET(gtav_native_const_reuse);
     const bool same_shared = const_reuse && rc.last_shared.valid && !rec.indirect && rc.shared_slots == rec.slots &&
                              std::memcmp(rc.shared_words, rec.words, sizeof(rec.words)) == 0;
-    uint8_t* shared_cpu = rc.last_shared.cpu[rc.last_shared.cur ^ 1];
+    const uint32_t building = rc.last_shared.cur ^ 1;
+    uint8_t* shared_cpu = rc.last_shared.cpu[building];
     if (!same_shared) {
       std::memcpy(shared_cpu, rec.slots, 192 * 4);
       std::memcpy(shared_cpu + 128 * 4, rec.words, sizeof(rec.words));
-      std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
+      if (rc.last_shared.records[building]) {
+        std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
+        rc.last_shared.records[building] = false;
+      }
     }
     rc.prof.Mark(rc.prof.consts);
 
@@ -5249,6 +5293,7 @@ struct Backend::Impl {
         const uint64_t bytes = uint64_t(vertices) * stride, host = uint64_t(vertices) * host_stride;
         const uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
         const uint64_t skey = Hash(guest, bytes, key ^ (host << 20));
+        rc.hashed_bytes[1] += bytes;
         SnapEntry* entry;
         {
           std::lock_guard lock(snap_mutex);
@@ -5293,6 +5338,7 @@ struct Backend::Impl {
     // Vertex shaders that fetch by a computed index read the guest streams as they are (raw,
     // still big-endian): one record per declared element, see vfetchIndirect in shader_common.h.
     if (rec.indirect) {
+      rc.last_shared.records[building] = true;
       uint64_t raw[kMaxStreams];
       std::memcpy(raw, rec.raw, sizeof(raw));
       for (uint32_t n = 0; n < d.element_count; n++) {
@@ -5338,8 +5384,9 @@ struct Backend::Impl {
     if (same_shared) {
       shared = rc.last_shared.gpu;
     } else {
+      const bool records = rc.last_shared.records[0] || rc.last_shared.records[1];
       if (const_reuse && rc.last_shared.valid &&
-          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, kSharedConstantsSize) == 0) {
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0) {
         shared = rc.last_shared.gpu;
       } else {
         shared = ContextUpload(rc, kSharedConstantsSize);
@@ -5462,6 +5509,8 @@ struct Backend::Impl {
     rect_hits += rc.rect_hits, rect_misses += rc.rect_misses;
     prehash_hits += rc.prehash_hits, prehash_late += rc.prehash_late, prehash_misses += rc.prehash_misses;
     tstats_watched_buffers += rc.watched_buffers, watch_missed += rc.watch_missed, watch_late += rc.watch_late;
+    hashed_bytes[0] += rc.hashed_bytes[0], hashed_bytes[1] += rc.hashed_bytes[1];
+    rc.hashed_bytes[0] = rc.hashed_bytes[1] = 0;
     buffer_bytes_total += rc.buffer_bytes;
     snap_bytes_total += rc.snap_bytes;
     for (auto& b : rc.dead_buffers) dead_buffers.push_back(std::move(b));
@@ -6647,6 +6696,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
         if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
         s.cur_draw = c.index;
+        if (!s.stream && !s.dumping && !s.take_notes) FenceReleaseBefore(f.draws[c.index].fence);
         s.Draw(list, f, f.draws[c.index]);
         s.cur_draw = c.index + 1;
         s.pass_draws++;
@@ -6720,6 +6770,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   s.conv_draws[2] / n, s.conv_bytes[3] / n / 1024, s.conv_draws[3] / n);
       REXLOG_INFO("[native]   snapshots per frame: {:.1f} from the cache, {:.1f} converted ({} cached, {:.1f} MB)",
                   s.snap_hits / n, s.snap_misses / n, s.snap_cache.size(), s.snap_bytes_total / 1048576.0);
+      REXLOG_INFO("[native]   vertex and index bytes hashed per frame: {:.0f} KB of buffers, {:.0f} KB of snapshots",
+                  s.hashed_bytes[0] / n / 1024, s.hashed_bytes[1] / n / 1024);
+      s.hashed_bytes[0] = s.hashed_bytes[1] = 0;
       s.snap_hits = s.snap_misses = 0;
       REXLOG_INFO("[native]   rect lists per frame: {:.1f} from the cache, {:.1f} expanded ({} sites cached)",
                   s.rect_hits / n, s.rect_misses / n, s.rect_cache.size());
@@ -6742,9 +6795,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_fetch_resolves = 0;
       auto& t = s.tprof;
       REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
-                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms)",
+                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms), {:.0f} stable ones not checked",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
-                  t.full_bytes / n / 1048576.0, t.full_ms / n);
+                  t.full_bytes / n / 1048576.0, t.full_ms / n, t.stable / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
                   "{:.0f} pipeline binds",
                   t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);

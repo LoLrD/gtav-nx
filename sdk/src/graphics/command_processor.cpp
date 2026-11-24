@@ -101,10 +101,12 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 // processor has been idle for 2 ms, rex_skip_rendering_idle lets it release what it held back
 // (the game is probably waiting for it).
 using SkipRenderingFenceHook = uint32_t (*)(uint32_t address, uint32_t value, uint32_t endian);
+using SkipRenderingFenceStoreHook = bool (*)(uint32_t address, uint32_t value, uint32_t endian);
 using SkipRenderingIdleHook = void (*)();
 #if defined(__SWITCH__)
 extern "C" __attribute__((weak)) void rex_skip_rendering_idle();
 extern "C" __attribute__((weak)) uint32_t rex_skip_rendering_fence(uint32_t address, uint32_t value, uint32_t endian);
+extern "C" __attribute__((weak)) bool rex_skip_rendering_fence_store(uint32_t address, uint32_t value, uint32_t endian);
 extern "C" __attribute__((weak)) int rex_skip_rendering_gpu_waiters();
 #endif
 static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
@@ -114,6 +116,19 @@ static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
   return &rex_skip_rendering_idle;
 #else
   return reinterpret_cast<SkipRenderingIdleHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_idle"));
+#endif
+}
+// rex_skip_rendering_fence_store, when the title exports it, may take over an EVENT_WRITE_SHD whole (returns true
+// after writing the fence itself): the title's renderer also writes that fence from its own thread, and both
+// stores have to be ordered under one lock.
+static SkipRenderingFenceStoreHook ResolveSkipRenderingFenceStoreHook() {
+#ifdef _WIN32
+  return reinterpret_cast<SkipRenderingFenceStoreHook>(
+      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_fence_store"));
+#elif defined(__SWITCH__)
+  return &rex_skip_rendering_fence_store;
+#else
+  return reinterpret_cast<SkipRenderingFenceStoreHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_fence_store"));
 #endif
 }
 static SkipRenderingFenceHook ResolveSkipRenderingFenceHook() {
@@ -160,6 +175,9 @@ REXCVAR_DEFINE_INT32(gpu_idle_spins, GPU_IDLE_SPINS_DEFAULT, "GPU",
                      "~70% of a core on a phone at 500)");
 REXCVAR_DEFINE_INT32(gpu_skip_rendering_lag_ms, 0, "GPU",
                      "Command processor latency behind the CPU's kicks (title-side renderer)");
+REXCVAR_DEFINE_BOOL(gpu_skip_rendering_unread_registers, true, "GPU",
+                    "With gpu_skip_rendering: drop shader constant writes (registers 0x4000 and up, read only by "
+                    "a host renderer) and store context register ranges without per-register handling");
 static std::mutex g_kick_mutex;
 static std::deque<std::pair<uint32_t, std::chrono::steady_clock::time_point>> g_kicks;
 
@@ -304,6 +322,7 @@ void CommandProcessor::WorkerThreadMain() {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  skip_unread_registers_ = REXCVAR_GET(gpu_skip_rendering) && REXCVAR_GET(gpu_skip_rendering_unread_registers);
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -344,10 +363,10 @@ void CommandProcessor::WorkerThreadMain() {
       auto idle_start = std::chrono::steady_clock::now();
       bool idle_reported = false;
       do {
-        if (idle_hook && !idle_reported &&
-            std::chrono::steady_clock::now() - idle_start >= std::chrono::milliseconds(2)) {
+        if (idle_hook && std::chrono::steady_clock::now() - idle_start >= std::chrono::milliseconds(2)) {
           idle_hook();
           idle_reported = true;
+          idle_start = std::chrono::steady_clock::now();
         }
 #if REX_PLATFORM_SWITCH
         // UpdateWritePointer and CallInThread signal the event. Leave the CPU free
@@ -658,7 +677,21 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
   if (!num_registers) {
     return;
   }
+  if (skip_unread_registers_ && base >= XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    ring->AdvanceRead(size_t(num_registers) * sizeof(uint32_t));
+    return;
+  }
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
+  if (skip_unread_registers_ && base >= 0x2000 && base + num_registers <= RegisterFile::kRegisterCount) {
+    uint32_t* values = register_file_->values + base;
+    uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
+    memory::copy_and_swap(values, reinterpret_cast<const uint32_t*>(range.first), first_count);
+    if (range.second_length != 0)
+      memory::copy_and_swap(values + first_count, reinterpret_cast<const uint32_t*>(range.second),
+                            range.second_length / sizeof(uint32_t));
+    ring->EndRead(range);
+    return;
+  }
   if (range.first_length != 0) {
     uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
     WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
@@ -699,21 +732,25 @@ void CommandProcessor::WriteREGISTERSRangeFromRing(memory::RingBuffer* ring, uin
 
 void CommandProcessor::WriteALURangeFromMem(uint32_t start_index, uint32_t* base,
                                             uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4000, base, num_registers);
 }
 
 void CommandProcessor::WriteFetchRangeFromMem(uint32_t start_index, uint32_t* base,
                                               uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4800, base, num_registers);
 }
 
 void CommandProcessor::WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4900, base, num_registers);
 }
 
 void CommandProcessor::WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4908, base, num_registers);
 }
 
@@ -1421,6 +1458,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
+  static const SkipRenderingFenceStoreHook store_hook = ResolveSkipRenderingFenceStoreHook();
+  if (store_hook && store_hook(address, data_value, uint32_t(endianness))) return true;
   static const SkipRenderingFenceHook fence_hook = ResolveSkipRenderingFenceHook();
   if (fence_hook) data_value = fence_hook(address, data_value, uint32_t(endianness));
   data_value = GpuSwap(data_value, endianness);

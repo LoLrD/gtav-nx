@@ -26,6 +26,13 @@ struct ConstantUse {
 };
 const ConstantUse& ShaderConstants(uint32_t guest_object);
 
+// Everything above for one shader object, from a single lookup.
+struct ShaderInfo {
+  uint64_t hash = 0, ucode_hash = 0;
+  const ConstantUse* consts = nullptr;
+};
+ShaderInfo ShaderLookup(uint32_t guest_object);
+
 // Container hash of a created shader with this microcode hash, or 0 (diagnostics).
 uint64_t ContainerForUcode(uint64_t ucode_hash);
 

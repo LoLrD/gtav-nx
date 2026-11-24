@@ -37,10 +37,13 @@ FrameStats g_frame;  // touched only by the swapping thread
 
 }  // namespace
 
-bool StatsEnabled() { return REXCVAR_GET(gtav_native_stats); }
+bool StatsEnabled() {
+  static const bool enabled = REXCVAR_GET(gtav_native_stats);
+  return enabled;
+}
 
 void StatCount(StatCounter c) {
-  if (StatsEnabled()) g_counts[c].fetch_add(1, std::memory_order_relaxed);
+  if (StatsEnabled()) g_counts[c].store(g_counts[c].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void StatsSwap(Clock::time_point begin, Clock::time_point end, uint32_t device) {

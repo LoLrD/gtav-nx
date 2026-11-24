@@ -71,6 +71,7 @@ struct DrawCommand {
   uint32_t snap_first = 0, snap_vertices = 0;  // vertices [snap_first, snap_first + snap_vertices)
   uint32_t snap_stream[kMaxStreams] = {};
   uint32_t snap_index = 0, snap_index_size = 0;
+  uint32_t fence = 0;  // the device's next GPU fence value when the draw was issued (or its command buffer ran)
 };
 
 // Hash of the exact guest bytes a draw reads (its index slice and the vertex range those indices
@@ -199,6 +200,7 @@ struct FramePacket {
   ByteArena fence_arena;
   static constexpr uint32_t kFenceBit = 0x80000000u;
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
+  uint32_t end_fence = 0;  // the device's next GPU fence value at Swap: every fence below it was issued in the frame
 
   uint32_t Push(const void* data, uint32_t size) {
     uint32_t at = uint32_t(arena.size());
@@ -216,6 +218,7 @@ struct FramePacket {
     arena.clear();
     fence_arena.clear();
     front_buffer = 0;
+    end_fence = 0;
   }
   const uint8_t* At(uint32_t offset) const {
     return offset & kFenceBit ? fence_arena.data() + (offset & ~kFenceBit) : arena.data() + offset;

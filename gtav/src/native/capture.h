@@ -50,7 +50,7 @@ enum class QueryOverride { kOriginal, kReady, kNotReady };
 QueryOverride OverrideQueryResult(uint32_t query, uint32_t* samples);
 
 // Guest frame boundary (before the guest's Swap runs): hands the frame to the renderer.
-void OnCaptureSwap(uint32_t front_buffer);
+void OnCaptureSwap(uint32_t device, uint32_t front_buffer);
 uint64_t GuestFrame();
 // Render thread, before recording frame f: moves the fence-time copies of its draws into it.
 struct FramePacket;
@@ -62,5 +62,14 @@ void FenceCopiesRecorded(uint64_t frame);
 void DrawsRecorded(uint32_t count);
 // Command processor thread: releases the GPU fence values held back (before its swap).
 void FenceFlush();
+
+// --gtav_native_fence_release: the game sees a GPU fence only once the renderer read the guest data of every draw
+// issued before it. Render thread: every draw issued before `fence` (a DrawCommand's or a frame's end_fence) has
+// been recorded.
+void FenceReleaseBefore(uint32_t fence);
+// A game thread starts or ends blocking on GPU fence `fence` (D3D 8380CEF8). Urgent (true) when the renderer cannot
+// release it by itself: it was issued in the frame the game is still building.
+bool FenceWaitBegin(uint32_t fence);
+void FenceWaitEnd(bool urgent);
 
 }  // namespace gtav::native
