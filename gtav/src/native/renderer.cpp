@@ -1630,7 +1630,9 @@ class Renderer {
     // Hitch log: a present more than 25 ms after the previous one (50 ms on phones, where 30 fps
     // frames are 33 ms: every frame was a "hitch" and the log grew by megabytes a minute), with what
     // this frame cost.
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#if defined(__SWITCH__)
+    constexpr double kHitchMs = 150.0;
+#elif defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     constexpr double kHitchMs = 50.0;
 #else
     constexpr double kHitchMs = 25.0;
