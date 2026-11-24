@@ -205,6 +205,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore_strips, false, "GTAV",
+                    "Native renderer: skip every draw of the depth restore vertex shader, whatever its pixel shader "
+                    "(TU27 draws the strips with pixel shader 7AFFD9F0F46AECFC and a null one, which the check above "
+                    "misses: 24 render passes a frame)");
 #if GTAV_MOBILE
 #define GTAV_DRAW_CLEARS_DEFAULT false  // vkCmdClearAttachments can become a load op (gtav_native_load_clears)
 #else
@@ -4661,8 +4665,9 @@ struct Backend::Impl {
     // colour targets alias the depth surface (bases 000, 020, ... with depth at the base before).
     // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
     // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
-    if (d.ps_hash == 0xF1490AFF1455E54Full && d.vs_hash == 0x5A4385B7FE6CD154ull &&
-        REXCVAR_GET(gtav_native_skip_depth_restore))
+    if (d.vs_hash == 0x5A4385B7FE6CD154ull &&
+        ((d.ps_hash == 0xF1490AFF1455E54Full && REXCVAR_GET(gtav_native_skip_depth_restore)) ||
+         REXCVAR_GET(gtav_native_skip_depth_restore_strips)))
       return false;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
