@@ -23,6 +23,8 @@ constexpr uint32_t kFetchSize = 32 * 6 * 4;
 constexpr uint32_t kAluSize = 256 * 16;
 constexpr uint32_t kMaxVertexElements = 16;
 constexpr uint32_t kMaxStreams = 4;
+constexpr uint32_t kWritebackMaxTexels = 128 * 128;
+constexpr uint32_t kWritebackPage = 4096;
 
 struct VertexElement {  // D3DVERTEXELEMENT9 as the XDK stores it (host-endian copy)
   uint16_t stream, offset;
@@ -139,6 +141,7 @@ struct ResolveCommand {
   uint32_t dest_level = 0, dest_face = 0;  // mip level and cube face / array slice
   uint32_t dest_words[13] = {};  // dest texture object header + fetch constant (layout check)
   bool light_fill = false;
+  uint32_t dest_bytes = 0, dest_epoch = 0, dest_pages = 0;
 };
 
 // D3D occlusion query Issue(BEGIN / END). The native renderer counts the samples the draws between
@@ -164,6 +167,7 @@ inline std::atomic<uint64_t> g_arena_grows{0}, g_arena_grow_bytes{0};  // stats:
 // Largest capacity any arena reached: a new arena starts there instead of doubling up from 4 MB
 // (each growth copied tens of MB in the open world: a hitch whenever a new packet was made).
 inline std::atomic<size_t> g_arena_peak{0};
+inline std::atomic<uint32_t> g_writeback_epoch{0};
 
 class ByteArena {
  public:

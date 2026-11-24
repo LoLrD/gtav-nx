@@ -6217,15 +6217,73 @@ struct Backend::Impl {
   // written in their guest layout into a host-visible buffer and copied into guest memory once
   // the frame's fence passed (FrameComplete), a frame later than the hardware would.
   static constexpr uint64_t kWritebackSize = 8ull << 20;
-  static constexpr uint32_t kWritebackMaxTexels = 128 * 128;
   std::unique_ptr<RenderBuffer> writeback_buffer;
   uint64_t writeback_gpu = 0, writeback_used = 0;
   struct Writeback {
     uint32_t address;
     uint64_t offset, size;
+    uint32_t dest_bytes = 0, dest_epoch = 0, first_page = 0;
   };
   std::vector<Writeback> writebacks;
+  std::vector<uint64_t> writeback_pages;
   bool writeback_resolves = false;  // set from --gtav_native=on in Init
+  struct WrittenPage {
+    uint32_t epoch;
+    uint64_t hash;
+  };
+  std::unordered_map<uint32_t, WrittenPage> written_pages;
+  std::vector<uint8_t> writeback_keep;
+  uint64_t writebacks_dropped = 0;
+
+  void NoteResolveDest(Writeback& w, const FramePacket& f, const ResolveCommand& rc) {
+    w.dest_bytes = rc.dest_bytes;
+    w.dest_epoch = rc.dest_epoch;
+    w.first_page = uint32_t(writeback_pages.size());
+    const uint32_t pages = (rc.dest_bytes + kWritebackPage - 1) / kWritebackPage;
+    writeback_pages.resize(w.first_page + pages);
+    if (pages) std::memcpy(writeback_pages.data() + w.first_page, f.At(rc.dest_pages), pages * sizeof(uint64_t));
+  }
+
+  bool GameWroteSince(const Writeback& w, const uint64_t* at_resolve, const uint8_t* guest) const {
+    for (uint32_t at = 0, i = 0; at < w.dest_bytes; at += kWritebackPage, i++) {
+      const uint64_t now = XXH3_64bits(guest + at, std::min(kWritebackPage, w.dest_bytes - at));
+      auto ours = written_pages.find(w.address + at);
+      const bool rewritten = ours != written_pages.end() && int32_t(ours->second.epoch - w.dest_epoch) > 0;
+      if (now != (rewritten ? ours->second.hash : at_resolve[i])) return true;
+    }
+    return false;
+  }
+
+  void ApplyWritebacks(const std::vector<Writeback>& ws, const std::vector<uint64_t>& pages, const uint8_t* data) {
+    auto* mem = REX_KERNEL_MEMORY();
+    writeback_keep.assign(ws.size(), 0);
+    for (size_t i = 0; i < ws.size(); i++) {
+      const uint8_t* guest = mem->TranslatePhysical(ws[i].address);
+      if (!guest) continue;
+      if (GameWroteSince(ws[i], pages.data() + ws[i].first_page, guest)) {
+        if (writebacks_dropped++ < 16)
+          REXLOG_INFO("[native] resolve {:08X} not written back: the game wrote there after the resolve",
+                      ws[i].address);
+        continue;
+      }
+      writeback_keep[i] = 1;
+    }
+    for (size_t i = 0; i < ws.size(); i++)
+      if (writeback_keep[i]) {
+        std::memcpy(mem->TranslatePhysical(ws[i].address), data + ws[i].offset, ws[i].size);
+        write_watch::Touch(ws[i].address, ws[i].size);  // a physical-view write: no fault to see it
+      }
+    const uint32_t epoch = g_writeback_epoch.load(std::memory_order_relaxed) + 1;
+    for (size_t i = 0; i < ws.size(); i++)
+      if (writeback_keep[i]) {
+        const uint8_t* guest = mem->TranslatePhysical(ws[i].address);
+        for (uint64_t at = 0; at < ws[i].size; at += kWritebackPage) {
+          const uint64_t hash = XXH3_64bits(guest + at, std::min<uint64_t>(kWritebackPage, ws[i].size - at));
+          written_pages[ws[i].address + uint32_t(at)] = {epoch, hash};
+        }
+      }
+    g_writeback_epoch.store(epoch, std::memory_order_release);
+  }
 
   // Occlusion queries (--gtav_native=on): one pool per frame in flight, read in FrameComplete.
   static constexpr uint32_t kMaxQueries = 1024;
@@ -6274,6 +6332,7 @@ struct Backend::Impl {
     std::unique_ptr<RenderBuffer> writeback_buffer;
     uint64_t writeback_gpu = 0, writeback_used = 0;
     std::vector<Writeback> writebacks;
+    std::vector<uint64_t> writeback_pages;
     std::unordered_map<uint64_t, RenderTarget> targets;  // --gtav_native_slot_targets
   };
   Parked parked[Backend::kFramesInFlight];
@@ -6290,6 +6349,7 @@ struct Backend::Impl {
     std::swap(writeback_gpu, p.writeback_gpu);
     std::swap(writeback_used, p.writeback_used);
     std::swap(writebacks, p.writebacks);
+    std::swap(writeback_pages, p.writeback_pages);
     // Render targets of their own per frame in flight: no write-after-read hazard between
     // consecutive frames, so the GPU can start a frame's first passes while the previous frame's
     // post-processing chain (dozens of tiny dependent passes) leaves it mostly idle.
@@ -6301,10 +6361,11 @@ struct Backend::Impl {
     }
   }
 
-  void QueueWriteback(RenderCommandList* list, ResolvedTexture& r, uint32_t address) {
+  void QueueWriteback(RenderCommandList* list, ResolvedTexture& r, uint32_t address, const FramePacket& f,
+                      const ResolveCommand& rc) {
     if (!memory_pipeline || r.width * r.height > kWritebackMaxTexels) return;
     GuestLayout g;
-    if (!GuestLayoutOf(r, &g)) return;
+    if (!GuestLayoutOf(r, &g) || (rc.dest_bytes && g.size > rc.dest_bytes)) return;
     if (!writeback_buffer) {
       writeback_buffer = device->createBuffer(RenderBufferDesc::ReadbackBuffer(
           kWritebackSize, RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS |
@@ -6325,6 +6386,7 @@ struct Backend::Impl {
         for (size_t j = 0; j < writebacks.size(); j++)
           if (writebacks[j].offset == p.offset) {
             auto w = writebacks[j];
+            NoteResolveDest(w, f, rc);
             writebacks.erase(writebacks.begin() + j);
             writebacks.push_back(w);
             break;
@@ -6339,7 +6401,9 @@ struct Backend::Impl {
       pending_writebacks.push_back({&r, address, offset, g});
     else
       WriteGuestLayout(list, r, g, writeback_buffer.get(), writeback_gpu + offset);
-    writebacks.push_back({address, offset, g.size});
+    Writeback w{address, offset, g.size};
+    NoteResolveDest(w, f, rc);
+    writebacks.push_back(w);
   }
   struct PendingWriteback {
     ResolvedTexture* r;
@@ -6868,7 +6932,7 @@ struct Backend::Impl {
         std::equal(fill_rect, fill_rect + 6, dst.fill_rect)) {
       stat_fills_reused++;
       Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
-      if (writeback_resolves) QueueWriteback(list, dst, base);
+      if (writeback_resolves) QueueWriteback(list, dst, base, f, rc);
       return;
     }
     if (skipped) {
@@ -6967,7 +7031,7 @@ struct Backend::Impl {
                               RenderTextureCopyLocation::Subresource(src->texture.get()), px, py, 0, &box);
     }
     if (!in_pass) Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
-    if (writeback_resolves && !depth_resolve) QueueWriteback(list, dst, base);
+    if (writeback_resolves && !depth_resolve) QueueWriteback(list, dst, base, f, rc);
     if (dumping) {
       dump_log += fmt::format("resolve #{} target {} flags={:X} src={} -> {:08X} L{} F{} {}x{} rect={}:{},{}-{},{} point={}:{},{} "
                               "copy {},{}-{},{} at {},{} src {}x{}\n",
@@ -7444,15 +7508,10 @@ void Backend::FrameComplete(uint32_t slot) {
   p.dead_buffers.clear();
   // Resolves the CPU may read (--gtav_native=on): into guest memory now that the GPU wrote them.
   if (!p.writebacks.empty()) {
-    auto* mem = REX_KERNEL_MEMORY();
-    const uint8_t* data = static_cast<const uint8_t*>(p.writeback_buffer->map());
-    for (const auto& w : p.writebacks)
-      if (uint8_t* guest = mem->TranslatePhysical(w.address)) {
-        std::memcpy(guest, data + w.offset, w.size);
-        write_watch::Touch(w.address, w.size);  // a physical-view write: no fault to see it
-      }
+    impl_->ApplyWritebacks(p.writebacks, p.writeback_pages, static_cast<const uint8_t*>(p.writeback_buffer->map()));
     p.writeback_buffer->unmap();
     p.writebacks.clear();
+    p.writeback_pages.clear();
   }
   p.writeback_used = 0;
 }

@@ -13,12 +13,14 @@
 #include "renderer.h"
 #include "shaders.h"
 #include "stats.h"
+#include "textures.h"
 #include "xenos_regs.h"
 
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
 #include <rex/cvar.h>
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/kernel.h>
 #include <rex/logging.h>
 #include <rex/system.h>
@@ -203,6 +205,29 @@ void ProbeDraw(const char* kind, uint32_t device) {
 // Guest D3D resources: a 24-byte header (Common, RefCount, Fence, ReadFence, Identifier,
 // BaseFlush), then the type-specific part.
 constexpr uint32_t kResourceHeader = 24;
+
+void HashResolveDest(FramePacket& packet, ResolveCommand& r) {
+  static const bool writebacks = REXCVAR_GET(gtav_native) == "on";
+  r.dest_bytes = 0;
+  if (!writebacks || !r.dest_texture || (r.flags & 7) >= 4) return;
+  const uint32_t* words = r.dest_words + 7;
+  const uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
+  const uint32_t dw = (words[2] & 0x1FFF) + 1, dh = ((words[2] >> 13) & 0x1FFF) + 1;
+  const auto* info = rex::graphics::FormatInfo::Get(words[1] & 0x3F);
+  if (!base || uint64_t(dw) * dh > kWritebackMaxTexels || !info || info->block_width != 1 || info->block_height != 1)
+    return;
+  uint32_t pitch = ((words[0] >> 22) & 0x1FF) << 5;
+  if (!pitch) pitch = dw;
+  pitch = (pitch + 31) & ~31u;
+  r.dest_bytes = pitch * ((dh + 31) & ~31u) * info->bytes_per_block();
+  r.dest_epoch = g_writeback_epoch.load(std::memory_order_acquire);
+  const uint8_t* guest = REX_KERNEL_MEMORY()->TranslatePhysical(base);
+  thread_local std::vector<uint64_t> pages;
+  pages.clear();
+  for (uint32_t at = 0; at < r.dest_bytes; at += kWritebackPage)
+    pages.push_back(XXH3_64bits(guest + at, std::min(kWritebackPage, r.dest_bytes - at)));
+  r.dest_pages = packet.Push(pages.data(), uint32_t(pages.size() * sizeof(uint64_t)));
+}
 
 }  // namespace
 
@@ -1081,6 +1106,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_tex
     uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(dword1 & 0xFFFFF000);
     if (physical != UINT32_MAX) dword1 = (dword1 & 0xFFF) | (physical & 0xFFFFF000);
   }
+  HashResolveDest(g_packet, r);
   g_packet.commands.push_back(
       {CommandKind::kResolve, uint32_t(g_packet.resolves.size()), WritePointer(device), CurrentDrawList()});
   g_packet.resolves.push_back(r);
@@ -1208,6 +1234,7 @@ void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uin
     case CommandKind::kResolve: {
       ResolveCommand k = src.resolves[c.index];
       k.regs = blob(k.regs, kRegShadowSize);
+      HashResolveDest(dst, k);
       dst.commands.push_back({c.kind, uint32_t(dst.resolves.size()), pm4, c.draw_list});
       dst.resolves.push_back(k);
       break;
