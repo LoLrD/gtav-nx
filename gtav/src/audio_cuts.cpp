@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #if defined(__APPLE__)
 #include <pthread.h>
@@ -25,6 +26,9 @@ REXCVAR_DEFINE_INT32(gtav_audio_quiet_xma, 0, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_audio_quiet_loop_every, 0, "GTAV",
                      "A wave player kept quiet by gtav_audio_quiet_xma whose XMA loops forever runs only once in this "
                      "many mixer frames (its output stays silent, its loop position advances slower); 0 = every frame");
+REXCVAR_DEFINE_INT32(gtav_audio_controller_ms, 0, "GTAV",
+                     "Minimum time between two updates of the audio controller thread (sounds, categories, voice "
+                     "requests); 0 = the game's own period");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters; "
                       "all when empty) are ignored (A/B runs)");
@@ -354,6 +358,7 @@ REX_HOOK_RAW(sub_831BB508) {
 
 REX_EXTERN(__imp__sub_831E7C10);
 REX_HOOK_RAW(sub_831E7C10) {
+  const auto start = std::chrono::steady_clock::now();
   NameThread("audio control");
   Count(g_controller);
   static bool logged = false;
@@ -367,4 +372,7 @@ REX_HOOK_RAW(sub_831E7C10) {
     REXLOG_INFO("[audio-cuts] controller period {} ms, sleep flag {}", ms, base[0x8398C665]);
   }
   __imp__sub_831E7C10(ctx, base);
+  const int32_t ms = REXCVAR_GET(gtav_audio_controller_ms);
+  if (ms > 0 && !AbOff(kAbController))
+    std::this_thread::sleep_until(start + std::chrono::milliseconds(ms));
 }
