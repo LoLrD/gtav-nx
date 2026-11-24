@@ -90,6 +90,7 @@ set(GTAV_SOURCES
     src/native/backend.cpp
     src/native/deferred_list.cpp
     src/native/textures.cpp
+    src/native/upscale.cpp
     src/native/write_watch.cpp
     src/native/shader_compiler.cpp
     src/native/touch_controls.cpp
@@ -438,7 +439,8 @@ else()
 endif()
 add_dependencies(gtav gtav_native_shaders)
 endif()
-target_include_directories(gtav PRIVATE ${GTAV_NATIVE_SHADER_DIR})
+target_include_directories(gtav PRIVATE ${GTAV_NATIVE_SHADER_DIR}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/src/ui/shaders/vulkan_spirv)
 
 # Background shader compiler tools (shader_compiler.cpp; build.cmd copies them on Windows):
 # <exe>/tools/XenosRecomp, dxc (a wrapper that sets the library path) and shader_common.h.

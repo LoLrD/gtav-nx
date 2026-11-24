@@ -53,6 +53,7 @@ struct DrawCommand {
   // BeginIndexedVertices draws: the CPU-written indices, copied into the arena as well.
   uint32_t inline_indices = 0, inline_index_size = 0;
   bool is_inline = false;
+  bool hud = false;
   uint64_t vs_hash = 0, ps_hash = 0;
   uint64_t ps_ucode_hash = 0;  // Xenia's key, for comparisons with the emulator
   uint32_t regs = 0, fetch = 0, vs_consts = 0, ps_consts = 0;  // arena offsets

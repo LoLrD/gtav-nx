@@ -7,6 +7,7 @@
 #include "frame.h"
 #include "textures.h"
 #include "shaders.h"
+#include "upscale.h"
 #include "write_watch.h"
 #include "vertex_layout.h"
 #include "xenos_regs.h"
@@ -231,6 +232,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV
 REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV",
                       "Native renderer: render the full-width (1280) targets at this fraction of their size "
                       "(0.5-2: above 1 renders at a higher resolution than the Xbox 720p; read at start)");
+REXCVAR_DEFINE_BOOL(gtav_native_fsr, false, "GTAV",
+                    "Native renderer (live): upscale the scene rendered below full size (--gtav_native_render_scale "
+                    "under 1) with FSR 1 (EASU, then RCAS) before the HUD, which then draws at full size; frames "
+                    "without a HUD are upscaled whole before the present");
+REXCVAR_DEFINE_DOUBLE(gtav_native_fsr_sharpness, 0.25, "GTAV",
+                      "Native renderer (live): --gtav_native_fsr sharpening (RCAS) in stops of reduction, 0 = "
+                      "sharpest, 2 = soft; negative skips RCAS (EASU only, cheaper)");
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
@@ -2651,6 +2659,7 @@ struct Backend::Impl {
     blit_sampler = Sampler(linear);
     blit_vs = device->createShader(g_native_blit_vs, sizeof(g_native_blit_vs), "VSMain", RenderShaderFormat::SPIRV);
     blit_ps = device->createShader(g_native_blit_ps, sizeof(g_native_blit_ps), "PSMain", RenderShaderFormat::SPIRV);
+    upscale_ready = upscale.Init(device);
     rectlist_gs = device->createShader(g_native_rectlist_gs, sizeof(g_native_rectlist_gs), "main",
                                        RenderShaderFormat::SPIRV);
     // Metal (MoltenVK) has no geometry shaders: rect lists are expanded on the CPU instead.
@@ -2927,6 +2936,8 @@ struct Backend::Impl {
     }
     uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(depth) << 16 | uint64_t(pitch) << 17 |
                    uint64_t(msaa) << 31;
+    const bool scaled = rs != 1.0f && !msaa && pitch >= 1280;
+    if (scaled && upscale_full) key |= kFullSizeKey;
     auto& memo = target_memo[(key ^ key >> 12 ^ key >> 17) & (target_memo.size() - 1)];
     if (memo.first != key || !memo.second) memo = {key, &targets[key]};
     auto& t = *memo.second;
@@ -2966,7 +2977,7 @@ struct Backend::Impl {
     t.height = height;
     t.msaa = msaa;
     t.depth = depth;
-    t.scale = rs != 1.0f && !msaa && pitch >= 1280 ? rs : 1.0f;
+    t.scale = scaled && !(key & kFullSizeKey) ? rs : 1.0f;
     RenderMultisampling ms(SampleCount(msaa));
     const uint32_t tw = Sz(t.width, t.scale), th = Sz(t.height, t.scale);
     t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms)
@@ -4594,6 +4605,11 @@ struct Backend::Impl {
     if (count == 0 && !depth) {
       stat_skipped++;
       return false;
+    }
+    if (d.hud && !upscale_full && count && color[0] == upscale_scene && upscale_ready &&
+        REXCVAR_GET(gtav_native_fsr)) {
+      UpscaleScene(list, r, color[0]);
+      count = ActiveTargets(r, std::min(height, kMaxTargetRows), color, &depth, (dc & 3) != 0);
     }
     if (redirect2x) vp = RenderViewport(vp.x * 2, vp.y * 2, vp.width * 2, vp.height * 2, vp.minDepth, vp.maxDepth);
     for (uint32_t i = 0; i < count; i++) {
@@ -6294,6 +6310,105 @@ struct Backend::Impl {
     return nullptr;
   }
 
+  SceneUpscale upscale;
+  bool upscale_ready = false;
+  bool upscale_full = false;
+  static constexpr uint64_t kFullSizeKey = 1ull << 63;
+  RenderTarget* upscale_scene = nullptr;
+  struct UpscaleImage {
+    std::unique_ptr<RenderTexture> texture;
+    std::unique_ptr<RenderTextureView> view;
+    std::unique_ptr<RenderFramebuffer> framebuffer;
+  };
+  std::unordered_map<uint64_t, UpscaleImage> upscale_images;
+  ResolvedTexture upscale_front;
+
+  UpscaleImage& UpscaleTarget(RenderFormat format, uint32_t width, uint32_t height) {
+    UpscaleImage& image = upscale_images[uint64_t(format) << 32 | uint64_t(width) << 16 | height];
+    if (!image.texture) {
+      image.texture = device->createTexture(RenderTextureDesc::ColorTarget(width, height, format));
+      image.view = image.texture->createTextureView(RenderTextureViewDesc::Texture2D(format));
+      const RenderTexture* color = image.texture.get();
+      image.framebuffer = device->createFramebuffer(RenderFramebufferDesc(&color, 1));
+    }
+    return image;
+  }
+
+  void UpscaleStamp(RenderCommandList* list, const char* label, uint32_t width, uint32_t height) {
+    PassBegin(label);
+    pass_end = label;
+    if (pass_times) PassStamp(list, label);
+    list->setViewports(RenderViewport(0, 0, float(width), float(height)));
+    list->setScissors(RenderRect(0, 0, int32_t(width), int32_t(height)));
+  }
+
+  template <class Bind>
+  void Upscale(RenderCommandList* list, uint32_t use, RenderTexture* source, const RenderTextureView* view,
+               uint32_t source_width, uint32_t source_height, RenderFormat format, uint32_t width, uint32_t height,
+               Bind&& bind) {
+    const float sharpness = float(REXCVAR_GET(gtav_native_fsr_sharpness));
+    const float ratio = float(source_width) / float(width);
+    Transition(list, source, RenderTextureLayout::SHADER_READ);
+    if (sharpness >= 0.0f) {
+      UpscaleImage& easu = UpscaleTarget(format, width, height);
+      Transition(list, easu.texture.get(), RenderTextureLayout::COLOR_WRITE);
+      list->setFramebuffer(easu.framebuffer.get());
+      bound_fb = nullptr;
+      UpscaleStamp(list, "fsr easu", width, height);
+      upscale.Easu(list, slot, use, source, view, format, ratio, source_width, source_height);
+      Transition(list, easu.texture.get(), RenderTextureLayout::SHADER_READ);
+      bind();
+      UpscaleStamp(list, "fsr rcas", width, height);
+      upscale.Rcas(list, slot, use, easu.texture.get(), easu.view.get(), format, sharpness);
+    } else {
+      bind();
+      UpscaleStamp(list, "fsr easu", width, height);
+      upscale.Easu(list, slot, use, source, view, format, ratio, source_width, source_height);
+    }
+    InvalidateDrawState();
+  }
+
+  void UpscaleScene(RenderCommandList* list, const uint8_t* r, RenderTarget* scene) {
+    FlushClears(list, scene);
+    upscale_full = true;
+    const auto c = regs::Color(r, 0);
+    RenderTarget* targets[4] = {Target(c.base, uint32_t(c.format), false, regs::Surface(r).pitch, 0, scene->height)};
+    RenderTarget* full = targets[0];
+    full->float_data = scene->float_data;
+    Upscale(list, 0, scene->texture.get(), scene->view.get(), Sz(scene->width, scene->scale),
+            Sz(scene->height, scene->scale), full->format, full->width, full->height,
+            [&] { BindTargets(list, targets, 1, nullptr); });
+    full->written = ++target_serial;
+  }
+
+  ResolvedTexture* UpscaleFront(RenderCommandList* list, ResolvedTexture& front) {
+    ResolvedTexture& out = upscale_front;
+    if (!out.texture || out.width != front.width || out.height != front.height || out.format != front.format) {
+      if (out.texture) {
+        layouts.erase(out.texture.get());
+        dead_framebuffers.push_back(std::move(out.framebuffer));
+        dead_views.push_back(std::move(out.view));
+        dead_textures.push_back(std::move(out.texture));
+      }
+      out.texture = device->createTexture(RenderTextureDesc::ColorTarget(front.width, front.height, front.format));
+      out.view = out.texture->createTextureView(RenderTextureViewDesc::Texture2D(front.format));
+      const RenderTexture* color = out.texture.get();
+      out.framebuffer = device->createFramebuffer(RenderFramebufferDesc(&color, 1));
+      if (!out.descriptor) out.descriptor = AllocDescriptor();
+      texture_set->setTexture(out.descriptor, out.texture.get(), RenderTextureLayout::SHADER_READ, out.view.get());
+      out.format = front.format;
+      out.width = front.width;
+      out.height = front.height;
+    }
+    Upscale(list, 1, front.texture.get(), front.view.get(), Sz(front.width, front.scale),
+            Sz(front.height, front.scale), front.format, front.width, front.height, [&] {
+              Transition(list, out.texture.get(), RenderTextureLayout::COLOR_WRITE);
+              list->setFramebuffer(out.framebuffer.get());
+              bound_fb = nullptr;
+            });
+    return &out;
+  }
+
   RenderFramebuffer* ResolveFramebuffer(ResolvedTexture& t, uint32_t face, uint32_t level) {
     if (t.framebuffer) return t.framebuffer.get();
     auto& target = t.subresource_targets[face << 8 | level];
@@ -6332,6 +6447,7 @@ struct Backend::Impl {
     if (!depth_resolve) {
       auto c = regs::Color(r, int(source));
       src = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, dh);
+      if (rc.dest_texture == f.front_buffer && src->scale != 1.0f) upscale_scene = src;
       FlushClears(list, src);
     } else {
       auto d = regs::Depth(r);
@@ -6620,6 +6736,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     s.PassStamp(list, "frame start");
   }
   s.grow_list = list;
+  s.upscale_full = false;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
@@ -6874,6 +6991,18 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
                 s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size());
+  // The front buffer is the last resolve into the texture passed to Swap.
+  ResolvedTexture* r = nullptr;
+  for (auto it = f.resolves.rbegin(); it != f.resolves.rend(); ++it) {
+    if (it->dest_texture != f.front_buffer) continue;
+    const uint32_t* w = it->dest_words + 7;
+    r = s.LatestResolved(FetchBaseAddress(w) & 0x1FFFFFFF, false, (w[2] & 0x1FFF) + 1, ((w[2] >> 13) & 0x1FFF) + 1);
+    if (f.index % 150 == 0 && r)
+      REXLOG_INFO("[native] present {:08X}: {}x{} format {} descriptor {}", FetchBaseAddress(w), r->width,
+                  r->height, uint32_t(r->format), r->descriptor);
+    break;
+  }
+  if (r && r->scale != 1.0f && s.upscale_ready && REXCVAR_GET(gtav_native_fsr)) r = s.UpscaleFront(list, *r);
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;
@@ -6881,26 +7010,15 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     for (uint32_t i = uint32_t(s.pass_labels[s.slot].size()); i < Impl::kPassStamps; i++)
       list->writeTimestamp(s.pass_pools[s.slot].get(), i);
   }
-  // The front buffer is the last resolve into the texture passed to Swap.
-  for (auto it = f.resolves.rbegin(); it != f.resolves.rend(); ++it) {
-    if (it->dest_texture != f.front_buffer) continue;
-    const uint32_t* w = it->dest_words + 7;
-    ResolvedTexture* r = s.LatestResolved(FetchBaseAddress(w) & 0x1FFFFFFF, false, (w[2] & 0x1FFF) + 1,
-                                          ((w[2] >> 13) & 0x1FFF) + 1);
-    if (f.index % 150 == 0 && r)
-      REXLOG_INFO("[native] present {:08X}: {}x{} format {} descriptor {}", FetchBaseAddress(w), r->width,
-                  r->height, uint32_t(r->format), r->descriptor);
-    if (!r) break;
-    s.Transition(list, r->texture.get(), RenderTextureLayout::SHADER_READ);
-    if (s.dumping) {
-      uint32_t none[6] = {};
-      s.DumpTexture(list, r->descriptor, uint32_t(r->format), r->width, r->height, 0xFFFF0000, 0xF0F0F0, none);
-    }
-    if (RenderTexture* held = s.HoldFront(list, *r, lost, front_descriptor)) return held;
-    *front_descriptor = r->descriptor;
-    return r->texture.get();
+  if (!r) return nullptr;
+  s.Transition(list, r->texture.get(), RenderTextureLayout::SHADER_READ);
+  if (s.dumping) {
+    uint32_t none[6] = {};
+    s.DumpTexture(list, r->descriptor, uint32_t(r->format), r->width, r->height, 0xFFFF0000, 0xF0F0F0, none);
   }
-  return nullptr;
+  if (RenderTexture* held = s.HoldFront(list, *r, lost, front_descriptor)) return held;
+  *front_descriptor = r->descriptor;
+  return r->texture.get();
 }
 
 // The slot's parked state becomes the recording state (its upload chunks get reused); the
