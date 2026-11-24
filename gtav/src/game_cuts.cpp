@@ -26,6 +26,10 @@ REXCVAR_DEFINE_INT32(gtav_anim_every, 1, "GTAV",
 REXCVAR_DEFINE_DOUBLE(gtav_physics_max_step, 0.0, "GTAV",
                       "Run the physics once per frame instead of twice while the frame step is at most this many "
                       "seconds (0 = game: two half steps a frame below 60 fps)");
+REXCVAR_DEFINE_INT32(gtav_script_every, 1, "GTAV",
+                     "Run the scripts named in gtav_script_throttle every Nth frame (1 = game)");
+REXCVAR_DEFINE_STRING(gtav_script_throttle, "", "GTAV",
+                      "Scripts that gtav_script_every slows down, comma-separated names");
 REXCVAR_DEFINE_BOOL(gtav_game_cpu_times, false, "GTAV",
                     "Diagnostic: log the CPU time per frame of the game's main thread systems, worker jobs and "
                     "scripts every 300 frames");
@@ -71,6 +75,8 @@ constexpr uint32_t kReportFrames = 300;
 constexpr uint32_t kPlayerInfo = 0x83AAC7E4;
 constexpr uint32_t kGameTimeStep = 0x83DDDBF4;
 constexpr uint32_t kPhysicsSlices = 0x8390639C;
+constexpr uint32_t kScriptHash = 8;
+constexpr uint32_t kScriptState = 12;
 constexpr uint32_t kScriptName = 104;
 
 std::array<std::atomic<uint64_t>, kSlots> g_ns{};
@@ -78,6 +84,7 @@ std::array<std::atomic<uint64_t>, kSlots> g_calls{};
 std::atomic<bool> g_cuts_paused{false};
 uint32_t g_frames = 0;
 bool g_single_slice = false;
+std::map<uint32_t, bool> g_script_throttled;
 std::map<uint32_t, uint64_t> g_script_ns;
 std::map<uint32_t, std::string> g_script_names;
 
@@ -114,6 +121,16 @@ void AnimateTimesliced(PPCContext& ctx, uint8_t* base, PPCFunc* original) {
   S32(base, kGameTimeStep, std::bit_cast<uint32_t>(std::bit_cast<float>(step) * float(every)));
   original(ctx, base);
   S32(base, kGameTimeStep, step);
+}
+
+bool ScriptThrottled(const uint8_t* base, uint32_t thread) {
+  const uint32_t hash = L32(base, thread + kScriptHash);
+  if (auto it = g_script_throttled.find(hash); it != g_script_throttled.end()) return it->second;
+  const std::string name(reinterpret_cast<const char*>(base + thread + kScriptName));
+  const bool throttled =
+      !name.empty() && ("," + REXCVAR_GET(gtav_script_throttle) + ",").find("," + name + ",") != std::string::npos;
+  if (throttled) REXLOG_INFO("[game-cuts] script {} runs every {} frames", name, REXCVAR_GET(gtav_script_every));
+  return g_script_throttled[hash] = throttled;
 }
 
 uint64_t ThreadNs() {
@@ -235,6 +252,18 @@ REX_EXTERN(__imp__sub_835F98E0);
 REX_HOOK_RAW(sub_835F98E0) {
   if (gtav::g_single_slice) gtav::S32(base, gtav::kPhysicsSlices, 1);
   __imp__sub_835F98E0(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_835273D8);
+REX_HOOK_RAW(sub_835273D8) {
+  const int32_t every = REXCVAR_GET(gtav_script_every);
+  const uint32_t thread = ctx.r3.u32;
+  if (every > 1 && gtav::Cut() && (gtav::g_frames + (thread >> 4)) % uint32_t(every) &&
+      gtav::ScriptThrottled(base, thread)) {
+    ctx.r3.u64 = gtav::L32(base, thread + gtav::kScriptState);
+    return;
+  }
+  __imp__sub_835273D8(ctx, base);
 }
 
 REX_EXTERN(__imp__sub_82927BE0);
