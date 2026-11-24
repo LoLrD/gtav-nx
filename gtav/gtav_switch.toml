@@ -33,3 +33,6 @@ gtav_ambient_services = false
 gtav_ambient_events = false
 gtav_model_budget = false
 gtav_native_fence_wait = true
+gtav_native_skip_alu_packets = true
+gtav_native_texture_stable_frames = 4
+gtav_native_fence_release = true
