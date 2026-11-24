@@ -345,6 +345,241 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
 }
 
+bool LooksLikeSwitchBctr(const uint32_t* data) {
+  constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
+  constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
+  constexpr uint32_t NOP = 0x60000000;
+  for (int i = 1; i <= 3; i++) {
+    uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
+    if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
+      for (int j = 1; j < i; j++) {
+        if (load_and_swap<uint32_t>(data - j) != NOP)
+          return false;
+      }
+      return true;
+    }
+    if (prev_insn != NOP)
+      return false;
+  }
+  return false;
+}
+
+std::unordered_map<uint32_t, uint32_t> ComputeFpSingles(const FunctionNode& fn, const EmitContext& ctx,
+                                                        bool sehHandlers) {
+  std::unordered_map<uint32_t, uint32_t> result;
+  if (sehHandlers)
+    return result;
+  std::vector<uint32_t> addrs;
+  std::vector<const uint32_t*> words;
+  for (const auto& block : fn.blocks()) {
+    auto* data = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
+    if (!data)
+      continue;
+    for (uint32_t addr = block.base; addr < block.end(); addr += 4, ++data) {
+      addrs.push_back(addr);
+      words.push_back(data);
+    }
+  }
+  const size_t n = addrs.size();
+  if (n == 0)
+    return result;
+  std::unordered_map<uint32_t, uint32_t> index;
+  index.reserve(n);
+  for (size_t i = 0; i < n; ++i)
+    index.emplace(addrs[i], static_cast<uint32_t>(i));
+
+  enum : uint8_t { kNone, kSet, kClear, kCopy, kSel };
+  struct Node {
+    std::vector<uint32_t> succ;
+    uint32_t kill = 0;
+    uint8_t op = kNone;
+    uint8_t d = 0, a = 0, b = 0;
+  };
+  std::vector<Node> nodes(n);
+  const auto& cfg = ctx.config;
+  const uint32_t kVolatile = 0x3FFFu;
+  const uint32_t callKill = (cfg.nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters()) ? kVolatile : ~0u;
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t addr = addrs[i];
+    const uint32_t w = load_and_swap<uint32_t>(words[i]);
+    const uint32_t op = PPC_OP(w);
+    Node& node = nodes[i];
+    bool fall = true;
+    auto addTarget = [&](uint32_t target) {
+      auto it = index.find(target);
+      if (it != index.end())
+        node.succ.push_back(it->second);
+    };
+    if (cfg.midAsmHooks.count(addr))
+      return result;
+    if (op == PPC_OP_B) {
+      const uint32_t target = PPC_BA(w) ? static_cast<uint32_t>(PPC_BI(w)) : addr + PPC_BI(w);
+      if (PPC_BL(w)) {
+        if (target == cfg.setJmpAddress || target == cfg.longJmpAddress)
+          return result;
+        const FunctionNode* callee = ctx.graph.getFunction(target);
+        node.kill = (callee && callee->sharesRegisters()) ? ~0u : callKill;
+        if (ctx.graph.classifyTarget(target, addr, true) == TargetKind::InternalLabel)
+          addTarget(target);
+      } else {
+        fall = false;
+        auto kind = ctx.graph.classifyTarget(target, addr, false);
+        if (kind == TargetKind::InternalLabel ||
+            (kind == TargetKind::Unknown && target >= fn.base() && target < fn.end()))
+          addTarget(target);
+      }
+    } else if (op == PPC_OP_BC) {
+      if (PPC_BL(w))
+        node.kill = ~0u;
+      addTarget(PPC_BA(w) ? static_cast<uint32_t>(PPC_BD(w)) : addr + PPC_BD(w));
+    } else if (op == PPC_OP_CTR && (PPC_XOP(w) == 16 || PPC_XOP(w) == 528)) {
+      const bool always = (PPC_BO(w) & 0x14) == 0x14;
+      if (PPC_BL(w)) {
+        node.kill = callKill;
+      } else if (PPC_XOP(w) == 16) {
+        fall = !always;
+      } else {
+        auto stIt = cfg.switchTables.find(addr);
+        if (stIt != cfg.switchTables.end())
+          for (uint32_t target : stIt->second.targets)
+            addTarget(target);
+        for (const auto& autoJt : fn.jumpTables())
+          if (autoJt.bctrAddress == addr)
+            for (uint32_t target : autoJt.targets)
+              addTarget(target);
+        if (LooksLikeSwitchBctr(words[i])) {
+          FunctionScanner scanner(ctx.binary);
+          if (auto late = scanner.detect_jump_table(addr))
+            for (uint32_t target : late->targets)
+              addTarget(target);
+        }
+        fall = !always;
+      }
+    } else if (op == PPC_OP_SC) {
+      node.kill = ~0u;
+    } else if (op == 31 || op == 48 || op == 49 || op == 50 || op == 51 || op == 59 || op == 63) {
+      ppc_insn insn;
+      Disassemble(words[i], 4, addr, insn);
+      if (insn.opcode) {
+        node.d = static_cast<uint8_t>(insn.operands[0] & 31);
+        node.a = static_cast<uint8_t>(insn.operands[1] & 31);
+        node.b = static_cast<uint8_t>(insn.operands[2] & 31);
+        switch (insn.opcode->id) {
+          case PPC_INST_LFS:
+          case PPC_INST_LFSU:
+          case PPC_INST_LFSX:
+          case PPC_INST_LFSUX:
+          case PPC_INST_FADDS:
+          case PPC_INST_FSUBS:
+          case PPC_INST_FMULS:
+          case PPC_INST_FDIVS:
+          case PPC_INST_FMADDS:
+          case PPC_INST_FMSUBS:
+          case PPC_INST_FNMADDS:
+          case PPC_INST_FNMSUBS:
+          case PPC_INST_FSQRTS:
+          case PPC_INST_FRES:
+          case PPC_INST_FRSQRTE:
+          case PPC_INST_FRSP:
+            node.op = kSet;
+            break;
+          case PPC_INST_FMR:
+          case PPC_INST_FNEG:
+          case PPC_INST_FABS:
+          case PPC_INST_FNABS:
+            node.op = kCopy;
+            break;
+          case PPC_INST_FSEL:
+            node.op = kSel;
+            node.a = static_cast<uint8_t>(insn.operands[2] & 31);
+            node.b = static_cast<uint8_t>(insn.operands[3] & 31);
+            break;
+          case PPC_INST_FCMPU:
+          case PPC_INST_FCMPO:
+          case PPC_INST_MTFSF:
+            break;
+          case PPC_INST_LFD:
+          case PPC_INST_LFDU:
+          case PPC_INST_LFDX:
+          case PPC_INST_LFDUX:
+            node.op = kClear;
+            break;
+          default:
+            if (op == 59 || op == 63)
+              node.op = kClear;
+            break;
+        }
+      } else if (op != 31) {
+        return result;
+      }
+    }
+    if (fall && i + 1 < n)
+      node.succ.push_back(static_cast<uint32_t>(i + 1));
+  }
+
+  auto transfer = [&](const Node& node, uint32_t in) -> uint32_t {
+    if (node.kill)
+      return in & ~node.kill;
+    const uint32_t bit = 1u << node.d;
+    switch (node.op) {
+      case kSet:
+        return in | bit;
+      case kClear:
+        return in & ~bit;
+      case kCopy:
+        return (in >> node.a & 1) ? (in | bit) : (in & ~bit);
+      case kSel:
+        return ((in >> node.a & 1) && (in >> node.b & 1)) ? (in | bit) : (in & ~bit);
+      default:
+        return in;
+    }
+  };
+
+  std::vector<uint8_t> reachable(n, 0);
+  std::vector<uint32_t> stack{0};
+  reachable[0] = 1;
+  while (!stack.empty()) {
+    uint32_t i = stack.back();
+    stack.pop_back();
+    for (uint32_t s : nodes[i].succ)
+      if (!reachable[s]) {
+        reachable[s] = 1;
+        stack.push_back(s);
+      }
+  }
+  std::vector<uint32_t> in(n, 0);
+  for (size_t i = 1; i < n; ++i)
+    if (reachable[i])
+      in[i] = ~0u;
+  std::vector<uint8_t> queued(n, 0);
+  std::vector<uint32_t> work;
+  for (size_t i = n; i-- > 0;)
+    if (reachable[i]) {
+      work.push_back(static_cast<uint32_t>(i));
+      queued[i] = 1;
+    }
+  while (!work.empty()) {
+    uint32_t i = work.back();
+    work.pop_back();
+    queued[i] = 0;
+    const uint32_t out = transfer(nodes[i], in[i]);
+    for (uint32_t s : nodes[i].succ) {
+      const uint32_t next = in[s] & out;
+      if (next != in[s]) {
+        in[s] = next;
+        if (!queued[s]) {
+          queued[s] = 1;
+          work.push_back(s);
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < n; ++i)
+    if (in[i])
+      result.emplace(addrs[i], in[i]);
+  return result;
+}
+
 }  // namespace
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -386,6 +621,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
   labels.reserve(64);
+  std::unordered_set<size_t> loopHeads;
 
   for (const auto& block : blocks()) {
     auto* blockData = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
@@ -397,17 +633,22 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           load_and_swap<uint32_t>((const uint8_t*)blockData + addr - block.base);
       if (!PPC_BL(instruction)) {
         const size_t op = PPC_OP(instruction);
-        if (op == PPC_OP_B)
-          labels.emplace(addr + PPC_BI(instruction));
-        else if (op == PPC_OP_BC)
-          labels.emplace(addr + PPC_BD(instruction));
+        if (op == PPC_OP_B || op == PPC_OP_BC) {
+          const size_t target = addr + (op == PPC_OP_B ? PPC_BI(instruction) : PPC_BD(instruction));
+          labels.emplace(target);
+          if (target <= addr)
+            loopHeads.emplace(target);
+        }
       }
 
       // Labels from config switch tables
       auto stIt = ctx.config.switchTables.find(static_cast<uint32_t>(addr));
       if (stIt != ctx.config.switchTables.end()) {
-        for (auto label : stIt->second.targets)
+        for (auto label : stIt->second.targets) {
           labels.emplace(label);
+          if (label <= addr)
+            loopHeads.emplace(label);
+        }
       }
 
       // Labels and extern declarations from mid-asm hooks
@@ -466,6 +707,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   for (const auto& jt : jumpTables()) {
     for (auto label : jt.targets) {
       labels.emplace(label);
+      if (label <= jt.bctrAddress)
+        loopHeads.emplace(label);
     }
   }
 
@@ -492,6 +735,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // Local map for late-detected jump tables (can't mutate const config)
   std::unordered_map<uint32_t, JumpTable> lateJumpTables;
 
+  std::unordered_map<uint32_t, uint32_t> fpSingles;
+  if (ctx.config.singleFloatOps)
+    fpSingles = ComputeFpSingles(*this, ctx, sehInfo && !sehInfo->scopes.empty() && ctx.config.generateExceptionHandlers);
+
   std::string body;
   body.reserve(4096);
 
@@ -512,6 +759,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       // Only emit each label once
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
+        if (loopHeads.contains(blockBase))
+          emit_println(body, "\tREX_LOOP_BARRIER();");
         csrState = CSRState::Unknown;
       }
 
@@ -583,6 +832,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         int id = insn.opcode->id;
         BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
                                   localVariables, csrState, activeJt};
+        if (!fpSingles.empty()) {
+          auto fpIt = fpSingles.find(static_cast<uint32_t>(blockBase));
+          if (fpIt != fpSingles.end())
+            builderCtx.fpSingle = fpIt->second;
+        }
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();

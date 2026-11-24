@@ -279,6 +279,12 @@ if(NOT GTAV_SDK_COUNTERS)
     endforeach()
 endif()
 
+option(GTAV_PLAIN_GUEST_MEMORY "Access guest memory without volatile in the recompiled game code" OFF)
+if(GTAV_PLAIN_GUEST_MEMORY AND TARGET gtav_recomp)
+    target_compile_definitions(gtav_recomp PRIVATE REX_PLAIN_GUEST_MEMORY)
+    target_compile_options(gtav_recomp PRIVATE -fno-strict-aliasing)
+endif()
+
 # The generated registration function (one call per game function, ~100k) takes clang's arm64
 # backend hours (-O3, and GlobalISel at -O0); it runs once at startup: unoptimized, SelectionDAG.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")

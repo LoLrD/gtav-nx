@@ -140,17 +140,31 @@ bool build_vminfp(BuilderContext& ctx) {
 }
 
 bool build_vrefp(BuilderContext& ctx) {
-  // TODO: see if we can use rcp safely
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr("simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({vA}.f32))");
+  if (ctx.config().fastVmxEstimates && ctx.config().fpFormsVerify)
+    ctx.emit_vec_fp_unary_expr(fmt::format(
+        "rex_fp_check::Estimate(0x{:X}, rex::ppc::vrefp_est(simde_mm_load_ps({{vA}}.f32)), "
+        "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({{vA}}.f32)))",
+        ctx.base));
+  else if (ctx.config().fastVmxEstimates)
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vrefp_est(simde_mm_load_ps({vA}.f32))");
+  else
+    ctx.emit_vec_fp_unary_expr("simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({vA}.f32))");
   return true;
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // TODO: see if we can use rsqrt safely
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  if (ctx.config().fastVmxEstimates && ctx.config().fpFormsVerify)
+    ctx.emit_vec_fp_unary_expr(fmt::format(
+        "rex_fp_check::Estimate(0x{:X}, rex::ppc::vrsqrtefp_est(simde_mm_load_ps({{vA}}.f32)), "
+        "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({{vA}}.f32))))",
+        ctx.base));
+  else if (ctx.config().fastVmxEstimates)
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vrsqrtefp_est(simde_mm_load_ps({vA}.f32))");
+  else
+    ctx.emit_vec_fp_unary_expr(
+        "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
   return true;
 }
 

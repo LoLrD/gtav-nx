@@ -106,3 +106,25 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   registers, `mfcr` and the caller-side stores do not count as reads. Vector registers are only counted (379 functions
   read one they never write, mostly the source of a `vrlimi128`; they keep reading zero). `mflr` under `skip_lr`
   writes 0 to its register.
+- `fast_vmx_estimates` (`include/rex/ppc/intrinsics.h`, `src/codegen/builders/vector.cpp`): `vrefp` / `vrsqrtefp` as the
+  ARM estimate plus one Newton-Raphson step (~2^-16 relative, the PPC guarantees 2^-12); the reciprocal square root
+  keeps the estimate's +-0 -> +-inf and +inf -> +0 (the step would make 0 * inf).
+- `single_float_ops` (`src/codegen/function_graph.cpp`, `src/codegen/builders/floating_point.cpp`): a per-function
+  dataflow marks FPRs that hold single values (lfs, single arithmetic, frsp, moves and sign ops of those; the entry and
+  double results clear them, a call clears f0-f13, or every FPR when the function keeps callee-saved registers in ctx).
+  With single inputs `fadds` / `fsubs` / `fmuls` / `fdivs` / `fsqrts` compute in float (bit-identical: double rounding
+  is innocuous for them) and `fmadds` / `fmsubs` / `fnmadds` / `fnmsubs` are one `fmaf` (one rounding to single, as on
+  the Xenon). `fp_forms_verify` (validation builds) computes both forms at every converted instruction, keeps the old
+  value and counts input / result differences (`rex_fp_check` in the pch).
+- Plain guest memory (`REX_PLAIN_GUEST_MEMORY`, ported from the NieR SDK): `REX_LOAD_*` / `REX_STORE_*` drop `volatile`
+  and the code generator emits `REX_LOOP_BARRIER()` at every loop head (target of a backward branch or jump-table entry),
+  so polling loops still re-read memory. MMIO stays volatile; the generated code needs `-fno-strict-aliasing` (CMake
+  option `GTAV_PLAIN_GUEST_MEMORY`). The
+  AArch64 FPCR accessors clobber memory, so guest loads cannot move across a rounding-mode change.
+- Indirect call promotion (`indirect_profile`, `indirect_promotions_file`, `indirect_promotions_verify` in the
+  manifest; `src/codegen/builders/control_flow.cpp`, `src/system/indirect_dispatch.cpp`,
+  `resources/templates/codegen/_indirect_call.inja`): a profile build counts guest call site -> target pairs
+  (`REX_INDIRECT_PROFILE`, cvar `indirect_profile_file`); the listed `bctrl` / tail `bctr` sites then call their one or
+  two dominant targets directly behind a compare of the target (`if (ctr != T) goto miss; sub_T(ctx, base);`), so the
+  arguments-in-registers pass sees an ordinary direct call. Any other target takes the dispatch table as before. The
+  verify option checks every guarded call against the table (`indirect promotion DIFFERENCE`).

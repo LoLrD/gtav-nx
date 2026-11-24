@@ -98,6 +98,10 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  uint32_t fpSingle = 0;
+
+  bool fp_single(size_t index) const { return index < 32 && (fpSingle >> index & 1); }
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 

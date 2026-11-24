@@ -102,6 +102,57 @@ bool build_bl(BuilderContext& ctx) {
   return true;
 }
 
+static void emitIndirectProfile(BuilderContext& ctx) {
+  if (ctx.config().indirectProfile)
+    ctx.println("\tREX_INDIRECT_PROFILE(0x{:X}, {}.u32);", ctx.base, ctx.ctr());
+}
+
+static std::vector<const FunctionNode*> promotedTargets(BuilderContext& ctx) {
+  std::vector<const FunctionNode*> out;
+  const auto& cfg = ctx.config();
+  auto it = cfg.indirectPromotions.find(ctx.base);
+  if (it == cfg.indirectPromotions.end())
+    return out;
+  for (uint32_t target : it->second) {
+    if (out.size() == 2)
+      break;
+    const FunctionNode* fn = ctx.graph().getFunction(target);
+    if (!fn || fn->base() != target || fn->sharesRegisters() || !fn->liveIn().empty() ||
+        fn->authority() == FunctionAuthority::IMPORT || target == ctx.emitCtx.entryPoint ||
+        target == cfg.longJmpAddress || target == cfg.setJmpAddress || fn->name().find("__rest") == 0 ||
+        fn->name().find("__save") == 0)
+      continue;
+    bool crt = false;
+    for (const auto& [name, addr] : cfg.rexcrtFunctions)
+      crt = crt || addr == target;
+    if (!crt)
+      out.push_back(fn);
+  }
+  return out;
+}
+
+static bool emitPromotedCalls(BuilderContext& ctx, bool tail) {
+  auto targets = promotedTargets(ctx);
+  if (targets.empty())
+    return false;
+  const uint32_t done = ctx.base + 3;
+  for (size_t i = 0; i < targets.size(); ++i) {
+    const FunctionNode* fn = targets[i];
+    const uint32_t miss = ctx.base + 1 + static_cast<uint32_t>(i);
+    ctx.emitCtx.reference(fn->name());
+    ctx.println("\tif ({}.u32 != 0x{:X}) goto loc_{:X};", ctx.ctr(), fn->base(), miss);
+    if (ctx.config().indirectPromotionsVerify)
+      ctx.println("\tREX_INDIRECT_PROMOTED_CHECK(0x{:X}, {});", fn->base(), fn->name());
+    ctx.println("\t{}(ctx, base);", fn->name());
+    if (tail)
+      ctx.println("\treturn;");
+    else
+      ctx.println("\tgoto loc_{:X};", done);
+    ctx.println("loc_{:X}:", miss);
+  }
+  return true;
+}
+
 bool build_blr(BuilderContext& ctx) {
   ctx.println("\treturn;");
   return true;
@@ -195,6 +246,8 @@ bool build_bctr(BuilderContext& ctx) {
     // The validation phase will report missing switch tables.
     // An indirect tail jump may land on a fragment split off this very function (the
     // targets the hole finder declared), which reads our live registers from ctx.
+    emitIndirectProfile(ctx);
+    emitPromotedCalls(ctx, true);
     ctx.emit_call_sharing_registers(fmt::format("REX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr()),
                                     false, "\t");
     ctx.println("\treturn;");
@@ -204,7 +257,13 @@ bool build_bctr(BuilderContext& ctx) {
 
 bool build_bctrl(BuilderContext& ctx) {
   emitLrStore(ctx);
+  emitIndirectProfile(ctx);
+  const bool promoted = emitPromotedCalls(ctx, false);
   ctx.println("\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
+  if (promoted) {
+    ctx.println("loc_{:X}:", ctx.base + 3);
+    ctx.println("\t;");
+  }
   ctx.csrState = CSRState::Unknown;  // the call could change it
   return true;
 }

@@ -393,6 +393,29 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
   return simde_mm_packus_epi16(r_lo, r_hi);
 }
 
+inline simde__m128 vrefp_est(simde__m128 x) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  const float32x4_t v = simde__m128_to_neon_f32(x);
+  const float32x4_t e = vrecpeq_f32(v);
+  return simde__m128_from_neon_f32(vmulq_f32(e, vrecpsq_f32(v, e)));
+#else
+  return simde_mm_div_ps(simde_mm_set1_ps(1), x);
+#endif
+}
+
+inline simde__m128 vrsqrtefp_est(simde__m128 x) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  const float32x4_t v = simde__m128_to_neon_f32(x);
+  const float32x4_t e0 = vrsqrteq_f32(v);
+  const float32x4_t e1 = vmulq_f32(e0, vrsqrtsq_f32(vmulq_f32(v, e0), e0));
+  const uint32x4_t special =
+      vorrq_u32(vceqq_f32(e0, vdupq_n_f32(0.0f)), vceqq_f32(vabsq_f32(e0), vdupq_n_f32(__builtin_inff())));
+  return simde__m128_from_neon_f32(vbslq_f32(special, e0, e1));
+#else
+  return simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(x));
+#endif
+}
+
 }  // namespace rex::ppc
 
 //=============================================================================
