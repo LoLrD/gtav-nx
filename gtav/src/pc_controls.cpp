@@ -106,6 +106,23 @@ REX_EXTERN(sub_82C6ACE8);
 REX_EXTERN(sub_82D32968);
 REX_EXTERN(sub_82D316A0);
 REX_EXTERN(sub_82C7E348);
+REX_EXTERN(sub_82CF0F18);
+REX_EXTERN(sub_82CF0EF0);
+REX_EXTERN(sub_82CE5078);
+REX_EXTERN(sub_82D31658);
+REX_EXTERN(sub_82C88CD0);
+REX_EXTERN(sub_82C7D2A0);
+REX_EXTERN(sub_82C6ADB8);
+REX_EXTERN(sub_82D31768);
+REX_EXTERN(sub_82D318F8);
+REX_EXTERN(sub_82D31918);
+REX_EXTERN(sub_82CE66F8);
+REX_EXTERN(sub_82D314C8);
+REX_EXTERN(sub_82C89080);
+REX_EXTERN(sub_82CE6390);
+REX_EXTERN(sub_82C7B650);
+REX_EXTERN(sub_82CF0E98);
+REX_EXTERN(sub_82CF0EB8);
 
 REXCVAR_DEFINE_BOOL(gtav_trace_cutscene_audio, false, "GTAV",
                     "Diagnostic: log the cutscene audio entity (0x83A320F8) state, its two stream slots and "
@@ -116,6 +133,15 @@ REXCVAR_DEFINE_DOUBLE(gtav_shadow_scale, 0.0, "GTAV", "Cascade shadow bounds sca
 REXCVAR_DEFINE_BOOL(gtav_light_shadows, true, "GTAV", "Shadows from local lights");
 REXCVAR_DEFINE_BOOL(gtav_procobj, true, "GTAV", "Procedural objects (grass, rocks, litter)");
 REXCVAR_DEFINE_BOOL(gtav_distant_cars, true, "GTAV", "Distant cars and their lights");
+REXCVAR_DEFINE_INT32(gtav_pop_budget, 3, "GTAV", "Ped and vehicle population budget 0-3 (3 = game)");
+REXCVAR_DEFINE_DOUBLE(gtav_pop_range, 1.0, "GTAV", "Ambient ped and vehicle spawn range multiplier (1 = game)");
+REXCVAR_DEFINE_BOOL(gtav_map_optional, true, "GTAV", "Medium priority optional map entities");
+REXCVAR_DEFINE_BOOL(gtav_grass, true, "GTAV", "Procedural grass");
+REXCVAR_DEFINE_BOOL(gtav_decals, true, "GTAV", "Decal rendering");
+REXCVAR_DEFINE_BOOL(gtav_ambient_services, true, "GTAV",
+                    "Random trains, boats, garbage trucks, cops, low priority parked cars, fire, ambulance, gangs, army");
+REXCVAR_DEFINE_BOOL(gtav_ambient_events, true, "GTAV", "Ambient ped event reactions and shocking events");
+REXCVAR_DEFINE_BOOL(gtav_model_budget, true, "GTAV", "Full ped and vehicle model memory budget");
 REXCVAR_DEFINE_BOOL(gtav_debug_commands, false, "GTAV",
                     "Test hook: <exe>/logs/native_cmd is run on the script thread once per second "
                     "('kill' = SET_ENTITY_HEALTH(player, 0)) and deleted");
@@ -132,6 +158,7 @@ std::atomic<float> g_lodscale{0.0f};
 std::atomic<float> g_timescale{0.0f};
 std::chrono::steady_clock::time_point g_population_at{};
 std::chrono::steady_clock::time_point g_quality_at{};
+std::chrono::steady_clock::time_point g_frame_cuts_at{};
 bool g_quality_loaded = false;
 constexpr float kDriveX = -1336.0f, kDriveY = -3044.0f, kDriveZ = 13.9f, kDriveHeading = 150.0f;
 
@@ -329,6 +356,24 @@ REX_HOOK_RAW(sub_82CE9CA8) {
       Call(ctx, base, sub_82D316A0, {0u});
       Call(ctx, base, sub_82C7E348, {1u});
     }
+    if (const int32_t budget = REXCVAR_GET(gtav_pop_budget); budget < 3) {
+      Call(ctx, base, sub_82CF0F18, {uint32_t(budget)});
+      Call(ctx, base, sub_82CF0EF0, {uint32_t(budget)});
+    }
+    if (!REXCVAR_GET(gtav_map_optional)) Call(ctx, base, sub_82C88CD0, {1u});
+    if (!REXCVAR_GET(gtav_grass)) Call(ctx, base, sub_82C7D2A0, {1u, 0u, 0u, 0u, std::bit_cast<uint32_t>(100000.0f)});
+    if (!REXCVAR_GET(gtav_ambient_services)) {
+      Call(ctx, base, sub_82D31768, {0u});
+      Call(ctx, base, sub_82D318F8, {0u});
+      Call(ctx, base, sub_82D31918, {0u});
+      Call(ctx, base, sub_82CE66F8, {0u});
+      Call(ctx, base, sub_82D314C8, {0u});
+      for (uint32_t service : {3u, 5u, 11u, 14u}) Call(ctx, base, sub_82C89080, {service, 0u});
+    }
+    if (!REXCVAR_GET(gtav_model_budget)) {
+      Call(ctx, base, sub_82CF0E98, {1u});
+      Call(ctx, base, sub_82CF0EB8, {1u});
+    }
   }
   const float density = g_density.load(std::memory_order_relaxed);
   const float lodscale = g_lodscale.load(std::memory_order_relaxed);
@@ -345,6 +390,18 @@ REX_HOOK_RAW(sub_82CE9CA8) {
       Call(ctx, base, sub_82D31618, {d});
     }
     if (lodscale > 0.0f) Call(ctx, base, sub_82CF1528, {std::bit_cast<uint32_t>(lodscale)});
+  }
+  if (now >= g_frame_cuts_at) {
+    g_frame_cuts_at = now + std::chrono::milliseconds(4);
+    if (const float range = float(REXCVAR_GET(gtav_pop_range)); range < 1.0f) {
+      Call(ctx, base, sub_82CE5078, {std::bit_cast<uint32_t>(range)});
+      Call(ctx, base, sub_82D31658, {std::bit_cast<uint32_t>(range)});
+    }
+    if (!REXCVAR_GET(gtav_decals)) Call(ctx, base, sub_82C6ADB8, {});
+    if (!REXCVAR_GET(gtav_ambient_events)) {
+      Call(ctx, base, sub_82CE6390, {1u});
+      Call(ctx, base, sub_82C7B650, {});
+    }
   }
   int request = rex::input::mnk::TakeWeaponRequest();
   if (!request && now < g_next_check) return;
