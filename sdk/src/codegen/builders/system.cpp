@@ -257,6 +257,8 @@ bool build_mfocrf(BuilderContext& ctx) {
 bool build_mflr(BuilderContext& ctx) {
   if (!ctx.config().skipLr)
     ctx.println("\t{}.u64 = ctx.lr;", ctx.r(ctx.insn.operands[0]));
+  else
+    ctx.println("\t{}.u64 = 0;", ctx.r(ctx.insn.operands[0]));
   return true;
 }
 

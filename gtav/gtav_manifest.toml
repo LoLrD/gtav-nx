@@ -34,7 +34,7 @@ args_in_registers_exclude_file = "args_in_registers_exclude.txt"
 0x822271A0 = { size = 0x18 }  # orphan tail stub
 0x82CF0980 = { size = 0x78 }  # orphan tail stub
 0x82FADD60 = { size = 0x14 }  # orphan tail stub
-0x83452B08 = { size = 0x1C }  # orphan tail stub
+0x83452B08 = { size = 0x28 }  # orphan tail stub
 0x822397D0 = {}  # pointer target
 0x824C9948 = {}  # pointer target
 0x824E43A8 = {}  # pointer target

@@ -23,6 +23,7 @@
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <fstream>
 #include <inja/inja.hpp>
 
@@ -316,6 +317,76 @@ bool CodegenWriter::write(bool force) {
                             : (!fn->name().empty() ? fn->name() : fmt::format("sub_{:08X}", fn->base())));
   }
   emitCtx.referenced = nullptr;
+
+  {
+    std::vector<std::string> definite, possible;
+    std::vector<size_t> check(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i)
+      check[i] = i;
+    size_t marked = 0;
+    size_t vectorReaders = 0;
+    for (int round = 0; round < 8 && !check.empty(); ++round) {
+      std::unordered_set<std::string> names;
+      for (size_t i : check) {
+        if (bodyNames[i].rfind("__save", 0) == 0 || bodyNames[i].rfind("__rest", 0) == 0)
+          continue;
+        FindUninitializedLocalReads(bodies[i], definite, possible);
+        std::vector<std::string> vectors;
+        std::erase_if(definite, [&](const std::string& reg) {
+          if (reg[0] != 'v')
+            return false;
+          vectors.push_back(reg);
+          return true;
+        });
+        if (!vectors.empty() && round == 0 && ++vectorReaders)
+          REXCODEGEN_DEBUG("{} reads vector registers it never writes (kept as zero locals): {}", bodyNames[i],
+                           fmt::join(vectors, " "));
+        if (definite.empty())
+          continue;
+        FunctionNode* node = graph().getFunction(functions[i]->base());
+        if (!node || node->sharesRegisters()) {
+          REXCODEGEN_ERROR("{} reads registers before writing them: {}", bodyNames[i], fmt::join(definite, " "));
+          continue;
+        }
+        REXCODEGEN_WARN("{} reads {} before writing them (continues another function): share_registers",
+                        bodyNames[i], fmt::join(definite, " "));
+        node->setSharesRegisters(true);
+        names.insert(bodyNames[i]);
+        ++marked;
+      }
+      check.clear();
+      if (names.empty())
+        break;
+      for (size_t i = 0; i < bodies.size(); ++i) {
+        bool again = names.count(bodyNames[i]) != 0;
+        for (const auto& name : references[i])
+          again = again || names.count(name) != 0;
+        if (!again)
+          continue;
+        referenced.clear();
+        emitCtx.referenced = &referenced;
+        bodies[i] = functions[i]->emitCpp(emitCtx);
+        references[i] = referenced;
+        check.push_back(i);
+      }
+      emitCtx.referenced = nullptr;
+    }
+    size_t possibleCount = 0;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+      if (bodyNames[i].rfind("__save", 0) == 0 || bodyNames[i].rfind("__rest", 0) == 0)
+        continue;
+      FindUninitializedLocalReads(bodies[i], definite, possible);
+      std::erase_if(definite, [](const std::string& reg) { return reg[0] == 'v'; });
+      if (!definite.empty())
+        REXCODEGEN_ERROR("{} still reads registers before writing them: {}", bodyNames[i], fmt::join(definite, " "));
+      if (!possible.empty() && possibleCount++ < 32)
+        REXCODEGEN_DEBUG("{} may read registers before writing them on some path: {}", bodyNames[i],
+                         fmt::join(possible, " "));
+    }
+    REXCODEGEN_INFO("uninitialized locals: {} functions now share registers, {} may read a local unwritten on some path, "
+                    "{} read vector registers they never write",
+                    marked, possibleCount, vectorReaders);
+  }
 
   // Arguments in registers: rewrite the bodies (file assignment keeps using the original sizes, so the
   // partition does not depend on the option).
