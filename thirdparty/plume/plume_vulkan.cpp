@@ -1055,6 +1055,9 @@ namespace plume {
         imageInfo.usage |= ((desc.flags & RenderTextureFlag::RENDER_TARGET) && g_colorInputAttachments) ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0;
         imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
         imageInfo.usage |= (desc.flags & RenderTextureFlag::STORAGE) ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
+        if (desc.flags & RenderTextureFlag::NO_COPY_DEST) {
+            imageInfo.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        }
 
         if (desc.multisampling.sampleLocationsEnabled && (desc.flags & RenderTextureFlag::DEPTH_TARGET)) {
             imageInfo.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;

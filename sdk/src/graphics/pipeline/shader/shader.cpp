@@ -213,3 +213,14 @@ extern "C" REX_SHADER_EXPORT uint32_t rex_shader_texture_fetch_mask(bool pixel, 
   for (const auto& binding : shader.texture_bindings()) mask |= 1u << (binding.fetch_constant & 31);
   return mask;
 }
+
+extern "C" REX_SHADER_EXPORT uint32_t rex_shader_ucode_flags(bool pixel, const uint32_t* ucode_dwords,
+                                                              uint32_t dword_count) {
+  using namespace rex::graphics;
+  if (!ucode_dwords || !dword_count) return 7;
+  Shader shader(pixel ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex, 0, ucode_dwords, dword_count);
+  rex::string::StringBuffer disasm;
+  shader.AnalyzeUcode(disasm);
+  return (shader.kills_pixels() ? 1u : 0u) | (shader.writes_depth() ? 2u : 0u) |
+         (shader.memexport_eM_written() ? 4u : 0u);
+}

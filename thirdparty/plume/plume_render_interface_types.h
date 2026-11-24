@@ -448,7 +448,8 @@ namespace plume {
             DEPTH_TARGET = 1U << 1,
             STORAGE = 1U << 2,
             UNORDERED_ACCESS = 1U << 3,
-            CUBE = 1U << 4
+            CUBE = 1U << 4,
+            NO_COPY_DEST = 1U << 5
         };
     };
 

@@ -53,6 +53,7 @@
 #include <unordered_set>
 #include <bit>
 #include <set>
+#include <utility>
 // Phones (Android, iOS): the settings and paths measured on the Android port.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -206,6 +207,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore_strips, false, "GTAV",
+                    "Native renderer: skip every draw of the depth restore vertex shader, whatever its pixel shader "
+                    "(TU27 draws the strips with pixel shader 7AFFD9F0F46AECFC and a null one, which the check above "
+                    "misses: 24 render passes a frame)");
 #if GTAV_MOBILE
 #define GTAV_DRAW_CLEARS_DEFAULT false  // vkCmdClearAttachments can become a load op (gtav_native_load_clears)
 #else
@@ -242,6 +247,30 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_fsr_sharpness, 0.25, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
+REXCVAR_DEFINE_BOOL(gtav_native_depth_zcull, false, "GTAV",
+                    "Native renderer: depth targets without transfer-destination usage, cleared in a render pass "
+                    "when created, so NVK gives them a ZCULL plane (hidden pixels rejected before shading); "
+                    "read when a depth target is created");
+REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
+                     "Native renderer: depth/stencil tests before the pixel shader (same images, hidden pixels are "
+                     "not shaded): 1 = draws whose pixel shader can kill pixels and that write neither depth nor "
+                     "stencil, 2 = also every draw whose pixel shader cannot kill (no texkill, alpha test or "
+                     "alpha-to-mask)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
+                    "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
+                    "queries");
+REXCVAR_DEFINE_BOOL(gtav_native_light_fill_reuse, false, "GTAV",
+                    "Native renderer, with --gtav_light_shadow_draws=false: a local light shadow face that is only "
+                    "its fill quad and a resolve into a texture that already holds that fill keeps the texture "
+                    "(no copy; the quad itself is skipped too when it writes neither depth nor stencil)");
+REXCVAR_DEFINE_INT32(gtav_native_cube_every, 1, "GTAV",
+                     "Native renderer: the game redraws its reflection cube map (six multisampled faces) every "
+                     "frame. N > 1 redraws it every Nth frame and passes over its draws, clears and resolves on "
+                     "the others: reflections on cars and windows then move at 1/N of the frame rate (live)");
+REXCVAR_DEFINE_BOOL(gtav_native_keep_targets, false, "GTAV",
+                    "Native renderer: draws into some of the bound pass's attachments (fewer colour targets, or no "
+                    "depth) keep the pass and leave the others unwritten, instead of starting a pass with the "
+                    "smaller set (live)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -974,12 +1003,44 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 // --gtav_native_render_scale: pipelines drawing into scaled targets carry this spec bit (it also
 // keys them apart) and get spec constant 1 = 1 / scale, which the shaders' vPos is multiplied by.
 constexpr uint32_t kSpecScaled = 1u << 8;
+constexpr uint32_t kSpecEarlyTests = 1u << 9;
 float g_pixel_scale_inv = 1.0f;
 uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
-  out[0] = RenderSpecConstant(0, spec);
+  out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
   if (!(spec & kSpecScaled)) return 1;
   out[1] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
   return 2;
+}
+
+std::vector<uint8_t> EarlyFragmentTestsSpirv(const std::vector<uint8_t>& data) {
+  constexpr uint32_t kOpEntryPoint = 15, kOpExecutionMode = 16, kOpDecorate = 71, kOpMemberDecorate = 72;
+  constexpr uint32_t kFragment = 4, kEarlyFragmentTests = 9, kDepthReplacing = 12, kBuiltIn = 11, kFragDepth = 22;
+  const size_t n = data.size() / 4;
+  if (n < 5) return {};
+  std::vector<uint32_t> words(n);
+  std::memcpy(words.data(), data.data(), n * 4);
+  uint32_t entry = 0;
+  size_t insert_at = 0;
+  for (size_t at = 5; at < n;) {
+    const uint32_t count = words[at] >> 16, op = words[at] & 0xFFFF;
+    if (!count || at + count > n) return {};
+    if (op == kOpEntryPoint && count >= 3 && words[at + 1] == kFragment) {
+      entry = words[at + 2];
+      insert_at = at + count;
+    } else if (op == kOpExecutionMode && count >= 3) {
+      if (words[at + 2] == kDepthReplacing || words[at + 2] == kEarlyFragmentTests) return {};
+      insert_at = at + count;
+    } else if ((op == kOpDecorate && count >= 4 && words[at + 2] == kBuiltIn && words[at + 3] == kFragDepth) ||
+               (op == kOpMemberDecorate && count >= 5 && words[at + 3] == kBuiltIn && words[at + 4] == kFragDepth)) {
+      return {};
+    }
+    at += count;
+  }
+  if (!entry) return {};
+  words.insert(words.begin() + ptrdiff_t(insert_at), {3u << 16 | kOpExecutionMode, entry, kEarlyFragmentTests});
+  std::vector<uint8_t> out(words.size() * 4);
+  std::memcpy(out.data(), words.data(), out.size());
+  return out;
 }
 
 struct PipelineJob {
@@ -1246,24 +1307,27 @@ class PipelineWarmer {
     std::unique_ptr<RenderPipeline> result;
   };
 
-  const RenderShader* LoadShader(uint64_t hash, bool pixel) {
+  const RenderShader* LoadShader(uint64_t hash, bool pixel, bool early = false) {
     if (!hash) return nullptr;
     std::string name = fmt::format("{}_{:016X}.spv", pixel ? "ps" : "vs", hash);
+    const std::string key = early ? name + "#early" : name;
     {
       std::lock_guard lock(shader_mutex_);
-      if (auto it = shaders_.find(name); it != shaders_.end()) return it->second.get();
+      if (auto it = shaders_.find(key); it != shaders_.end()) return it->second.get();
     }
     std::unique_ptr<RenderShader> shader;
     if (FILE* f = std::fopen((spirv_dir_ + "/" + name).c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
       std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
       std::fseek(f, 0, SEEK_SET);
-      if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size())
-        shader = device_->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+      if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size()) {
+        if (early) data = EarlyFragmentTestsSpirv(data);
+        if (!data.empty()) shader = device_->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+      }
       std::fclose(f);
     }
     std::lock_guard lock(shader_mutex_);
-    auto& slot = shaders_[name];
+    auto& slot = shaders_[key];
     if (!slot) slot = std::move(shader);
     return slot.get();
   }
@@ -1294,7 +1358,7 @@ class PipelineWarmer {
       }
       std::unique_ptr<RenderPipeline> pipeline;
       const RenderShader* vs = LoadShader(rec->vs, false);
-      const RenderShader* ps = LoadShader(rec->ps, true);
+      const RenderShader* ps = LoadShader(rec->ps, true, spec.value & kSpecEarlyTests);
       if (io.ok && vs && (ps || !rec->ps) && (!has_gs || gs_)) {
         desc.pipelineLayout = layout_;
         desc.vertexShader = vs;
@@ -1433,11 +1497,15 @@ struct ResolvedTexture {
   uint32_t width, height, descriptor;
   bool render_target = false;
   bool depth_copy = false;  // R32F copy of a depth resolve (only for depth-format fetches)
+  bool light_fill = false;
+  uint64_t fill_sig = 0;
+  uint32_t fill_rect[6] = {};
   float scale = 1.0f;       // of the source target: the texture is width * scale by height * scale
   uint64_t serial = 0;  // last write order
   // Cube faces and mip levels (resolves with a destination level/face): 6 layers for cubes,
   // the fetch constant's mip count, one render view + framebuffer per written (face, level).
   uint32_t mips = 1, layers = 1;
+  uint32_t cube_faces = 0;
   uint32_t fetch_words[6] = {};  // destination fetch constant of the last resolve
   std::unique_ptr<RenderTextureView> cube_view;
   uint32_t cube_descriptor = 0;
@@ -2203,6 +2271,19 @@ struct Backend::Impl {
 
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
+  uint32_t stat_early = 0, stat_silent = 0, stat_fills_reused = 0;
+  bool fill_resolve_next = false, fill_drawn = false, fill_sig_valid = false;
+  uint64_t fill_sig = 0;
+  const DrawCommand* skipped_fill = nullptr;
+
+  static uint64_t FillSignature(const FramePacket& f, const DrawCommand& d) {
+    uint64_t h = Hash(&d.vs_hash, sizeof(d.vs_hash), d.ps_hash);
+    h = Hash(f.At(d.inline_vertices), d.inline_size, h);
+    h = Hash(f.At(d.regs), kRegShadowSize, h);
+    if (d.ps_use)
+      for (const auto& run : d.ps_use->runs) h = Hash(f.At(d.ps_consts) + 16 * run.first, 16 * run.count, h);
+    return h;
+  }
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -2533,6 +2614,44 @@ struct Backend::Impl {
     if (labels.size() + 1 >= kPassStamps) return;
     list->writeTimestamp(pass_pools[slot].get(), uint32_t(labels.size()));
     labels.push_back(std::move(label));
+  }
+
+  std::vector<uint8_t> skip_commands;
+  uint32_t cube_skipped = 0, kept_targets = 0;
+  void MarkCubeSkips(const FramePacket& f) {
+    skip_commands.clear();
+    const int every = REXCVAR_GET(gtav_native_cube_every);
+    if (every <= 1 || frame % uint64_t(every) == 0) return;
+    for (size_t i = 0; i < f.commands.size(); i++) {
+      if (f.commands[i].kind != CommandKind::kResolve) continue;
+      const ResolveCommand& rc = f.resolves[f.commands[i].index];
+      const uint32_t source = rc.flags & 7;
+      const uint32_t* words = rc.dest_words + 7;
+      const uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
+      const uint32_t dw = (words[2] & 0x1FFF) + 1, dh = ((words[2] >> 13) & 0x1FFF) + 1;
+      if (source >= 4 || !base || ((words[5] >> 9) & 3) != 3 || dw != dh || rc.dest_level || rc.dest_face >= 6)
+        continue;
+      const uint8_t* r = f.At(rc.regs);
+      const auto surface = regs::Surface(r);
+      if (!surface.msaa) continue;
+      auto latest = resolved_latest.find(base);
+      if (latest == resolved_latest.end()) continue;
+      auto have = resolved.find(latest->second);
+      if (have == resolved.end() || !have->second.texture || !(have->second.cube_faces >> rc.dest_face & 1)) continue;
+      const uint32_t target = regs::Color(r, int(source)).base;
+      auto same_target = [&](const uint8_t* rr) {
+        const auto there = regs::Surface(rr);
+        return there.pitch == surface.pitch && there.msaa == surface.msaa && regs::Color(rr, int(source)).base == target;
+      };
+      if (skip_commands.empty()) skip_commands.assign(f.commands.size(), 0);
+      skip_commands[i] = 1;
+      for (size_t j = i; j-- > 0;) {
+        const Command& c = f.commands[j];
+        if (c.kind == CommandKind::kDraw && same_target(f.At(f.draws[c.index].regs))) skip_commands[j] = 1;
+        else if (c.kind == CommandKind::kClear && same_target(f.At(f.clears[c.index].regs))) skip_commands[j] = 1;
+        else break;
+      }
+    }
   }
 
   void PassBegin(const char* why) {
@@ -2901,6 +3020,46 @@ struct Backend::Impl {
     return (shaders[key] = std::move(shader)).get();
   }
 
+  std::unordered_map<uint64_t, std::unique_ptr<RenderShader>> early_shaders;
+  RenderShader* EarlyShader(uint64_t hash) {
+    auto [it, inserted] = early_shaders.try_emplace(hash);
+    if (!inserted) return it->second.get();
+    std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
+    if (dir.empty()) dir = DefaultSpirvDir();
+    if (FILE* f = std::fopen(fmt::format("{}/ps_{:016X}.spv", dir, hash).c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
+      std::fseek(f, 0, SEEK_SET);
+      const bool read = !data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size();
+      std::fclose(f);
+      if (read) data = EarlyFragmentTestsSpirv(data);
+      if (read && !data.empty())
+        it->second = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+    }
+    return it->second.get();
+  }
+
+  static bool DepthStencilWrites(const uint8_t* r, uint32_t dc) {
+    if ((dc & 2) && (dc & 4)) return true;
+    if (!(dc & 1) || !((regs::Read(r, regs::RB_STENCILREFMASK) >> 16) & 0xFF)) return false;
+    const bool front = ((dc >> 11) & 7) || ((dc >> 14) & 7) || ((dc >> 17) & 7);
+    const bool back = (dc & 0x80) && (((dc >> 23) & 7) || ((dc >> 26) & 7) || ((dc >> 29) & 7));
+    return front || back;
+  }
+
+  bool EarlyTests(const uint8_t* r, const DrawCommand& d, const RenderTarget* depth, uint32_t spec,
+                  uint32_t alpha_to_mask) const {
+    const int32_t mode = REXCVAR_GET(gtav_native_early_depth_tests);
+    if (mode <= 0 || !depth || active_query >= 0 || dumping || !d.ps_use || d.ps_use->writes_depth ||
+        d.ps_use->memexport || TileOverride(d.ps_hash))
+      return false;
+    const uint32_t dc = regs::Read(r, regs::RB_DEPTHCONTROL);
+    if (!(dc & 3)) return false;
+    const bool kills = d.ps_use->kills || (spec & 2) || alpha_to_mask ||
+                       ((regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1);
+    return kills ? !DepthStencilWrites(r, dc) : mode >= 2;
+  }
+
   // Color formats that share one EDRAM layout alias the same target: the guest draws into a
   // surface under one format and keeps drawing (or resolves) under the other, e.g. the final scene
   // as 2_10_10_10_FLOAT and the HUD over it as 2_10_10_10_FLOAT_AS_16_16_16_16.
@@ -2942,10 +3101,11 @@ struct Backend::Impl {
     if (memo.first != key || !memo.second) memo = {key, &targets[key]};
     auto& t = *memo.second;
     if (t.texture && t.height >= height) return &t;
+    const bool zcull = depth && REXCVAR_GET(gtav_native_depth_zcull);
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
     // tiling (EDRAM holds only a tile of them), but D3D-level draws arrive once for the whole
     // surface, so targets are full size: at least 720 lines, never limited by EDRAM.
-    height = std::min(std::max({height, t.height, 720u}), kMaxTargetRows);
+    height = std::min(std::max({height, t.height, 720u, zcull ? 721u : 0u}), kMaxTargetRows);
     // Grown targets keep their contents: GTA binds a taller color target with the scene's depth
     // (e.g. the fog pass), and recreating the depth empty let distant fog meshes cover everything.
     std::unique_ptr<RenderTexture> old_texture;
@@ -2980,10 +3140,15 @@ struct Backend::Impl {
     t.scale = scaled && !(key & kFullSizeKey) ? rs : 1.0f;
     RenderMultisampling ms(SampleCount(msaa));
     const uint32_t tw = Sz(t.width, t.scale), th = Sz(t.height, t.scale);
-    t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms)
-                                            : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
+    t.texture = device->createTexture(
+        depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms, nullptr,
+                                               zcull ? RenderTextureFlag::NO_COPY_DEST : RenderTextureFlag::NONE)
+              : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
     if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, tw, th);
-    if (old_texture && grow_list) {
+    if (old_texture && zcull) {
+      REXLOG_WARN("[native] depth target {:03X} pitch {} grows {} -> {} rows: ZCULL depth starts cleared", base, pitch,
+                  old_height, height);
+    } else if (old_texture && grow_list) {
       Transition(grow_list, old_texture.get(), RenderTextureLayout::COPY_SOURCE);
       Transition(grow_list, t.texture.get(), RenderTextureLayout::COPY_DEST);
       RenderBox box(0, 0, int32_t(Sz(std::min(old_width, t.width), t.scale)),
@@ -3007,6 +3172,12 @@ struct Backend::Impl {
         texture_set->setTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
                                 t.stencil_view.get());
       }
+    }
+    if (zcull && grow_list) {
+      InvalidateDrawState();
+      RenderTarget* none[4] = {};
+      BindTargets(grow_list, none, 0, &t);
+      grow_list->clearDepthStencil(true, true, 0.0f, 0);
     }
     return &t;
   }
@@ -4572,8 +4743,18 @@ struct Backend::Impl {
     // colour targets alias the depth surface (bases 000, 020, ... with depth at the base before).
     // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
     // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
-    if (d.ps_hash == 0xF1490AFF1455E54Full && d.vs_hash == 0x5A4385B7FE6CD154ull &&
-        REXCVAR_GET(gtav_native_skip_depth_restore))
+    if (d.light_fill && d.is_inline && fill_resolve_next && !dumping && REXCVAR_GET(gtav_native_light_fill_reuse)) {
+      fill_sig = FillSignature(f, d);
+      fill_sig_valid = true;
+      if (!DepthStencilWrites(r, regs::Read(r, regs::RB_DEPTHCONTROL))) {
+        skipped_fill = &d;
+        return false;
+      }
+      fill_drawn = true;
+    }
+    if (d.vs_hash == 0x5A4385B7FE6CD154ull &&
+        ((d.ps_hash == 0xF1490AFF1455E54Full && REXCVAR_GET(gtav_native_skip_depth_restore)) ||
+         REXCVAR_GET(gtav_native_skip_depth_restore_strips)))
       return false;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
@@ -4629,6 +4810,11 @@ struct Backend::Impl {
       bind_color = bound_color;
       bind_count = 0;
       while (bind_count < 4 && bound_color[bind_count]) bind_count++;
+    }
+    if (REXCVAR_GET(gtav_native_skip_silent_draws) && count == 0 && active_query < 0 && d.vs_use &&
+        !d.vs_use->memexport && !(d.ps_use && d.ps_use->memexport) && !DepthStencilWrites(r, dc)) {
+      stat_silent++;
+      return false;
     }
     prof.Mark(prof.setup);
 
@@ -4889,6 +5075,25 @@ struct Backend::Impl {
 
     uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    if (!colorless && count && bound_fb && REXCVAR_GET(gtav_native_keep_targets)) {
+      uint32_t bound_count = 0;
+      while (bound_count < 4 && bound_color[bound_count]) bound_count++;
+      bool subset =
+          bound_count >= count && (depth ? depth == bound_depth : bound_depth != nullptr || bound_count > count);
+      for (uint32_t i = 0; subset && i < count; i++) subset = color[i] == bound_color[i];
+      if (subset && (bound_count > count || depth != bound_depth)) {
+        bind_color = bound_color;
+        bind_count = bound_count;
+        depth = bound_depth;
+        kept_targets++;
+      }
+    }
+    if (ps && diag == kDiagOff && EarlyTests(r, d, depth, spec, *word(133)))
+      if (RenderShader* early = EarlyShader(d.ps_hash)) {
+        ps = early;
+        spec |= kSpecEarlyTests;
+        stat_early++;
+      }
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     RenderPipeline* pipeline =
         Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag, colorless,
@@ -6534,7 +6739,9 @@ struct Backend::Impl {
       ZeroTexture(list, dst.texture.get(), dst_format, Sz(dw, s), Sz(dh, s), mips, layers);
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      dst.cube_faces = 0;
     }
+    if (cube && rc.dest_level == 0) dst.cube_faces |= 1u << rc.dest_face;
     uint32_t x1 = 0, y1 = 0, x2 = std::min(dw, src->width), y2 = std::min(dh, src->height);
     if (rc.has_rect) {
       x1 = rc.source_rect[0], y1 = rc.source_rect[1];
@@ -6552,6 +6759,24 @@ struct Backend::Impl {
         tile_split = y1;
       }
     }
+    const uint32_t fill_rect[6] = {x1, y1, x2, y2, px, py};
+    const bool fill = rc.light_fill && !depth_resolve && !(rc.flags & 0x300) && !src->msaa;
+    const DrawCommand* skipped = std::exchange(skipped_fill, nullptr);
+    const bool drawn = std::exchange(fill_drawn, false), signed_fill = std::exchange(fill_sig_valid, false);
+    if ((skipped || drawn) && fill && dst.light_fill && dst.fill_sig == fill_sig &&
+        std::equal(fill_rect, fill_rect + 6, dst.fill_rect)) {
+      stat_fills_reused++;
+      Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
+      if (writeback_resolves) QueueWriteback(list, dst, base);
+      return;
+    }
+    if (skipped) {
+      fill_resolve_next = false;
+      Draw(list, f, *skipped);
+    }
+    dst.light_fill = fill && signed_fill;
+    dst.fill_sig = fill_sig;
+    std::copy(fill_rect, fill_rect + 6, dst.fill_rect);
     if (dumping && !depth_resolve) DumpTarget(list, src, 8 + source);  // the source as the copy sees it
     if (seqdiag)
       seq_note = fmt::format("resolve src {} {} ({}x{} fmt {}{}) rect {},{}-{},{} -> {:08X} {}x{} fmt {} at {},{} L{} F{} flags {:X}{}",
@@ -6738,6 +6963,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.grow_list = list;
   s.upscale_full = false;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
+  s.stat_early = s.stat_silent = s.stat_fills_reused = s.cube_skipped = s.kept_targets = 0;
+  s.skipped_fill = nullptr;
+  s.fill_drawn = s.fill_sig_valid = false;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
@@ -6838,14 +7066,26 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     consts(n.ps_consts, n.ps_use);
   };
   size_t next_draw = 0;  // index in f.commands of the first kDraw after the current command
+  s.MarkCubeSkips(f);
   for (size_t ci = 0; ci < f.commands.size(); ci++) {
     const auto& c = f.commands[ci];
+    if (!s.skip_commands.empty() && s.skip_commands[ci]) {
+      if (c.kind == CommandKind::kDraw) {
+        s.cur_draw = c.index + 1;
+        s.cube_skipped++;
+        if (!s.stream) DrawsRecorded(c.index + 1);
+      }
+      continue;
+    }
     switch (c.kind) {
       case CommandKind::kDraw:
         if (next_draw <= ci) next_draw = ci + 1;
         while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
         if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
         s.cur_draw = c.index;
+        s.fill_resolve_next = ci + 1 < f.commands.size() && f.commands[ci + 1].kind == CommandKind::kResolve &&
+                              f.resolves[f.commands[ci + 1].index].light_fill &&
+                              !(f.resolves[f.commands[ci + 1].index].flags & 0x300);
         if (!s.stream && !s.dumping && !s.take_notes) FenceReleaseBefore(f.draws[c.index].fence);
         s.Draw(list, f, f.draws[c.index]);
         s.cur_draw = c.index + 1;
@@ -6988,9 +7228,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.lost_first.clear();
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
-                "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
+                "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached, {} early-test "
+                "draws, {} silent draws skipped, {} light fills reused, {} cube draws passed over, {} draws kept "
+                "the bound targets",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
-                s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size());
+                s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size(),
+                s.stat_early, s.stat_silent, s.stat_fills_reused, s.cube_skipped, s.kept_targets);
   // The front buffer is the last resolve into the texture passed to Swap.
   ResolvedTexture* r = nullptr;
   for (auto it = f.resolves.rbegin(); it != f.resolves.rend(); ++it) {
