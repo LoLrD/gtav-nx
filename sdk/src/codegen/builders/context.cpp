@@ -13,6 +13,7 @@
 #include "helpers.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
@@ -230,6 +231,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
       }
 
       emitCtx.reference(name);
+      emit_live_in_handover(*targetFn, "\t");
       println("\t{}(ctx, base);", name);
       return;
     }
@@ -284,6 +286,27 @@ bool BuilderContext::localizesAnything() const {
     return false;
   const auto& cfg = config();
   return cfg.nonVolatileRegistersAsLocalVariables || cfg.nonArgumentRegistersAsLocalVariables;
+}
+
+void BuilderContext::emit_live_in_handover(const FunctionNode& target, const char* indent) {
+  for (const auto& reg : target.liveIn()) {
+    if (reg == "r0" || reg == "r2" || reg == "r11" || reg == "r12" || reg == "f0")
+      continue;
+    const size_t n = static_cast<size_t>(std::atoi(reg.c_str() + (reg[0] == 'c' ? 2 : 1)));
+    std::string local;
+    if (reg == "ctr")
+      local = ctr();
+    else if (reg[0] == 'c')
+      local = cr(n);
+    else if (reg[0] == 'r')
+      local = r(n);
+    else if (reg[0] == 'f')
+      local = f(n);
+    else
+      continue;
+    if (local.rfind("ctx.", 0) != 0)
+      println("{}ctx.{} = {};", indent, reg, local);
+  }
 }
 
 void BuilderContext::emit_call_sharing_registers(const std::string& call, bool copyBack,
@@ -354,11 +377,13 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           auto* targetFn = callTarget->asFunction();
           emitCtx.reference(targetFn->name());
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          if (targetFn->sharesRegisters())
+          if (targetFn->sharesRegisters()) {
             emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()), false,
                                         "\t\t");
-          else
+          } else {
+            emit_live_in_handover(*targetFn, "\t\t");
             println("\t\t{}(ctx, base);", targetFn->name());
+          }
           println("\t\treturn;");
           println("\t}}");
         } else if (callTarget->isImport()) {

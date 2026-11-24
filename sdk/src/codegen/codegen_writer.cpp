@@ -344,13 +344,24 @@ bool CodegenWriter::write(bool force) {
         if (definite.empty())
           continue;
         FunctionNode* node = graph().getFunction(functions[i]->base());
-        if (!node || node->sharesRegisters()) {
+        std::vector<std::string> liveIn = node ? node->liveIn() : std::vector<std::string>{};
+        const size_t before = liveIn.size();
+        for (const auto& reg : definite)
+          if (std::find(liveIn.begin(), liveIn.end(), reg) == liveIn.end())
+            liveIn.push_back(reg);
+        if (!node || node->sharesRegisters() || liveIn.size() == before) {
           REXCODEGEN_ERROR("{} reads registers before writing them: {}", bodyNames[i], fmt::join(definite, " "));
           continue;
         }
-        REXCODEGEN_WARN("{} reads {} before writing them (continues another function): share_registers",
-                        bodyNames[i], fmt::join(definite, " "));
-        node->setSharesRegisters(true);
+        const bool scratch = std::any_of(liveIn.begin(), liveIn.end(), [](const std::string& reg) {
+          return reg == "r0" || reg == "r2" || reg == "r11" || reg == "r12" || reg == "f0";
+        });
+        REXCODEGEN_WARN("{} reads {} before writing them (continues another function): {}", bodyNames[i],
+                        fmt::join(definite, " "), scratch ? "share_registers" : "taken from ctx at entry");
+        if (scratch)
+          node->setSharesRegisters(true);
+        else
+          node->setLiveIn(std::move(liveIn));
         names.insert(bodyNames[i]);
         ++marked;
       }
@@ -383,7 +394,7 @@ bool CodegenWriter::write(bool force) {
         REXCODEGEN_DEBUG("{} may read registers before writing them on some path: {}", bodyNames[i],
                          fmt::join(possible, " "));
     }
-    REXCODEGEN_INFO("uninitialized locals: {} functions now share registers, {} may read a local unwritten on some path, "
+    REXCODEGEN_INFO("uninitialized locals: {} functions take registers from ctx, {} may read a local unwritten on some path, "
                     "{} read vector registers they never write",
                     marked, possibleCount, vectorReaders);
   }
