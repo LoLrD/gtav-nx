@@ -168,6 +168,10 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_farpin_scale, 1.0, "GTAV",
 REXCVAR_DEFINE_STRING(gtav_native_skip_ps, "", "GTAV", "Diagnostic: drop draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
                      "Decoded texture cache budget: textures idle for 2 s are released above it (unified memory)");
+REXCVAR_DEFINE_INT32(gtav_native_texture_memory_mb, 0, "GTAV",
+                     "Guest texture budget in device memory actually allocated (0: none): textures not drawn for 120 "
+                     "frames are released above it (NVK rounds every texture up to 64 KB, so small ones cost far more "
+                     "than their decoded size)");
 REXCVAR_DEFINE_BOOL(gtav_native_texture_arena, false, "GTAV",
                     "Guest textures up to 8 MB are placed in 32 MB memory blocks shared with other textures instead of "
                     "allocations of their own (NVK: a texture over 1 MB was a vkAllocateMemory of its own)");
@@ -1546,6 +1550,7 @@ struct CachedTexture {
   uint64_t raw_hash = 0;  // HashGuestTexture of the decoded bytes
   uint64_t checked_frame = 0;
   uint64_t bytes = 0;  // decoded size: small textures are rechecked every frame
+  uint64_t memory = 0;
   uint64_t sampled_hash = 0;  // HashGuestTexture(sampled) at the last full check
   uint64_t sample_frame = ~0ull;  // frame of the last sampled check
   uint64_t used_frame = 0;  // last frame a draw bound it (EvictTextures)
@@ -1876,7 +1881,7 @@ struct Backend::Impl {
   // Running byte totals of `textures` (t.bytes) and `buffers` (b.size): the budget check used to walk
   // both maps every 60 frames (169,000 buffers after an hour of driving = a periodic hitch).
   // Re-summed every 600 frames in case an update path was missed.
-  uint64_t texture_bytes_total = 0, buffer_bytes_total = 0;
+  uint64_t texture_bytes_total = 0, buffer_bytes_total = 0, texture_memory_total = 0;
   std::unordered_map<uint64_t, uint32_t> samplers;  // desc hash -> descriptor index
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
   // Erased only by the buffer budget (EvictTexturesOverBudget), which then clears buffer_memo.
@@ -2479,10 +2484,12 @@ struct Backend::Impl {
       REXLOG_INFO("[native] low memory: caches shrink to half their budgets");
     const uint64_t min_idle = low_memory ? 30 : 120;
     uint64_t budget = uint64_t(std::max(64, REXCVAR_GET(gtav_native_texture_budget_mb))) << 20;
-    if (low_memory) budget /= 2;
+    uint64_t memory_budget = uint64_t(std::max(0, REXCVAR_GET(gtav_native_texture_memory_mb))) << 20;
+    if (low_memory) budget /= 2, memory_budget /= 2;
     if (frame % 600 == 0) {  // resync the running totals (and report drift once)
-      uint64_t tt = 0, bb = 0;
-      for (const auto& [key, t] : textures) tt += t.bytes;
+      uint64_t tt = 0, bb = 0, tm = 0;
+      for (const auto& [key, t] : textures) tt += t.bytes, tm += t.memory;
+      texture_memory_total = tm;
       for (const auto& [key, b] : buffers) bb += b.size;
       if ((tt != texture_bytes_total || bb != buffer_bytes_total) && total_drift_logs++ < 5)
         REXLOG_WARN("[native] cache totals drifted: textures {} vs {} MB, buffers {} vs {} MB",
@@ -2538,29 +2545,34 @@ struct Backend::Impl {
       texture_allocs = {};
       LogMemory();
     }
-    if (total <= budget) return;
+    const uint64_t memory = texture_memory_total;
+    if (total <= budget && (!memory_budget || memory <= memory_budget)) return;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
     for (const auto& [key, t] : textures)
       if (frame - t.used_frame >= min_idle && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
     std::sort(idle.begin(), idle.end());
-    uint64_t released = 0, freed_bytes = 0;
+    uint64_t released = 0, freed_bytes = 0, freed_memory = 0;
     for (const auto& [used, key] : idle) {
-      if (total - freed_bytes <= budget * 4 / 5) break;
+      if (total - freed_bytes <= budget * 4 / 5 && (!memory_budget || memory - freed_memory <= memory_budget * 4 / 5))
+        break;
       auto it = textures.find(key);
       CachedTexture& t = it->second;
       if (t.descriptor >= kFirstTextureDescriptor) pending_free_descriptors.push_back(t.descriptor);
-      if (t.texture) freed_bytes += t.bytes;
+      if (t.texture) freed_bytes += t.bytes, freed_memory += t.memory;
       if (t.view) dead_views.push_back(std::move(t.view));
       if (t.texture) dead_textures.push_back(std::move(t.texture));
       texture_bytes_total -= t.bytes;
+      texture_memory_total -= t.memory;
       textures.erase(it);
       released++;
     }
     if (released) texture_memo.fill({});
     textures_evicted += released;
     if (budget_logs++ < 20 || budget_logs % 100 == 0)
-      REXLOG_INFO("[native] texture budget: released {} textures ({:.0f} MB), {} cached ({:.0f} MB)", released,
-                  freed_bytes / 1048576.0, textures.size(), (total - freed_bytes) / 1048576.0);
+      REXLOG_INFO("[native] texture budget: released {} textures ({:.0f} MB decoded, {:.0f} MB of device memory), {} "
+                  "cached ({:.0f} MB decoded, {:.0f} MB of device memory)",
+                  released, freed_bytes / 1048576.0, freed_memory / 1048576.0, textures.size(),
+                  (total - freed_bytes) / 1048576.0, (memory - freed_memory) / 1048576.0);
   }
   uint32_t budget_logs = 0, buffer_budget_logs = 0, low_memory_logs = 0, total_drift_logs = 0;
 
@@ -2636,6 +2648,7 @@ struct Backend::Impl {
       if (t.view) dead_views.push_back(std::move(t.view));
       if (t.texture) dead_textures.push_back(std::move(t.texture));
       texture_bytes_total -= t.bytes;
+      texture_memory_total -= t.memory;
       textures.erase(it);
       released++;
     }
@@ -3395,6 +3408,8 @@ struct Backend::Impl {
     if (t.texture && t.format != dec.format) {  // same guest texture, other host format: new texture
       dead_textures.push_back(std::move(t.texture));
       dead_views.push_back(std::move(t.view));
+      texture_memory_total -= t.memory;
+      t.memory = 0;
     }
     if (!t.texture) {
       t.format = dec.format;
@@ -3402,6 +3417,8 @@ struct Backend::Impl {
           dec.volume ? RenderTextureDesc::Texture3D(dec.width, dec.height, dec.depth, 1, dec.format)
                      : RenderTextureDesc::Texture2D(dec.width, dec.height, dec.mip_count, dec.format),
           dec.data.size());
+      t.memory = VulkanMemorySize(t.texture.get());
+      texture_memory_total += t.memory;
       RenderTextureViewDesc view =
           dec.volume ? RenderTextureViewDesc::Texture3D(dec.format) : RenderTextureViewDesc::Texture2D(dec.format);
       view.componentMapping = dec.swizzle;
