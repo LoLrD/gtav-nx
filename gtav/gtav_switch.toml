@@ -56,3 +56,5 @@ gtav_native_early_depth_tests = 2
 gtav_native_skip_silent_draws = true
 gtav_native_skip_depth_restore_strips = true
 gtav_native_light_fill_reuse = true
+gtav_native_cube_every = 4
+gtav_native_keep_targets = true
