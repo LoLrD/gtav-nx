@@ -93,6 +93,7 @@
 #include "libavutil/intfloat.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem_internal.h"
+#include "libavutil/thread.h"
 
 #include "avcodec.h"
 #include "internal.h"
@@ -309,6 +310,40 @@ static av_cold int get_rate(AVCodecContext *avctx)
     return avctx->sample_rate;
 }
 
+static av_cold void decode_init_static(void)
+{
+    INIT_VLC_STATIC(&sf_vlc, SCALEVLCBITS, HUFF_SCALE_SIZE,
+                    scale_huffbits, 1, 1,
+                    scale_huffcodes, 2, 2, 616);
+
+    INIT_VLC_STATIC(&sf_rl_vlc, VLCBITS, HUFF_SCALE_RL_SIZE,
+                    scale_rl_huffbits, 1, 1,
+                    scale_rl_huffcodes, 4, 4, 1406);
+
+    INIT_VLC_STATIC(&coef_vlc[0], VLCBITS, HUFF_COEF0_SIZE,
+                    coef0_huffbits, 1, 1,
+                    coef0_huffcodes, 4, 4, 2108);
+
+    INIT_VLC_STATIC(&coef_vlc[1], VLCBITS, HUFF_COEF1_SIZE,
+                    coef1_huffbits, 1, 1,
+                    coef1_huffcodes, 4, 4, 3912);
+
+    INIT_VLC_STATIC(&vec4_vlc, VLCBITS, HUFF_VEC4_SIZE,
+                    vec4_huffbits, 1, 1,
+                    vec4_huffcodes, 2, 2, 604);
+
+    INIT_VLC_STATIC(&vec2_vlc, VLCBITS, HUFF_VEC2_SIZE,
+                    vec2_huffbits, 1, 1,
+                    vec2_huffcodes, 2, 2, 562);
+
+    INIT_VLC_STATIC(&vec1_vlc, VLCBITS, HUFF_VEC1_SIZE,
+                    vec1_huffbits, 1, 1,
+                    vec1_huffcodes, 2, 2, 562);
+
+    for (int i = 0; i < 33; i++)
+        sin64[i] = sin(i*M_PI / 64.0);
+}
+
 /**
  *@brief Initialize the decoder.
  *@param avctx codec context
@@ -316,6 +351,7 @@ static av_cold int get_rate(AVCodecContext *avctx)
  */
 static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int num_stream)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     uint8_t *edata_ptr = avctx->extradata;
     unsigned int channel_mask;
     int i, bits;
@@ -467,33 +503,7 @@ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int nu
         }
     }
 
-    INIT_VLC_STATIC(&sf_vlc, SCALEVLCBITS, HUFF_SCALE_SIZE,
-                    scale_huffbits, 1, 1,
-                    scale_huffcodes, 2, 2, 616);
-
-    INIT_VLC_STATIC(&sf_rl_vlc, VLCBITS, HUFF_SCALE_RL_SIZE,
-                    scale_rl_huffbits, 1, 1,
-                    scale_rl_huffcodes, 4, 4, 1406);
-
-    INIT_VLC_STATIC(&coef_vlc[0], VLCBITS, HUFF_COEF0_SIZE,
-                    coef0_huffbits, 1, 1,
-                    coef0_huffcodes, 4, 4, 2108);
-
-    INIT_VLC_STATIC(&coef_vlc[1], VLCBITS, HUFF_COEF1_SIZE,
-                    coef1_huffbits, 1, 1,
-                    coef1_huffcodes, 4, 4, 3912);
-
-    INIT_VLC_STATIC(&vec4_vlc, VLCBITS, HUFF_VEC4_SIZE,
-                    vec4_huffbits, 1, 1,
-                    vec4_huffcodes, 2, 2, 604);
-
-    INIT_VLC_STATIC(&vec2_vlc, VLCBITS, HUFF_VEC2_SIZE,
-                    vec2_huffbits, 1, 1,
-                    vec2_huffcodes, 2, 2, 562);
-
-    INIT_VLC_STATIC(&vec1_vlc, VLCBITS, HUFF_VEC1_SIZE,
-                    vec1_huffbits, 1, 1,
-                    vec1_huffcodes, 2, 2, 562);
+    ff_thread_once(&init_static_once, decode_init_static);
 
     /** calculate number of scale factor bands and their offsets
         for every possible block size */
@@ -569,10 +579,6 @@ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int nu
                      / s->avctx->sample_rate;
         s->subwoofer_cutoffs[i] = av_clip(cutoff, 4, block_size);
     }
-
-    /** calculate sine values for the decorrelation matrix */
-    for (i = 0; i < 33; i++)
-        sin64[i] = sin(i*M_PI / 64.0);
 
     if (avctx->debug & FF_DEBUG_BITSTREAM)
         dump_context(s);
