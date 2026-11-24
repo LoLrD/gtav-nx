@@ -272,8 +272,9 @@ REXCVAR_DEFINE_INT32(gtav_native_resolve_src_barrier, 0, "GTAV",
                      "Native renderer: a colour resolve first ends its source's render pass and makes the source "
                      "SHADER_READ, before anything else of the resolve (0: off, 1: full-width sources only, 2: every "
                      "colour resolve; live)");
-REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, true, "GTAV",
-                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: off)");
+REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, false, "GTAV",
+                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: "
+                    "off; on, the lit scene intermittently lost its sun and ambient light above row 512)");
 REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
                      "Diagnostic: in-pass resolves store 1 magenta, 2 source + red, 3 source with alpha 1, 4 a green clear");
 REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
