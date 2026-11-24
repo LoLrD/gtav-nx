@@ -160,6 +160,9 @@ REXCVAR_DEFINE_INT32(gpu_idle_spins, GPU_IDLE_SPINS_DEFAULT, "GPU",
                      "~70% of a core on a phone at 500)");
 REXCVAR_DEFINE_INT32(gpu_skip_rendering_lag_ms, 0, "GPU",
                      "Command processor latency behind the CPU's kicks (title-side renderer)");
+REXCVAR_DEFINE_BOOL(gpu_skip_rendering_unread_registers, true, "GPU",
+                    "With gpu_skip_rendering: drop shader constant writes (registers 0x4000 and up, read only by "
+                    "a host renderer) and store context register ranges without per-register handling");
 static std::mutex g_kick_mutex;
 static std::deque<std::pair<uint32_t, std::chrono::steady_clock::time_point>> g_kicks;
 
@@ -304,6 +307,7 @@ void CommandProcessor::WorkerThreadMain() {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  skip_unread_registers_ = REXCVAR_GET(gpu_skip_rendering) && REXCVAR_GET(gpu_skip_rendering_unread_registers);
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -658,7 +662,21 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
   if (!num_registers) {
     return;
   }
+  if (skip_unread_registers_ && base >= XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    ring->AdvanceRead(size_t(num_registers) * sizeof(uint32_t));
+    return;
+  }
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
+  if (skip_unread_registers_ && base >= 0x2000 && base + num_registers <= RegisterFile::kRegisterCount) {
+    uint32_t* values = register_file_->values + base;
+    uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
+    memory::copy_and_swap(values, reinterpret_cast<const uint32_t*>(range.first), first_count);
+    if (range.second_length != 0)
+      memory::copy_and_swap(values + first_count, reinterpret_cast<const uint32_t*>(range.second),
+                            range.second_length / sizeof(uint32_t));
+    ring->EndRead(range);
+    return;
+  }
   if (range.first_length != 0) {
     uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
     WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
@@ -699,21 +717,25 @@ void CommandProcessor::WriteREGISTERSRangeFromRing(memory::RingBuffer* ring, uin
 
 void CommandProcessor::WriteALURangeFromMem(uint32_t start_index, uint32_t* base,
                                             uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4000, base, num_registers);
 }
 
 void CommandProcessor::WriteFetchRangeFromMem(uint32_t start_index, uint32_t* base,
                                               uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4800, base, num_registers);
 }
 
 void CommandProcessor::WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4900, base, num_registers);
 }
 
 void CommandProcessor::WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (skip_unread_registers_) return;
   WriteRegistersFromMem(start_index + 0x4908, base, num_registers);
 }
 
