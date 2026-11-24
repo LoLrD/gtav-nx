@@ -1153,6 +1153,7 @@ namespace plume {
         RenderHeapType heapType = RenderHeapType::UNKNOWN;
         uint32_t minBlockCount = 0;
         uint32_t maxBlockCount = 0;
+        uint64_t blockSize = 0;
         bool useLinearAlgorithm = false;
         bool allowOnlyBuffers = false;
     };

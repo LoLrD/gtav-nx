@@ -44,6 +44,14 @@ extern "C" PFN_vkGetInstanceProcAddr plume_switch_get_instance_proc_addr(void);
 namespace plume {
     // Counters for the host renderer's per-frame stats: render passes begun, barrier calls.
     std::atomic<uint32_t> g_statRenderPasses{0}, g_statBarriers{0};  // (lists may be recorded on several threads)
+    std::atomic<uint64_t> g_statDeviceMemoryAllocs{0}, g_statDeviceMemoryFrees{0}, g_statDeviceMemoryBytes{0};
+    static void VKAPI_PTR countDeviceMemoryAllocate(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void *) {
+        g_statDeviceMemoryAllocs++;
+        g_statDeviceMemoryBytes += size;
+    }
+    static void VKAPI_PTR countDeviceMemoryFree(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void *) {
+        g_statDeviceMemoryFrees++;
+    }
     bool g_exactBarrierStages = true;  // strip TOP_OF_PIPE / BOTTOM_OF_PIPE next to other stages (see barriers)
     // Every render pass also declares its colour attachments as input attachments (same indices,
     // GENERAL layout) and render targets get the input attachment usage, so a pipeline can read the
@@ -1071,10 +1079,17 @@ namespace plume {
         // memory block into one MTLBuffer of the whole block once any buffer is bound in it: images
         // sharing VMA blocks with buffers were paid twice (iPhone: ~750 MB of Metal memory beyond
         // the caches, then the app was killed). An image's own allocation costs nothing extra.
-        createInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        if (createInfo.pool == VK_NULL_HANDLE) {
+            createInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        }
 #endif
 
         VkResult res = vmaCreateImage(device->allocator, &imageInfo, &createInfo, &vk, &allocation, &allocationInfo);
+        if (res != VK_SUCCESS && createInfo.pool != VK_NULL_HANDLE) {
+            this->pool = nullptr;
+            createInfo.pool = VK_NULL_HANDLE;
+            res = vmaCreateImage(device->allocator, &imageInfo, &createInfo, &vk, &allocation, &allocationInfo);
+        }
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaCreateImage failed with error code 0x%X.\n", res);
             return;
@@ -4091,6 +4106,7 @@ namespace plume {
         createInfo.memoryTypeIndex = memoryTypeIndex;
         createInfo.minBlockCount = desc.minBlockCount;
         createInfo.maxBlockCount = desc.maxBlockCount;
+        createInfo.blockSize = desc.blockSize;
         createInfo.flags |= desc.useLinearAlgorithm ? VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT : 0;
 
         res = vmaCreatePool(device->allocator, &createInfo, &vk);
@@ -4536,6 +4552,8 @@ namespace plume {
         allocatorInfo.pVulkanFunctions = &vmaFunctions;
         allocatorInfo.instance = renderInterface->instance;
         allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
+        static const VmaDeviceMemoryCallbacks deviceMemoryCallbacks = { countDeviceMemoryAllocate, countDeviceMemoryFree, nullptr };
+        allocatorInfo.pDeviceMemoryCallbacks = &deviceMemoryCallbacks;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // 256 MB default blocks: each becomes a 256 MB MTLBuffer under MoltenVK (the phone's Metal
         // memory grew in 256 MB steps); smaller blocks leave less unused memory behind.

@@ -12,10 +12,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "paths.h"
+
 REXCVAR_DEFINE_BOOL(gtav_native_stats, false, "GTAV", "Log per-second frame time and D3D call counts");
+REXCVAR_DEFINE_INT32(gtav_native_timeline, 0, "GTAV",
+                     "Write logs/timeline.csv: timestamps of the game's render thread, the renderer, the command "
+                     "processor and the GPU fence waits over this many guest frames (0: off)");
+REXCVAR_DEFINE_INT32(gtav_native_timeline_from, 1500, "GTAV", "--gtav_native_timeline: the first guest frame");
 
 namespace gtav::native {
 namespace {
@@ -35,7 +43,65 @@ struct FrameStats {
 };
 FrameStats g_frame;  // touched only by the swapping thread
 
+constexpr const char* kTimelineNames[kTlEventCount] = {
+    "game_draw", "game_swap", "game_submitted", "record_begin", "record_end",
+    "presented", "cp_swap",   "cp_swap_done",   "fence_wait",   "fence_wait_done"};
+
+struct TimelineRecord {
+  int64_t ns;
+  uint64_t frame;
+  uint32_t thread;
+  TimelineEvent event;
+};
+constexpr size_t kTimelineMax = 1 << 16;
+std::unique_ptr<TimelineRecord[]> g_timeline;
+std::atomic<size_t> g_timeline_next{0};
+std::atomic<int> g_timeline_state{0};  // 0 before the first frame, 1 collecting, 2 written
+std::atomic<uint32_t> g_timeline_threads{0};
+
+void TimelineWrite(size_t count) {
+  const std::string path = LogPath("timeline.csv");
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+  FILE* f = std::fopen(path.c_str(), "w");
+  if (!f) return;
+  std::fprintf(f, "ns,event,frame,thread\n");
+  for (size_t i = 0; i < count; i++) {
+    const TimelineRecord& r = g_timeline[i];
+    if (!r.ns) continue;
+    std::fprintf(f, "%lld,%s,%llu,%u\n", (long long)r.ns, kTimelineNames[r.event], (unsigned long long)r.frame,
+                 r.thread);
+  }
+  std::fclose(f);
+  REXLOG_INFO("[native] timeline: {} events written to {}", count, path);
+}
+
 }  // namespace
+
+void TimelineMark(TimelineEvent event, uint64_t frame) {
+  static const int32_t frames = REXCVAR_GET(gtav_native_timeline);
+  if (frames <= 0) return;
+  static const uint64_t from = uint64_t(std::max(0, REXCVAR_GET(gtav_native_timeline_from)));
+  int state = g_timeline_state.load(std::memory_order_acquire);
+  if (state == 0) {
+    if (event != kTlGameSwap || frame + 1 < from) return;
+    g_timeline.reset(new TimelineRecord[kTimelineMax]());
+    g_timeline_state.store(1, std::memory_order_release);
+  } else if (state != 1) {
+    return;
+  }
+  if (event == kTlGameSwap && frame >= from + uint64_t(frames)) {
+    if (g_timeline_state.exchange(2) == 1) TimelineWrite(std::min(g_timeline_next.load(), kTimelineMax));
+    return;
+  }
+  thread_local const uint32_t thread = g_timeline_threads.fetch_add(1) + 1;
+  const size_t at = g_timeline_next.fetch_add(1, std::memory_order_relaxed);
+  if (at >= kTimelineMax) return;
+  TimelineRecord& r = g_timeline[at];
+  r.frame = frame;
+  r.thread = thread;
+  r.event = event;
+  r.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
 
 bool StatsEnabled() {
   static const bool enabled = REXCVAR_GET(gtav_native_stats);

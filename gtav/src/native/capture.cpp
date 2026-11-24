@@ -12,6 +12,7 @@
 #include "paths.h"
 #include "renderer.h"
 #include "shaders.h"
+#include "stats.h"
 #include "xenos_regs.h"
 
 #include <unordered_map>
@@ -525,10 +526,11 @@ static struct {
   std::atomic<uint32_t> longest_hold_ms{0};
 } g_release_stats;
 
+static std::atomic<bool> g_release_unsupported{false}, g_fence_store_hooked{false};
 static bool ReleaseMode() {
   static const bool on = REXCVAR_GET(gtav_native_fence_release) && REXCVAR_GET(gtav_native_fence_copy) &&
                          REXCVAR_GET(gtav_native) != "off";
-  return on;
+  return on && !g_release_unsupported.load(std::memory_order_relaxed);
 }
 static bool FenceWaitMode() { return REXCVAR_GET(gtav_native_fence_wait) || ReleaseMode(); }
 
@@ -751,6 +753,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   const uint8_t* dev = Guest(device);
   const uint32_t index = uint32_t(g_packet.draws.size());
+  if (!index) TimelineMark(kTlGameDraw, GuestFrame());
   DrawCommand& d = g_packet.draws.emplace_back();
   d.indexed = indexed;
   d.primitive = primitive;
@@ -1319,7 +1322,9 @@ void OnCaptureSwap(uint32_t device, uint32_t front_buffer) {
       max_bytes = max_draws = 0;
     }
   }
+  TimelineMark(kTlGameSwap, frame);
   Submit(std::move(g_packet));
+  TimelineMark(kTlGameSubmitted, frame);
   g_packet = TakeSpare();
 }
 
@@ -1472,6 +1477,9 @@ extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, 
   gtav::linux_threads::Note(gtav::linux_threads::kCommandProcessor);
   uint32_t fence = g_fence_address.load(std::memory_order_relaxed);
   if (!fence || (address & 0x1FFFFFFF) != (fence & 0x1FFFFFFF)) return value;
+  if (Releasing() && !g_fence_store_hooked.load(std::memory_order_relaxed) && !g_release_unsupported.exchange(true))
+    REXLOG_WARN("[native] --gtav_native_fence_release needs the command processor's rex_skip_rendering_fence_store "
+                "(an old librexgpu-xenos next to the executable?): fences are held as with --gtav_native_fence_wait");
   std::lock_guard lock(g_fence_mutex);
   g_fence_latest = value;
   g_fence_endian = endian;
@@ -1489,6 +1497,7 @@ extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, 
 // the lock the render thread's releases take) as min(value, what the renderer allows).
 extern "C" GTAV_HOOK_EXPORT bool rex_skip_rendering_fence_store(uint32_t address, uint32_t value, uint32_t endian) {
   using namespace gtav::native;
+  if (!g_fence_store_hooked.load(std::memory_order_relaxed)) g_fence_store_hooked.store(true);
   if (!Releasing()) return false;
   gtav::linux_threads::Note(gtav::linux_threads::kCommandProcessor);
   const uint32_t fence = g_fence_address.load(std::memory_order_relaxed);

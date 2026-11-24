@@ -166,6 +166,12 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_farpin_scale, 1.0, "GTAV",
 REXCVAR_DEFINE_STRING(gtav_native_skip_ps, "", "GTAV", "Diagnostic: drop draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
                      "Decoded texture cache budget: textures idle for 2 s are released above it (unified memory)");
+REXCVAR_DEFINE_BOOL(gtav_native_texture_arena, false, "GTAV",
+                    "Guest textures up to 8 MB are placed in 32 MB memory blocks shared with other textures instead of "
+                    "allocations of their own (NVK: a texture over 1 MB was a vkAllocateMemory of its own)");
+REXCVAR_DEFINE_INT32(gtav_native_texture_arena_mb, 64, "GTAV",
+                     "With --gtav_native_texture_arena: memory reserved for the blocks with the first texture "
+                     "(kept for good; the arena grows beyond it on demand)");
 // iPhone: the vertex/index buffer cache had no limit and reached 18,000 buffers (140 MB of Metal
 // memory plus driver objects) within minutes of driving; the app was killed at ~2.2 GB.
 #if GTAV_MOBILE
@@ -310,6 +316,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
 namespace plume {
 extern bool g_colorInputAttachments;  // plume-gtav.patch
 extern std::atomic<uint32_t> g_statRenderPasses;   // plume-gtav.patch
+extern std::atomic<uint64_t> g_statDeviceMemoryAllocs, g_statDeviceMemoryFrees, g_statDeviceMemoryBytes;
 }
 
 namespace gtav::native {
@@ -1625,6 +1632,25 @@ uint64_t SampledHash(const uint8_t* p, uint64_t size) {
 
 struct Backend::Impl {
   RenderDevice* device = nullptr;
+  std::unique_ptr<RenderPool> texture_arena;
+  struct {
+    uint64_t created = 0, large = 0, in_arena = 0;
+  } texture_allocs;
+  std::unique_ptr<RenderTexture> CreateGuestTexture(const RenderTextureDesc& desc, uint64_t bytes) {
+    constexpr uint64_t kArenaBlock = 32ull << 20, kArenaMaxTexture = 8ull << 20;
+    texture_allocs.created++;
+    texture_allocs.large += bytes > (1u << 20);
+    if (!REXCVAR_GET(gtav_native_texture_arena) || bytes > kArenaMaxTexture) return device->createTexture(desc);
+    if (!texture_arena) {
+      RenderPoolDesc pool;
+      pool.heapType = RenderHeapType::DEFAULT;
+      pool.blockSize = kArenaBlock;
+      pool.minBlockCount = uint32_t((uint64_t(std::max(0, REXCVAR_GET(gtav_native_texture_arena_mb))) << 20) / kArenaBlock);
+      texture_arena = device->createPool(pool);
+    }
+    texture_allocs.in_arena++;
+    return texture_arena->createTexture(desc);
+  }
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
 #if GTAV_MOBILE
@@ -2402,6 +2428,12 @@ struct Backend::Impl {
                   "({} MB), {} render targets (~{} MB at 4 B/px)",
                   textures.size(), total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0,
                   upload_chunks, (upload_chunks * kUploadChunk) >> 20, targets.size(), target_bytes >> 20);
+      REXLOG_INFO("[native] texture memory per 600 frames: {} textures created ({} over 1 MB, {} in the arena); "
+                  "device memory: {} allocations ({} MB), {} frees",
+                  texture_allocs.created, texture_allocs.large, texture_allocs.in_arena,
+                  plume::g_statDeviceMemoryAllocs.exchange(0), plume::g_statDeviceMemoryBytes.exchange(0) >> 20,
+                  plume::g_statDeviceMemoryFrees.exchange(0));
+      texture_allocs = {};
     }
     if (total <= budget) return;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
@@ -3119,9 +3151,10 @@ struct Backend::Impl {
     }
     if (!t.texture) {
       t.format = dec.format;
-      t.texture = device->createTexture(
+      t.texture = CreateGuestTexture(
           dec.volume ? RenderTextureDesc::Texture3D(dec.width, dec.height, dec.depth, 1, dec.format)
-                     : RenderTextureDesc::Texture2D(dec.width, dec.height, dec.mip_count, dec.format));
+                     : RenderTextureDesc::Texture2D(dec.width, dec.height, dec.mip_count, dec.format),
+          dec.data.size());
       RenderTextureViewDesc view =
           dec.volume ? RenderTextureViewDesc::Texture3D(dec.format) : RenderTextureViewDesc::Texture2D(dec.format);
       view.componentMapping = dec.swizzle;
