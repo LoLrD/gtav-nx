@@ -1363,6 +1363,8 @@ static const char* WindowCallName(u32 call) {
  */
 std::atomic<unsigned> g_interval_swap{0};
 
+void RexSwitchPerfCount(unsigned id);
+
 Result __wrap_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence) {
   const u64 from = armGetSystemTick();
   const unsigned request = g_interval_swap.load(std::memory_order_relaxed);
@@ -1372,6 +1374,9 @@ Result __wrap_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fenc
   const s32 cur = nw ? nw->cur_slot : -2;
   const Result rc = __real_nwindowQueueBuffer(nw, slot, fence);
   Note(kQueueBuffer, from);
+  if (R_SUCCEEDED(rc)) {
+    RexSwitchPerfCount(0);
+  }
   if (R_FAILED(rc)) {
     // cur_slot from before the call: a mismatch with slot means the WSI queued an image it had not dequeued.
     NoteWindowFailure(kWinQueueBuffer, rc, slot, nullptr);
