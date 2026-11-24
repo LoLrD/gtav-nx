@@ -146,6 +146,9 @@ class FunctionNode {
   bool sharesRegisters() const { return sharesRegisters_; }
   void setSharesRegisters(bool val) { sharesRegisters_ = val; }
 
+  const std::vector<std::string>& liveIn() const { return liveIn_; }
+  void setLiveIn(std::vector<std::string> regs) { liveIn_ = std::move(regs); }
+
  private:
   //=========================================================================
   // Mutation methods - only FunctionGraph can call these
@@ -188,6 +191,7 @@ class FunctionNode {
   FunctionState state_ = FunctionState::kRegistered;
   bool hasExceptionHandler_ = false;
   bool sharesRegisters_ = false;
+  std::vector<std::string> liveIn_;
 
   // Populated at discover()
   std::vector<Block> blocks_;

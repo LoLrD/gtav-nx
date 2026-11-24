@@ -157,11 +157,13 @@ bool build_bctr(BuilderContext& ctx) {
         case TargetKind::Import:
           if (auto* targetFn = ctx.graph().getFunction(label)) {
             ctx.emitCtx.reference(targetFn->name());
-            if (targetFn->sharesRegisters())
+            if (targetFn->sharesRegisters()) {
               ctx.emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()),
                                               false, "\t\t");
-            else
+            } else {
+              ctx.emit_live_in_handover(*targetFn, "\t\t");
               ctx.println("\t\t{}(ctx, base);", targetFn->name());
+            }
           } else {
             REXCODEGEN_ERROR(
                 "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",

@@ -97,8 +97,12 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   set with `rex::filesystem::SetReadFilter`. NieR uses it to show Switch button icons and texts without changing the
   game files.
 - `src/codegen/codegen_writer.cpp`, `src/codegen/args_in_registers.cpp` (`FindUninitializedLocalReads`): after
-  emitting, every body is checked for register locals (r0-r31, f0-f31, v0-v127, cr0-cr7, ctr) read before any write on
-  every path from its entry. Such a function continues another one (a tail stub split off by the manifest, a fragment)
-  and would read zeros from its zero-initialized locals; it is marked `share_registers` (registers stay in ctx, callers
-  hand theirs over) and it and its callers are emitted again. Inline saves of callee-saved registers and `mfcr` do not
-  count as reads. The run logs each marked function and errors for any body that still reads a local unwritten.
+  emitting, every body is checked for register locals (r0-r31, f0-f31, cr0-cr7, ctr) read before any write on every
+  path from its entry. Such a function continues another one (a tail stub split off by the manifest, an entry in the
+  middle of a function, a setjmp-like save) and would read zeros from its zero-initialized locals. It takes those
+  registers from ctx at entry (`FunctionNode::liveIn`) and every direct caller stores its copies to ctx before the call,
+  without taking anything back; a function that reads a scratch register (r0, r2, r11, r12, f0) is marked
+  `share_registers` instead (the stack probe). It and its callers are emitted again. Inline saves of callee-saved
+  registers, `mfcr` and the caller-side stores do not count as reads. Vector registers are only counted (379 functions
+  read one they never write, mostly the source of a `vrlimi128`; they keep reading zero). `mflr` under `skip_lr`
+  writes 0 to its register.

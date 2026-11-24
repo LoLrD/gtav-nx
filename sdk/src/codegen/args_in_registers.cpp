@@ -1227,6 +1227,11 @@ void LocalMasks(std::string_view s, LocalSet& use, LocalSet& def) {
   def.reset();
   if (StartsWith(s, "const auto s_"))
     return;
+  if (StartsWith(s, "ctx.") && EndsWith(s, ";")) {
+    size_t eq = s.find(" = ");
+    if (eq != std::string_view::npos && s.substr(4, eq - 4) == s.substr(eq + 3, s.size() - eq - 4))
+      return;
+  }
   const bool vectorStore = StartsWith(s, "simde_mm_store") && s.find("REX_RAW_ADDR(") != std::string_view::npos;
   size_t frameValue = std::string_view::npos;
   if (StartsWith(s, "REX_STORE")) {

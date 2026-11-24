@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -635,6 +636,26 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "\t}}\n");
   } else {
     emit_println(body, "}}\n");
+  }
+
+  if (!liveIn_.empty() && !sharesRegisters()) {
+    std::string init;
+    for (const auto& reg : liveIn_) {
+      const int n = std::atoi(reg.c_str() + (reg[0] == 'c' ? 2 : 1));
+      if (reg == "ctr" && ctx.config.ctrAsLocalVariable) {
+        localVariables.ctr = true;
+      } else if (reg[0] == 'c' && reg != "ctr" && ctx.config.crRegistersAsLocalVariables) {
+        localVariables.cr[n] = true;
+      } else if (reg[0] == 'r' && n >= 14 && ctx.config.nonVolatileRegistersAsLocalVariables) {
+        localVariables.r[n] = true;
+      } else if (reg[0] == 'f' && n >= 14 && ctx.config.nonVolatileRegistersAsLocalVariables) {
+        localVariables.f[n] = true;
+      } else {
+        continue;
+      }
+      emit_println(init, "\t{} = ctx.{};", reg, reg);
+    }
+    body = init + body;
   }
 
   // --- Emit local variable declarations, then body ---

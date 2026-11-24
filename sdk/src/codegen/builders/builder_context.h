@@ -246,6 +246,8 @@ struct BuilderContext {
    */
   void emit_call_sharing_registers(const std::string& call, bool copyBack, const char* indent);
 
+  void emit_live_in_handover(const FunctionNode& target, const char* indent);
+
   /// True if this function keeps anything in locals that a sharing callee would need.
   bool localizesAnything() const;
 
