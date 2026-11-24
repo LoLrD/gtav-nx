@@ -234,6 +234,10 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
+REXCVAR_DEFINE_BOOL(gtav_native_depth_zcull, false, "GTAV",
+                    "Native renderer: depth targets without transfer-destination usage, cleared in a render pass "
+                    "when created, so NVK gives them a ZCULL plane (hidden pixels rejected before shading); "
+                    "read when a depth target is created");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -2931,10 +2935,11 @@ struct Backend::Impl {
     if (memo.first != key || !memo.second) memo = {key, &targets[key]};
     auto& t = *memo.second;
     if (t.texture && t.height >= height) return &t;
+    const bool zcull = depth && REXCVAR_GET(gtav_native_depth_zcull);
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
     // tiling (EDRAM holds only a tile of them), but D3D-level draws arrive once for the whole
     // surface, so targets are full size: at least 720 lines, never limited by EDRAM.
-    height = std::min(std::max({height, t.height, 720u}), kMaxTargetRows);
+    height = std::min(std::max({height, t.height, 720u, zcull ? 721u : 0u}), kMaxTargetRows);
     // Grown targets keep their contents: GTA binds a taller color target with the scene's depth
     // (e.g. the fog pass), and recreating the depth empty let distant fog meshes cover everything.
     std::unique_ptr<RenderTexture> old_texture;
@@ -2969,10 +2974,15 @@ struct Backend::Impl {
     t.scale = rs != 1.0f && !msaa && pitch >= 1280 ? rs : 1.0f;
     RenderMultisampling ms(SampleCount(msaa));
     const uint32_t tw = Sz(t.width, t.scale), th = Sz(t.height, t.scale);
-    t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms)
-                                            : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
+    t.texture = device->createTexture(
+        depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms, nullptr,
+                                               zcull ? RenderTextureFlag::NO_COPY_DEST : RenderTextureFlag::NONE)
+              : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
     if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, tw, th);
-    if (old_texture && grow_list) {
+    if (old_texture && zcull) {
+      REXLOG_WARN("[native] depth target {:03X} pitch {} grows {} -> {} rows: ZCULL depth starts cleared", base, pitch,
+                  old_height, height);
+    } else if (old_texture && grow_list) {
       Transition(grow_list, old_texture.get(), RenderTextureLayout::COPY_SOURCE);
       Transition(grow_list, t.texture.get(), RenderTextureLayout::COPY_DEST);
       RenderBox box(0, 0, int32_t(Sz(std::min(old_width, t.width), t.scale)),
@@ -2996,6 +3006,12 @@ struct Backend::Impl {
         texture_set->setTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
                                 t.stencil_view.get());
       }
+    }
+    if (zcull && grow_list) {
+      InvalidateDrawState();
+      RenderTarget* none[4] = {};
+      BindTargets(grow_list, none, 0, &t);
+      grow_list->clearDepthStencil(true, true, 0.0f, 0);
     }
     return &t;
   }
