@@ -31,12 +31,12 @@ REXCVAR_DEFINE_BOOL(gtav_nr_unpack, true, "GTAV", "Native animation track unpack
 REXCVAR_DEFINE_BOOL(gtav_nr_volume, true, "GTAV",
                     "Native volume rasterization of boxes into a 4x4x6 cell grid (sub_8315B8D0)");
 REXCVAR_DEFINE_BOOL(gtav_nr_quat, true, "GTAV", "Native animation Euler-to-quaternion curve evaluation (sub_83420D18)");
-REXCVAR_DEFINE_BOOL(gtav_nr_cull, false, "GTAV", "Native triangle binning into the 12 occlusion tiles (sub_831665D8)");
+REXCVAR_DEFINE_BOOL(gtav_nr_cull, true, "GTAV", "Native triangle binning into the 12 occlusion tiles (sub_831665D8)");
 REXCVAR_DEFINE_BOOL(gtav_nr_blend, true, "GTAV", "Native animation frame blending (sub_83441C48)");
-REXCVAR_DEFINE_BOOL(gtav_nr_bound, false, "GTAV", "Native sphere against box overlap test (sub_83585DE8)");
+REXCVAR_DEFINE_BOOL(gtav_nr_bound, true, "GTAV", "Native sphere against box overlap test (sub_83585DE8)");
 REXCVAR_DEFINE_BOOL(gtav_nr_vm, false, "GTAV", "Native animation expression VM (sub_834260A0)");
-REXCVAR_DEFINE_BOOL(gtav_nr_pack, false, "GTAV", "Native packed-element sphere culling into a bitmask (sub_8358AE80)");
-REXCVAR_DEFINE_BOOL(gtav_nr_gather, false, "GTAV",
+REXCVAR_DEFINE_BOOL(gtav_nr_pack, true, "GTAV", "Native packed-element sphere culling into a bitmask (sub_8358AE80)");
+REXCVAR_DEFINE_BOOL(gtav_nr_gather, true, "GTAV",
                     "Native skeleton local-pose gather and hierarchy transform (sub_83442200)");
 REXCVAR_DEFINE_INT32(gtav_nr_check, 0, "GTAV",
                      "Differential check: every Nth call of a replaced function runs both the native and the "
