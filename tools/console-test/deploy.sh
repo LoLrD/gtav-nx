@@ -8,6 +8,8 @@ SPIRV="${GTAV_SPIRV:-$ROOT/out/spirv}"
 
 ftp_put "$NRO" "gtav-nx.nro"
 ftp_put "$ROOT/gtav/gtav_switch.toml" "gtav.toml"
+mkdir -p "$ROOT/out/console-test/deployed"
+cp -f "$ROOT/out/nx/gtav" "$ROOT/out/console-test/deployed/gtav.elf"
 echo "nro + config uploaded"
 
 if [[ "${1:-}" == "--spirv" ]]; then
