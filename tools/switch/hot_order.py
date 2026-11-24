@@ -64,12 +64,13 @@ def main():
         stack.update(s)
     order = sorted(set(pc) | set(stack), key=lambda n: (-pc[n], -stack[n], n))
     seen = set()
-    lines = [".text : {", "  KEEP (*(.crt0))"]
+    lines = [".text : {", "  KEEP (*(.crt0))", "  *(.text.rex_code_blocks_head)"]
     for name in order:
         for sec in sections(name):
             if sec not in seen:
                 seen.add(sec)
                 lines.append(f"  *({sec})")
+    lines.append("  *(.text.rex_code_blocks_hot_end)")
     lines.append("}")
     with open(out, "w") as f:
         f.write("\n".join(lines) + "\n")

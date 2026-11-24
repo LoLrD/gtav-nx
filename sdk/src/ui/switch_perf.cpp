@@ -44,6 +44,7 @@
 
 // libnx: the end of the heap that newlib's sbrk hands out (see HeapState).
 extern "C" char* fake_heap_end;
+extern "C" const char* RexSwitchCodeBlocksReport(void) __attribute__((weak));
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -1101,6 +1102,9 @@ void ProfilerMain(void*) {
     std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                  g_text_hi);
     std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
+    if (RexSwitchCodeBlocksReport) {
+      std::fprintf(f, "%s\n", RexSwitchCodeBlocksReport());
+    }
     std::fclose(f);
   }
 
@@ -1189,6 +1193,10 @@ __attribute__((constructor(102))) void StartProfiler() {
   if (R_SUCCEEDED(svcQueryMemory(&mi, &page_info, g_base))) {
     g_text_lo = mi.addr;
     g_text_hi = mi.addr + mi.size;
+    while (R_SUCCEEDED(svcQueryMemory(&mi, &page_info, g_text_hi)) && mi.addr == g_text_hi && mi.size &&
+           (mi.perm & Perm_X)) {
+      g_text_hi = mi.addr + mi.size;
+    }
   }
   Register(envGetMainThreadHandle());
   std::strncpy(g_slots[0].name, "main (UI)", sizeof(g_slots[0].name) - 1);

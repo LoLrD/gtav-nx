@@ -1,5 +1,6 @@
 .text : {
   KEEP (*(.crt0))
+  *(.text.rex_code_blocks_head)
   *(.text.__imp__sub_8320CF78)
   *(.text.__fast_sub_8320CF78)
   *(.text.sub_8320CF78)
@@ -7415,4 +7416,5 @@
   *(.text.__fast_sub_83817CC0)
   *(.text.sub_83817CC0)
   *(.text.av_fifo_freep)
+  *(.text.rex_code_blocks_hot_end)
 }
