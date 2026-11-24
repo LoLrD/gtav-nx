@@ -66,7 +66,6 @@ constexpr uint32_t kDlFrameBegin = 0x1A;
 constexpr uint32_t kDlFrameEnd = 0x1B;
 constexpr uint32_t kDlParaboloidReflection = 0x0A;
 constexpr uint32_t kDlShadows = 0x0C;
-constexpr uint32_t kDlHud = 0x0E;
 constexpr float kLightShadowMaxWidth = 256.0f;
 constexpr uint32_t kTlsDrawList = 344;
 constexpr uint32_t kParaboloidShadowIndex = 1072;
@@ -195,7 +194,7 @@ bool SkipDraw(const uint8_t* base, uint32_t device) {
   return g_current_dl == kDlParaboloidReflection && !REXCVAR_GET(gtav_reflection_draws);
 }
 
-bool InHudDrawList() { return g_current_dl == kDlHud; }
+uint8_t CurrentDrawList() { return uint8_t(g_current_dl); }
 
 bool LightShadowPass(const uint8_t* device) {
   return Cut() && g_current_dl == kDlShadows && !REXCVAR_GET(gtav_light_shadow_draws) &&

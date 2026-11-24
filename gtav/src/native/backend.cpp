@@ -239,8 +239,12 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV
                       "(0.5-2: above 1 renders at a higher resolution than the Xbox 720p; read at start)");
 REXCVAR_DEFINE_BOOL(gtav_native_fsr, false, "GTAV",
                     "Native renderer (live): upscale the scene rendered below full size (--gtav_native_render_scale "
-                    "under 1) with FSR 1 (EASU, then RCAS) before the HUD, which then draws at full size; frames "
-                    "without a HUD are upscaled whole before the present");
+                    "under 1) with FSR 1 (EASU, then RCAS); a frame still reduced at the present is upscaled whole");
+REXCVAR_DEFINE_BOOL(gtav_native_fsr_full_size_ui, true, "GTAV",
+                    "Native renderer (live), with --gtav_native_fsr: only the 3D scene draw list renders reduced. The "
+                    "frame is upscaled after it, so HUD, text, menus and fades draw at full size, and frames without "
+                    "a scene (loading screens, pause menu) render at full size throughout; off: every frame is drawn "
+                    "reduced and upscaled whole");
 REXCVAR_DEFINE_DOUBLE(gtav_native_fsr_sharpness, 0.25, "GTAV",
                       "Native renderer (live): --gtav_native_fsr sharpening (RCAS) in stops of reduction, 0 = "
                       "sharpest, 2 = soft; negative skips RCAS (EASU only, cheaper)");
@@ -4792,11 +4796,6 @@ struct Backend::Impl {
       stat_skipped++;
       return false;
     }
-    if (d.hud && !upscale_full && count && color[0] == upscale_scene && upscale_ready &&
-        REXCVAR_GET(gtav_native_fsr)) {
-      UpscaleScene(list, r, color[0]);
-      count = ActiveTargets(r, std::min(height, kMaxTargetRows), color, &depth, (dc & 3) != 0);
-    }
     if (redirect2x) vp = RenderViewport(vp.x * 2, vp.y * 2, vp.width * 2, vp.height * 2, vp.minDepth, vp.maxDepth);
     for (uint32_t i = 0; i < count; i++) {
       auto cf = regs::Color(r, int(i)).format;
@@ -6526,7 +6525,10 @@ struct Backend::Impl {
   bool upscale_ready = false;
   bool upscale_full = false;
   static constexpr uint64_t kFullSizeKey = 1ull << 63;
-  RenderTarget* upscale_scene = nullptr;
+  static constexpr uint8_t kSceneDrawList = 0x07;
+  size_t full_size_from = SIZE_MAX;
+  uint64_t frame_target_serial = 0;
+  uint32_t front_base = 0, front_format = 0, front_pitch = 0;
   struct UpscaleImage {
     std::unique_ptr<RenderTexture> texture;
     std::unique_ptr<RenderTextureView> view;
@@ -6580,11 +6582,23 @@ struct Backend::Impl {
     InvalidateDrawState();
   }
 
-  void UpscaleScene(RenderCommandList* list, const uint8_t* r, RenderTarget* scene) {
-    FlushClears(list, scene);
+  size_t FullSizeFrom(const FramePacket& f) const {
+    if (rs >= 1.0f || !upscale_ready || !REXCVAR_GET(gtav_native_fsr) || !REXCVAR_GET(gtav_native_fsr_full_size_ui))
+      return SIZE_MAX;
+    for (size_t ci = f.commands.size(); ci-- > 0;)
+      if (f.commands[ci].draw_list == kSceneDrawList) return ci + 1;
+    return 0;
+  }
+
+  void BeginFullSize(RenderCommandList* list) {
+    RenderTarget* scene = front_pitch >= 1280 ? Target(front_base, front_format, false, front_pitch, 0, 720) : nullptr;
     upscale_full = true;
-    const auto c = regs::Color(r, 0);
-    RenderTarget* targets[4] = {Target(c.base, uint32_t(c.format), false, regs::Surface(r).pitch, 0, scene->height)};
+    if (scene && scene->scale != 1.0f && scene->written > frame_target_serial) UpscaleScene(list, scene);
+  }
+
+  void UpscaleScene(RenderCommandList* list, RenderTarget* scene) {
+    FlushClears(list, scene);
+    RenderTarget* targets[4] = {Target(front_base, front_format, false, front_pitch, 0, scene->height)};
     RenderTarget* full = targets[0];
     full->float_data = scene->float_data;
     Upscale(list, 0, scene->texture.get(), scene->view.get(), Sz(scene->width, scene->scale),
@@ -6659,7 +6673,11 @@ struct Backend::Impl {
     if (!depth_resolve) {
       auto c = regs::Color(r, int(source));
       src = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, dh);
-      if (rc.dest_texture == f.front_buffer && src->scale != 1.0f) upscale_scene = src;
+      if (rc.dest_texture == f.front_buffer) {
+        front_base = c.base;
+        front_format = uint32_t(c.format);
+        front_pitch = surface.pitch;
+      }
       FlushClears(list, src);
       if (const int32_t barrier = REXCVAR_GET(gtav_native_resolve_src_barrier);
           barrier > 0 && src->descriptor && (barrier > 1 || surface.pitch >= 1280))
@@ -6972,6 +6990,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   s.grow_list = list;
   s.upscale_full = false;
+  s.full_size_from = s.FullSizeFrom(f);
+  s.frame_target_serial = s.target_serial;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
   s.stat_early = s.stat_silent = s.stat_fills_reused = s.cube_skipped = s.kept_targets = 0;
   s.skipped_fill = nullptr;
@@ -7079,6 +7099,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.MarkCubeSkips(f);
   for (size_t ci = 0; ci < f.commands.size(); ci++) {
     const auto& c = f.commands[ci];
+    if (ci == s.full_size_from) s.BeginFullSize(list);
     if (!s.skip_commands.empty() && s.skip_commands[ci]) {
       if (c.kind == CommandKind::kDraw) {
         s.cur_draw = c.index + 1;

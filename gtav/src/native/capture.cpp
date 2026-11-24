@@ -762,7 +762,6 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   d.base_vertex = base_vertex;
   d.start = start;
   d.count = count;
-  d.hud = InHudDrawList();
   // The shaders the device holds, as the draw reads them: the Set*Shader hooks are not the only
   // writers. Outdoors 28 scenery draws a frame (5106-index meshes) bound their pixel shader another
   // way, so the hooked value was a depth pass's null shader and they came out depth-only.
@@ -890,7 +889,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     std::lock_guard lock(g_incoming_mutex);
     g_incoming_copies.push_back(p);
   }
-  g_packet.commands.push_back({CommandKind::kDraw, index, WritePointer(device)});
+  g_packet.commands.push_back({CommandKind::kDraw, index, WritePointer(device), CurrentDrawList()});
   return &d;
 }
 
@@ -1037,7 +1036,8 @@ void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t 
       }
     }
   }
-  g_packet.commands.push_back({CommandKind::kClear, uint32_t(g_packet.clears.size()), WritePointer(device)});
+  g_packet.commands.push_back(
+      {CommandKind::kClear, uint32_t(g_packet.clears.size()), WritePointer(device), CurrentDrawList()});
   g_packet.clears.push_back(c);
 }
 
@@ -1081,7 +1081,8 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_tex
     uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(dword1 & 0xFFFFF000);
     if (physical != UINT32_MAX) dword1 = (dword1 & 0xFFF) | (physical & 0xFFFFF000);
   }
-  g_packet.commands.push_back({CommandKind::kResolve, uint32_t(g_packet.resolves.size()), WritePointer(device)});
+  g_packet.commands.push_back(
+      {CommandKind::kResolve, uint32_t(g_packet.resolves.size()), WritePointer(device), CurrentDrawList()});
   g_packet.resolves.push_back(r);
 }
 
@@ -1119,7 +1120,8 @@ void OnQueryIssue(uint32_t query, uint32_t flags) {
     st.issue_frame = g_frame.load(std::memory_order_relaxed);
     g_query_stats.issued++;
   }
-  g_packet.commands.push_back({CommandKind::kQuery, uint32_t(g_packet.queries.size()), WritePointer(device)});
+  g_packet.commands.push_back(
+      {CommandKind::kQuery, uint32_t(g_packet.queries.size()), WritePointer(device), CurrentDrawList()});
   g_packet.queries.push_back(c);
 }
 
@@ -1187,26 +1189,26 @@ void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uin
       d.ps_consts = blob(d.ps_consts, kAluSize);
       if (d.inline_size) d.inline_vertices = blob(d.inline_vertices, d.inline_size);
       if (d.inline_index_size) d.inline_indices = blob(d.inline_indices, d.inline_index_size);
-      dst.commands.push_back({c.kind, uint32_t(dst.draws.size()), pm4});
+      dst.commands.push_back({c.kind, uint32_t(dst.draws.size()), pm4, c.draw_list});
       dst.draws.push_back(d);
       break;
     }
     case CommandKind::kClear: {
       ClearCommand k = src.clears[c.index];
       k.regs = blob(k.regs, kRegShadowSize);
-      dst.commands.push_back({c.kind, uint32_t(dst.clears.size()), pm4});
+      dst.commands.push_back({c.kind, uint32_t(dst.clears.size()), pm4, c.draw_list});
       dst.clears.push_back(k);
       break;
     }
     case CommandKind::kQuery: {
-      dst.commands.push_back({c.kind, uint32_t(dst.queries.size()), pm4});
+      dst.commands.push_back({c.kind, uint32_t(dst.queries.size()), pm4, c.draw_list});
       dst.queries.push_back(src.queries[c.index]);
       break;
     }
     case CommandKind::kResolve: {
       ResolveCommand k = src.resolves[c.index];
       k.regs = blob(k.regs, kRegShadowSize);
-      dst.commands.push_back({c.kind, uint32_t(dst.resolves.size()), pm4});
+      dst.commands.push_back({c.kind, uint32_t(dst.resolves.size()), pm4, c.draw_list});
       dst.resolves.push_back(k);
       break;
     }
@@ -1260,6 +1262,7 @@ void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_a
     const uint32_t fence = be32(Guest(device) + kDevFence);
     for (const auto& c : b.packet.commands) {
       CopyCommand(g_packet, b.packet, c, 0);
+      g_packet.commands.back().draw_list = CurrentDrawList();
       if (c.kind == CommandKind::kDraw) g_packet.draws.back().fence = fence;
     }
     g_buffer_stats.replayed += uint32_t(b.packet.commands.size());
