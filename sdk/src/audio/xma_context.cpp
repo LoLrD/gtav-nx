@@ -317,6 +317,10 @@ REXCVAR_DEFINE_INT32(xma_fresh_contexts, 3, "Audio",
                      "takes one instead of reopening its own (same fresh state, without rebuilding the codec "
                      "tables on the audio thread); 0 = reopen in place");
 REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
+REXCVAR_DEFINE_BOOL(xma_direct_decode, false, "Audio",
+                    "Decode each XMA frame with the codec's decode callback instead of avcodec_send_packet / "
+                    "avcodec_receive_frame: same samples, without the per-frame packet reference, bitstream filter "
+                    "and skip-samples side data allocations");
 REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
 REXCVAR_DEFINE_BOOL(xma_persistent_enable, false, "Audio",
                     "XMA contexts stay enabled until the game disables them (as the hardware does) and decode "
@@ -1448,6 +1452,18 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
 
 bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
                               AVFrame* av_frame) {
+  if (REXCVAR_GET(xma_direct_decode)) {
+    av_frame_unref(av_frame);
+    int got_frame = 0;
+    const int ret = av_context->codec->decode(av_context, av_frame, &got_frame, const_cast<AVPacket*>(av_packet));
+    if (ret < 0) {
+      char errbuf[AV_ERROR_MAX_STRING_SIZE];
+      av_strerror(ret, errbuf, sizeof(errbuf));
+      REXAPU_ERROR("XmaContext {}: Error during decoding: {} ({})", id(), errbuf, ret);
+      return false;
+    }
+    return got_frame != 0;
+  }
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
