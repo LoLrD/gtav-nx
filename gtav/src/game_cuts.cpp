@@ -23,6 +23,9 @@
 REXCVAR_DEFINE_INT32(gtav_anim_every, 1, "GTAV",
                      "Animate peds and objects other than the player every Nth frame, with an N-frame step "
                      "(1 = game)");
+REXCVAR_DEFINE_DOUBLE(gtav_physics_max_step, 0.0, "GTAV",
+                      "Run the physics once per frame instead of twice while the frame step is at most this many "
+                      "seconds (0 = game: two half steps a frame below 60 fps)");
 REXCVAR_DEFINE_BOOL(gtav_game_cpu_times, false, "GTAV",
                     "Diagnostic: log the CPU time per frame of the game's main thread systems, worker jobs and "
                     "scripts every 300 frames");
@@ -67,12 +70,14 @@ constexpr const char* kSlotNames[kSlots] = {
 constexpr uint32_t kReportFrames = 300;
 constexpr uint32_t kPlayerInfo = 0x83AAC7E4;
 constexpr uint32_t kGameTimeStep = 0x83DDDBF4;
+constexpr uint32_t kPhysicsSlices = 0x8390639C;
 constexpr uint32_t kScriptName = 104;
 
 std::array<std::atomic<uint64_t>, kSlots> g_ns{};
 std::array<std::atomic<uint64_t>, kSlots> g_calls{};
 std::atomic<bool> g_cuts_paused{false};
 uint32_t g_frames = 0;
+bool g_single_slice = false;
 std::map<uint32_t, uint64_t> g_script_ns;
 std::map<uint32_t, std::string> g_script_names;
 
@@ -205,7 +210,6 @@ GTAV_TIMED_HOOK(835A0950, kScan)
 GTAV_TIMED_HOOK(8359B3F8, kScanEntities)
 GTAV_TIMED_HOOK(835A20E0, kScanSetup)
 GTAV_TIMED_HOOK(8359C820, kScanJobs)
-GTAV_TIMED_HOOK(825A2860, kPhysics)
 GTAV_TIMED_HOOK(833CE9D0, kPhysicsTask)
 GTAV_TIMED_HOOK(833CB750, kPhysicsTask2)
 GTAV_TIMED_HOOK(8316BFA8, kGlassTask)
@@ -215,6 +219,23 @@ GTAV_ANIM_HOOK(8280FDA0)
 GTAV_ANIM_HOOK(827DDE80)
 GTAV_ANIM_HOOK(827DDEE8)
 GTAV_ANIM_HOOK(82791F00)
+
+REX_EXTERN(__imp__sub_825A2860);
+REX_HOOK_RAW(sub_825A2860) {
+  gtav::Timed timed(gtav::kPhysics);
+  const double max_step = REXCVAR_GET(gtav_physics_max_step);
+  gtav::g_single_slice =
+      max_step > 0 && gtav::Cut() && std::bit_cast<float>(gtav::L32(base, gtav::kGameTimeStep)) <= max_step;
+  if (gtav::g_single_slice) gtav::S32(base, gtav::kPhysicsSlices, 1);
+  __imp__sub_825A2860(ctx, base);
+  gtav::g_single_slice = false;
+}
+
+REX_EXTERN(__imp__sub_835F98E0);
+REX_HOOK_RAW(sub_835F98E0) {
+  if (gtav::g_single_slice) gtav::S32(base, gtav::kPhysicsSlices, 1);
+  __imp__sub_835F98E0(ctx, base);
+}
 
 REX_EXTERN(__imp__sub_82927BE0);
 REX_HOOK_RAW(sub_82927BE0) {
