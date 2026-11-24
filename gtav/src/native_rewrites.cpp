@@ -128,6 +128,7 @@ Stat g_bound{"bound sub_83585DE8"};
 Stat g_vm{"vm sub_834260A0"};
 Stat g_pack{"pack sub_8358AE80"};
 Stat g_gather{"gather sub_83442200"};
+std::atomic<uint64_t> g_vm_unchecked{0};
 
 std::array<Stat*, 14> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack, &g_volume,
                               &g_quat,   &g_cull,    &g_blend,  &g_bound,     &g_vm,     &g_pack,   &g_gather};
@@ -167,6 +168,8 @@ void Report() {
                 s->guard_hits.load(std::memory_order_relaxed), s->nan_only.load(std::memory_order_relaxed), native,
                 original, native > 0 ? original / native : 0.0);
   }
+  if (const uint64_t n = g_vm_unchecked.load(std::memory_order_relaxed))
+    REXLOG_INFO("[native-rewrites] vm sub_834260A0: {} calls not checkable", n);
 }
 
 void Record(Stat& s, bool ok, bool guard_ok, uint64_t native_ns, uint64_t original_ns, const std::string& what) {
@@ -1814,19 +1817,147 @@ inline bool VmVecSame(const PPCVRegister& a, const PPCVRegister& b) {
 }
 
 bool VmSameRegs(const PPCContext& a, const PPCContext& b) {
-  return a.r1.u64 == b.r1.u64 && a.lr == b.lr && a.r3.u64 == b.r3.u64 && a.r4.u64 == b.r4.u64 &&
-         a.r5.u64 == b.r5.u64 && a.r6.u64 == b.r6.u64 && VmVecSame(a.v1, b.v1) && VmVecSame(a.v2, b.v2) &&
+  return a.r1.u64 == b.r1.u64 && a.r3.u64 == b.r3.u64 && VmVecSame(a.v1, b.v1) && VmVecSame(a.v2, b.v2) &&
          VmVecSame(a.v3, b.v3);
 }
 
-bool VmRegions(const PPCContext& ctx, uint8_t* base, uint32_t& a0, uint32_t& n0, uint32_t& a1, uint32_t& n1) {
+constexpr uint32_t kVmObjBytes = 64;
+constexpr uint32_t kVmTrackBytes = 65535u + 1024u + 32u;
+constexpr uint32_t kVmMaxSlots = 4096;
+constexpr uint32_t kVmTrackOffset = 128;
+constexpr uint32_t kVmSlotOffset = kVmTrackOffset + ((kVmTrackBytes + 15) & ~15u) + 16;
+constexpr uint32_t kVmShadowBytes = kVmSlotOffset + 16 * kVmMaxSlots + 32;
+
+struct VmShadow {
+  uint32_t at = 0;
+  uint32_t obj = 0, tracks_from = 0, tracks_n = 0, tracks_to = 0, slots_from = 0, slots_n = 0, slots_to = 0;
+
+  uint32_t Map(uint32_t v) const {
+    if (tracks_n && v - tracks_from < tracks_n) return v - tracks_from + tracks_to;
+    if (slots_n && v - slots_from < slots_n) return v - slots_from + slots_to;
+    return v;
+  }
+
+  void Fill(uint8_t* base, uint32_t real_obj, uint32_t slots_need) {
+    obj = at + (real_obj & 15);
+    std::memcpy(Host(base, obj), Host(base, real_obj), kVmObjBytes);
+    std::memcpy(Host(base, tracks_to), Host(base, tracks_from), tracks_n);
+    std::memset(Host(base, tracks_to + tracks_n), 0, kVmTrackBytes - tracks_n);
+    std::memcpy(Host(base, slots_to), Host(base, slots_from), slots_n);
+    std::memset(Host(base, slots_to + slots_n), 0, slots_need - slots_n);
+    for (uint32_t o : {0u, 4u, 8u, 16u, 24u}) VmS32(base, obj + o, Map(Load32(base, obj + o)));
+  }
+};
+
+uint32_t VmShadowBlock(int i) {
+  thread_local uint32_t blocks[2] = {0, 0};
+  if (!blocks[i]) blocks[i] = rex::system::kernel_memory()->SystemHeapAlloc(kVmShadowBytes, 4096);
+  return blocks[i];
+}
+
+bool VmShadows(const PPCContext& ctx, uint8_t* base, VmShadow& a, VmShadow& b) {
   const uint32_t obj = ctx.r4.u32;
+  if (!Flat(obj, kVmObjBytes) || Writable(obj, kVmObjBytes) != kVmObjBytes) return false;
   const uint32_t tracks = Load32(base, obj), slots = Load32(base, obj + 24), count = Load32(base, obj + 48);
-  a0 = tracks & ~15u;
-  n0 = 65535u + 1024u + 32u;
-  a1 = slots & ~15u;
-  n1 = count > 65536u ? 0u : 16u * count + 16u;
-  return count <= 65536u && Flat(a0, n0) && Flat(a1, n1);
+  if (count > kVmMaxSlots) return false;
+  const uint32_t t0 = tracks & ~15u, s0 = slots & ~15u;
+  const uint32_t tn = Flat(t0, kVmTrackBytes) ? Writable(t0, kVmTrackBytes) : 0;
+  const uint32_t slots_need = 16 * count + 16;
+  const uint32_t sn = count && Flat(s0, slots_need) ? Writable(s0, slots_need) : 0;
+  auto apart = [](uint32_t a, uint32_t an, uint32_t b, uint32_t bn) {
+    return !an || !bn || uint64_t(a) + an <= b || uint64_t(b) + bn <= a;
+  };
+  if (!tn || sn < 16 * count || !apart(t0, tn, s0, sn) || !apart(obj, kVmObjBytes, t0, tn) ||
+      !apart(obj, kVmObjBytes, s0, sn))
+    return false;
+  for (VmShadow* s : {&a, &b}) {
+    s->at = VmShadowBlock(s == &a ? 0 : 1);
+    if (!s->at) return false;
+    s->tracks_from = t0;
+    s->tracks_n = tn;
+    s->tracks_to = s->at + kVmTrackOffset;
+    s->slots_from = s0;
+    s->slots_n = sn;
+    s->slots_to = s->at + kVmSlotOffset;
+  }
+  a.Fill(base, obj, slots_need);
+  b.Fill(base, obj, slots_need);
+  return true;
+}
+
+bool VmSameBytes(const uint8_t* want, const uint8_t* have, uint32_t n, uint32_t addr, std::string& what,
+                 bool& nan_only) {
+  for (uint32_t w = 0; w < n; w += 4) {
+    if (std::memcmp(want + w, have + w, std::min(4u, n - w)) == 0) continue;
+    const uint32_t x = n - w >= 4 ? Be32(want, w) : 0, y = n - w >= 4 ? Be32(have, w) : 1;
+    if (IsNan(x) && IsNan(y)) {
+      nan_only = true;
+      continue;
+    }
+    what = fmt::format("byte {:08X}: original {:08X} native {:08X}", addr + w, x, y);
+    return false;
+  }
+  return true;
+}
+
+void VmCheck(PPCContext& ctx, uint8_t* base) {
+  VmShadow sa, sb;
+  if (!VmShadows(ctx, base, sa, sb)) {
+    g_vm_unchecked.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  PPCContext mine = ctx, theirs = ctx;
+  mine.r4.u64 = sa.obj;
+  theirs.r4.u64 = sb.obj;
+  thread_local uint32_t flip = 0;
+  Clock::time_point t[4];
+  if (++flip & 1) {
+    t[0] = Clock::now();
+    Vm834260A0(mine, base);
+    t[1] = Clock::now();
+    __imp__sub_834260A0(theirs, base);
+    t[2] = t[1];
+    t[3] = Clock::now();
+  } else {
+    t[2] = Clock::now();
+    __imp__sub_834260A0(theirs, base);
+    t[3] = Clock::now();
+    t[0] = t[3];
+    Vm834260A0(mine, base);
+    t[1] = Clock::now();
+  }
+  std::string what;
+  bool nan_only = false;
+  bool ok = VmSameBytes(Host(base, sb.tracks_to), Host(base, sa.tracks_to), sa.tracks_n, sa.tracks_from, what,
+                        nan_only) &&
+            VmSameBytes(Host(base, sb.slots_to), Host(base, sa.slots_to), sa.slots_n, sa.slots_from, what,
+                        nan_only);
+  auto canon = [](const VmShadow& s, uint64_t v) -> uint64_t {
+    const uint32_t lo = uint32_t(v);
+    if (s.tracks_n && lo - s.tracks_to < s.tracks_n) return (v & ~0xFFFFFFFFull) | (lo - s.tracks_to + s.tracks_from);
+    if (s.slots_n && lo - s.slots_to < s.slots_n) return (v & ~0xFFFFFFFFull) | (lo - s.slots_to + s.slots_from);
+    if (lo - s.at < kVmShadowBytes) return (v & ~0xFFFFFFFFull) | (lo - s.at + 0x10000000u);
+    return v;
+  };
+  if (ok) {
+    PPCContext x = mine, y = theirs;
+    x.r3.u64 = canon(sa, x.r3.u64);
+    y.r3.u64 = canon(sb, y.r3.u64);
+    ok = VmSameRegs(x, y);
+    if (!ok)
+      what = fmt::format("registers: r1 {:X}/{:X} r3 {:X}/{:X} v1 {:08X} {:08X} {:08X} {:08X}/{:08X} {:08X} {:08X} {:08X} "
+                         "v2 {:08X} {:08X} {:08X} {:08X}/{:08X} {:08X} {:08X} {:08X} v3 {:08X} {:08X} {:08X} {:08X}/{:08X} "
+                         "{:08X} {:08X} {:08X}",
+                         y.r1.u64, x.r1.u64, y.r3.u64, x.r3.u64, y.v1.u32[0], y.v1.u32[1], y.v1.u32[2], y.v1.u32[3],
+                         x.v1.u32[0], x.v1.u32[1], x.v1.u32[2], x.v1.u32[3], y.v2.u32[0], y.v2.u32[1], y.v2.u32[2],
+                         y.v2.u32[3], x.v2.u32[0], x.v2.u32[1], x.v2.u32[2], x.v2.u32[3], y.v3.u32[0], y.v3.u32[1],
+                         y.v3.u32[2], y.v3.u32[3], x.v3.u32[0], x.v3.u32[1], x.v3.u32[2], x.v3.u32[3]);
+  }
+  if (nan_only) g_vm.nan_only.fetch_add(1, std::memory_order_relaxed);
+  if (!ok)
+    what += fmt::format(" | in r3 {:08X} r4 {:08X} tracks {:08X} slots {:08X} count {}", ctx.r3.u32, ctx.r4.u32,
+                        sa.tracks_from, sa.slots_from, sa.slots_n / 16);
+  Record(g_vm, ok, true, Ns(t[0], t[1]), Ns(t[2], t[3]), what);
 }
 
 #endif
@@ -1836,13 +1967,8 @@ bool VmRegions(const PPCContext& ctx, uint8_t* base, uint32_t& a0, uint32_t& n0,
 REX_HOOK_RAW(sub_834260A0) {
 #if defined(__aarch64__)
   if (Enabled(REXCVAR_GET(gtav_nr_vm))) {
-    if (CheckNow()) [[unlikely]] {
-      uint32_t a0 = 0, n0 = 0, a1 = 0, n1 = 0;
-      if (VmRegions(ctx, base, a0, n0, a1, n1)) {
-        Differential(g_vm, ctx, base, __imp__sub_834260A0, {{a0, n0}, {a1, n1}}, VmSameRegs, Vm834260A0);
-        return;
-      }
-    }
+    if (CheckNow()) [[unlikely]]
+      VmCheck(ctx, base);
     Vm834260A0(ctx, base);
     return;
   }
@@ -2646,3 +2772,4 @@ REX_HOOK_RAW(sub_83442200) {
 #endif
   __imp__sub_83442200(ctx, base);
 }
+
