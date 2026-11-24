@@ -137,6 +137,12 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       p = std::filesystem::path(filePath).parent_path() / p;
     MergeScalar(cfg.argsInRegistersExcludeFile, p.string(), "args_in_registers_exclude_file");
   }
+  MergeBool(cfg.fastVmxEstimates, toml["fast_vmx_estimates"].value_or(false), hasBool("fast_vmx_estimates"),
+            "fast_vmx_estimates");
+  MergeBool(cfg.singleFloatOps, toml["single_float_ops"].value_or(false), hasBool("single_float_ops"),
+            "single_float_ops");
+  MergeBool(cfg.fpFormsVerify, toml["fp_forms_verify"].value_or(false), hasBool("fp_forms_verify"),
+            "fp_forms_verify");
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

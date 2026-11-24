@@ -14,6 +14,39 @@
 
 namespace rex::codegen {
 
+static bool emitSingleBinary(BuilderContext& ctx, const char* op) {
+  if (!ctx.config().singleFloatOps || !ctx.fp_single(ctx.insn.operands[1]) || !ctx.fp_single(ctx.insn.operands[2]))
+    return false;
+  auto d = ctx.f(ctx.insn.operands[0]);
+  auto a = ctx.f(ctx.insn.operands[1]);
+  auto b = ctx.f(ctx.insn.operands[2]);
+  if (ctx.config().fpFormsVerify)
+    ctx.println("\t{}.f64 = rex_fp_check::Binary(0x{:X}, double(float({}.f64) {} float({}.f64)), "
+                "double(float({}.f64 {} {}.f64)), {}.f64, {}.f64);",
+                d, ctx.base, a, op, b, a, op, b, a, b);
+  else
+    ctx.println("\t{}.f64 = double(float({}.f64) {} float({}.f64));", d, a, op, b);
+  return true;
+}
+
+static bool emitSingleFma(BuilderContext& ctx, const char* neg, const char* negAddend) {
+  if (!ctx.config().singleFloatOps || !ctx.fp_single(ctx.insn.operands[1]) || !ctx.fp_single(ctx.insn.operands[2]) ||
+      !ctx.fp_single(ctx.insn.operands[3]))
+    return false;
+  auto d = ctx.f(ctx.insn.operands[0]);
+  auto a = ctx.f(ctx.insn.operands[1]);
+  auto b = ctx.f(ctx.insn.operands[2]);
+  auto c = ctx.f(ctx.insn.operands[3]);
+  if (ctx.config().fpFormsVerify)
+    ctx.println("\t{}.f64 = rex_fp_check::Fma(0x{:X}, double({}fmaf(float({}.f64), float({}.f64), {}float({}.f64))), "
+                "double(float({}std::fma({}.f64, {}.f64, {}{}.f64))), {}.f64, {}.f64, {}.f64);",
+                d, ctx.base, neg, a, b, negAddend, c, neg, a, b, negAddend, c, a, b, c);
+  else
+    ctx.println("\t{}.f64 = double({}fmaf(float({}.f64), float({}.f64), {}float({}.f64)));", d, neg, a, b, negAddend,
+                c);
+  return true;
+}
+
 //=============================================================================
 // Sign Manipulation
 //=============================================================================
@@ -139,6 +172,8 @@ bool build_fadd(BuilderContext& ctx) {
 
 bool build_fadds(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleBinary(ctx, "+"))
+    return true;
   ctx.println("\t{}.f64 = double(float({}.f64 + {}.f64));", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
   return true;
@@ -157,6 +192,8 @@ bool build_fsub(BuilderContext& ctx) {
 
 bool build_fsubs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleBinary(ctx, "-"))
+    return true;
   ctx.println("\t{}.f64 = double(float({}.f64 - {}.f64));", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
   return true;
@@ -175,6 +212,8 @@ bool build_fmul(BuilderContext& ctx) {
 
 bool build_fmuls(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleBinary(ctx, "*"))
+    return true;
   ctx.println("\t{}.f64 = double(float({}.f64 * {}.f64));", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
   return true;
@@ -193,6 +232,8 @@ bool build_fdiv(BuilderContext& ctx) {
 
 bool build_fdivs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleBinary(ctx, "/"))
+    return true;
   ctx.println("\t{}.f64 = double(float({}.f64 / {}.f64));", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
   return true;
@@ -212,6 +253,8 @@ bool build_fmadd(BuilderContext& ctx) {
 
 bool build_fmadds(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleFma(ctx, "", ""))
+    return true;
   ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, {}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -228,6 +271,8 @@ bool build_fmsub(BuilderContext& ctx) {
 
 bool build_fmsubs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleFma(ctx, "", "-"))
+    return true;
   ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, -{}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -244,6 +289,8 @@ bool build_fnmadd(BuilderContext& ctx) {
 
 bool build_fnmadds(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleFma(ctx, "-", ""))
+    return true;
   ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, {}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -260,6 +307,8 @@ bool build_fnmsub(BuilderContext& ctx) {
 
 bool build_fnmsubs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emitSingleFma(ctx, "-", "-"))
+    return true;
   ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, -{}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -292,6 +341,17 @@ bool build_fsqrt(BuilderContext& ctx) {
 
 bool build_fsqrts(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (ctx.config().singleFloatOps && ctx.fp_single(ctx.insn.operands[1])) {
+    auto d = ctx.f(ctx.insn.operands[0]);
+    auto a = ctx.f(ctx.insn.operands[1]);
+    if (ctx.config().fpFormsVerify)
+      ctx.println("\t{}.f64 = rex_fp_check::Binary(0x{:X}, double(sqrtf(float({}.f64))), double(float(sqrt({}.f64))), "
+                  "{}.f64, 0.0);",
+                  d, ctx.base, a, a, a);
+    else
+      ctx.println("\t{}.f64 = double(sqrtf(float({}.f64)));", d, a);
+    return true;
+  }
   ctx.println("\t{}.f64 = double(float(sqrt({}.f64)));", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;

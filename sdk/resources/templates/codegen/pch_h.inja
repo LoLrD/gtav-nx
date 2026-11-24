@@ -296,6 +296,67 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 {% include "codegen/_indirect_call.inja" %}
 
+namespace rex_fp_check {
+inline std::atomic<uint64_t> checks{0}, input_errors{0}, binop_differences{0}, fma_differences{0}, estimate_errors{0};
+[[gnu::noinline, gnu::cold]] inline void Report(uint32_t site, const char* what, double n, double o) {
+  if (input_errors + binop_differences + fma_differences + estimate_errors < 200)
+    REXLOG_ERROR("fp_forms_verify {:08X}: {} new {} old {}", site, what, n, o);
+}
+inline void Count() {
+  thread_local uint64_t local = 0;
+  if ((++local & 0xFFFFF) == 0) {
+    uint64_t n = checks.fetch_add(0x100000, std::memory_order_relaxed) + 0x100000;
+    if ((n & 0xFFFFFF) == 0)
+      REXLOG_INFO("fp_forms_verify: {} checks, {} non-single inputs, {} binary op differences, {} fma double-rounding "
+                  "differences, {} estimates outside 1/4096",
+                  n, input_errors.load(), binop_differences.load(), fma_differences.load(), estimate_errors.load());
+  }
+}
+inline bool Single(double x) { return x != x || double(float(x)) == x; }
+inline bool Same(double a, double b) {
+  return __builtin_bit_cast(uint64_t, a) == __builtin_bit_cast(uint64_t, b) || (a != a && b != b);
+}
+inline double Binary(uint32_t site, double n, double o, double a, double b) {
+  Count();
+  if (!Single(a) || !Single(b)) [[unlikely]] {
+    input_errors.fetch_add(1, std::memory_order_relaxed);
+    Report(site, "non-single input", a, b);
+  } else if (!Same(n, o)) [[unlikely]] {
+    binop_differences.fetch_add(1, std::memory_order_relaxed);
+    Report(site, "binary op", n, o);
+  }
+  return o;
+}
+inline double Fma(uint32_t site, double n, double o, double a, double b, double c) {
+  Count();
+  if (!Single(a) || !Single(b) || !Single(c)) [[unlikely]] {
+    input_errors.fetch_add(1, std::memory_order_relaxed);
+    Report(site, "non-single input", a, b);
+  } else if (!Same(n, o)) [[unlikely]] {
+    fma_differences.fetch_add(1, std::memory_order_relaxed);
+    Report(site, "fma", n, o);
+  }
+  return o;
+}
+inline simde__m128 Estimate(uint32_t site, simde__m128 n, simde__m128 o) {
+  Count();
+  alignas(16) float nv[4], ov[4];
+  simde_mm_store_ps(nv, n);
+  simde_mm_store_ps(ov, o);
+  for (int i = 0; i < 4; ++i) {
+    const bool special = !__builtin_isfinite(ov[i]) || ov[i] == 0.0f || __builtin_fabsf(ov[i]) < 2.0f * 1.17549435e-38f;
+    const bool ok = special ? (Same(nv[i], ov[i]) || (__builtin_fabsf(ov[i]) < 2.0f * 1.17549435e-38f &&
+                                                     __builtin_fabsf(nv[i]) < 2.0f * 1.17549435e-38f))
+                            : __builtin_fabsf(nv[i] - ov[i]) <= __builtin_fabsf(ov[i]) * (1.0f / 4096.0f);
+    if (!ok) [[unlikely]] {
+      estimate_errors.fetch_add(1, std::memory_order_relaxed);
+      Report(site, "estimate", nv[i], ov[i]);
+    }
+  }
+  return o;
+}
+}  // namespace rex_fp_check
+
 //=============================================================================
 // Flush Mode
 //=============================================================================

@@ -106,3 +106,13 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   registers, `mfcr` and the caller-side stores do not count as reads. Vector registers are only counted (379 functions
   read one they never write, mostly the source of a `vrlimi128`; they keep reading zero). `mflr` under `skip_lr`
   writes 0 to its register.
+- `fast_vmx_estimates` (`include/rex/ppc/intrinsics.h`, `src/codegen/builders/vector.cpp`): `vrefp` / `vrsqrtefp` as the
+  ARM estimate plus one Newton-Raphson step (~2^-16 relative, the PPC guarantees 2^-12); the reciprocal square root
+  keeps the estimate's +-0 -> +-inf and +inf -> +0 (the step would make 0 * inf).
+- `single_float_ops` (`src/codegen/function_graph.cpp`, `src/codegen/builders/floating_point.cpp`): a per-function
+  dataflow marks FPRs that hold single values (lfs, single arithmetic, frsp, moves and sign ops of those; the entry and
+  double results clear them, a call clears f0-f13, or every FPR when the function keeps callee-saved registers in ctx).
+  With single inputs `fadds` / `fsubs` / `fmuls` / `fdivs` / `fsqrts` compute in float (bit-identical: double rounding
+  is innocuous for them) and `fmadds` / `fmsubs` / `fnmadds` / `fnmsubs` are one `fmaf` (one rounding to single, as on
+  the Xenon). `fp_forms_verify` (validation builds) computes both forms at every converted instruction, keeps the old
+  value and counts input / result differences (`rex_fp_check` in the pch).

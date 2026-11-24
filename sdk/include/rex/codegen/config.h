@@ -119,6 +119,10 @@ struct RecompilerConfig {
   bool argsInRegistersInstrument = false;  ///< ME_ARGS_COUNT entries (validation builds)
   bool argsInRegistersPoison = false;      ///< ME_ARGS_POISON before fast calls (validation builds)
 
+  bool fastVmxEstimates = false;
+  bool singleFloatOps = false;
+  bool fpFormsVerify = false;
+
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets
   uint32_t dataRegionThreshold = 16;  ///< Consecutive invalid instructions to mark as data region
