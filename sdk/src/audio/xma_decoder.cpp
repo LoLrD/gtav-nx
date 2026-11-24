@@ -312,6 +312,7 @@ void ReportXma() {
 }  // namespace
 
 void XmaDecoder::WorkerThreadMain() {
+  int64_t last_sweep_ns = 0;
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
@@ -355,7 +356,10 @@ void XmaDecoder::WorkerThreadMain() {
     // Full sweep as a safety net: it is how it used to work, and it serves any context left enabled
     // without a mark. Only when there were no pending ones, so the 320 locks are not walked after every
     // kick and the fast loop keeps the work being counted.
-    if (!pending_was) {
+    bool swept = false;
+    if (!pending_was && (REXCVAR_GET(xma_persistent_enable) || NowNs() - last_sweep_ns >= 20'000'000)) {
+      swept = true;
+      last_sweep_ns = NowNs();
       for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
         XmaContext& context = contexts_[n];
         bool worked = context.Work();
@@ -391,6 +395,8 @@ void XmaDecoder::WorkerThreadMain() {
     // refill an enabled context without a kick: look again every few ms.
     if (REXCVAR_GET(xma_persistent_enable)) {
       rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(4));
+    } else if (!swept) {
+      rex::thread::Wait(work_event_.get(), false, std::chrono::milliseconds(20));
     } else {
       rex::thread::Wait(work_event_.get(), false);
     }
