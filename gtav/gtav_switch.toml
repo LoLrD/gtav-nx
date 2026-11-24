@@ -59,3 +59,4 @@ gtav_native_light_fill_reuse = true
 gtav_native_cube_every = 4
 gtav_native_keep_targets = true
 gtav_native_resolve_src_barrier = 1
+gtav_pool_list_lock = true
