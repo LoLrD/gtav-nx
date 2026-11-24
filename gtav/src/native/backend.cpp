@@ -297,8 +297,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_resolve_discard, true, "GTAV",
                     "Native renderer: resolve copies over a whole destination do not load its old contents");
 REXCVAR_DEFINE_BOOL(gtav_native_defer_clears, true, "GTAV",
                     "Native renderer: apply resolve clears in the target's next render pass instead of a pass of their own");
-REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, true, "GTAV",
-                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: off)");
+REXCVAR_DEFINE_INT32(gtav_native_resolve_src_barrier, 0, "GTAV",
+                     "Native renderer: a colour resolve first ends its source's render pass and makes the source "
+                     "SHADER_READ, before anything else of the resolve (0: off, 1: full-width sources only, 2: every "
+                     "colour resolve; live)");
+REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, false, "GTAV",
+                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: "
+                    "off; on, the lit scene intermittently lost its sun and ambient light above row 512)");
 REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
                      "Diagnostic: in-pass resolves store 1 magenta, 2 source + red, 3 source with alpha 1, 4 a green clear");
 REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
@@ -6085,7 +6090,9 @@ struct Backend::Impl {
                         uint64_t gpu) {
     InvalidateDrawState();
     Transition(list, r.texture.get(), RenderTextureLayout::SHADER_READ);
-    list->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(buffer, RenderBufferAccess::WRITE));
+    list->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COMPUTE | RenderBarrierStage::COPY,
+                   RenderBufferBarrier(buffer, RenderBufferAccess::WRITE),
+                   RenderTextureBarrier(r.texture.get(), RenderTextureLayout::SHADER_READ));
     pass_end = "writeback compute";
     list->setFramebuffer(nullptr);
     PassStamp(list, "writeback compute");
@@ -6654,6 +6661,9 @@ struct Backend::Impl {
       src = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, dh);
       if (rc.dest_texture == f.front_buffer && src->scale != 1.0f) upscale_scene = src;
       FlushClears(list, src);
+      if (const int32_t barrier = REXCVAR_GET(gtav_native_resolve_src_barrier);
+          barrier > 0 && src->descriptor && (barrier > 1 || surface.pitch >= 1280))
+        Transition(list, src->texture.get(), RenderTextureLayout::SHADER_READ);
     } else {
       auto d = regs::Depth(r);
       src = Target(d.base, d.float24, true, surface.pitch, surface.msaa, dh);
