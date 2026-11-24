@@ -18,7 +18,11 @@ xer_as_local = true
 cr_as_local = true
 non_argument_as_local = true
 non_volatile_as_local = true
-args_in_registers = false
+args_in_registers = true
+skip_lr = true
+skip_msr = true
+fctiwz_inline = true
+dcbt_prefetch = true
 args_in_registers_exclude_file = "args_in_registers_exclude.txt"
 # reserved_as_local: NO. GTA splits ldarx and stdcx. across functions (spin-lock helper sub_83829CD8),
 # so a per-function reservation never matches: a thread spins forever (hang 11-18).
