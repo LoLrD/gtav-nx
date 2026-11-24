@@ -63,3 +63,6 @@ gtav_switch_present_interval = 2
 gtav_nr_vm = false
 gtav_native_texture_arena = true
 gtav_native_texture_arena_mb = 64
+gtav_native_vma_block_mb = 32
+gtav_native_vma_heap_mb = 4096
+gtav_native_texture_memory_mb = 256
