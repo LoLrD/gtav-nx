@@ -96,3 +96,9 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   After a successful guest read, `XFile::ReadInternal` passes the file's entry, offset and the bytes read to the filter
   set with `rex::filesystem::SetReadFilter`. NieR uses it to show Switch button icons and texts without changing the
   game files.
+- `src/codegen/codegen_writer.cpp`, `src/codegen/args_in_registers.cpp` (`FindUninitializedLocalReads`): after
+  emitting, every body is checked for register locals (r0-r31, f0-f31, v0-v127, cr0-cr7, ctr) read before any write on
+  every path from its entry. Such a function continues another one (a tail stub split off by the manifest, a fragment)
+  and would read zeros from its zero-initialized locals; it is marked `share_registers` (registers stay in ctx, callers
+  hand theirs over) and it and its callers are emitted again. Inline saves of callee-saved registers and `mfcr` do not
+  count as reads. The run logs each marked function and errors for any body that still reads a local unwritten.

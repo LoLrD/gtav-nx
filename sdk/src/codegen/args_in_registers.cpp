@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -1175,6 +1176,217 @@ void ApplyArgsInRegisters(const std::vector<std::string>& names, std::vector<std
     std::string text = std::move(em.text);
     text += "\n";
     bodies[b] = std::move(text);
+  }
+}
+
+namespace {
+
+int LocalIndex(std::string_view id) {
+  if (id == "ctr")
+    return 200;
+  if (id.size() == 3 && id[0] == 'c' && id[1] == 'r' && id[2] >= '0' && id[2] <= '7')
+    return 192 + (id[2] - '0');
+  if (id.size() < 2 || (id[0] != 'r' && id[0] != 'f' && id[0] != 'v'))
+    return -1;
+  if (id.size() > 2 && id[1] == '0')
+    return -1;
+  int n = 0;
+  for (size_t i = 1; i < id.size(); ++i) {
+    if (id[i] < '0' || id[i] > '9' || i > 3)
+      return -1;
+    n = n * 10 + (id[i] - '0');
+  }
+  if (id[0] == 'r')
+    return n < 32 ? n : -1;
+  if (id[0] == 'f')
+    return n < 32 ? 32 + n : -1;
+  return n < 128 ? 64 + n : -1;
+}
+
+std::string LocalName(int idx) {
+  if (idx == 200)
+    return "ctr";
+  if (idx >= 192)
+    return fmt::format("cr{}", idx - 192);
+  if (idx >= 64)
+    return fmt::format("v{}", idx - 64);
+  if (idx >= 32)
+    return fmt::format("f{}", idx - 32);
+  return fmt::format("r{}", idx);
+}
+
+bool NonVolatile(int idx) {
+  return (idx >= 14 && idx < 32) || (idx >= 46 && idx < 64) || (idx >= 78 && idx < 96) || (idx >= 128 && idx < 192) ||
+         (idx >= 194 && idx <= 196);
+}
+
+using LocalSet = std::bitset<201>;
+
+void LocalMasks(std::string_view s, LocalSet& use, LocalSet& def) {
+  use.reset();
+  def.reset();
+  if (StartsWith(s, "const auto s_"))
+    return;
+  const bool vectorStore = StartsWith(s, "simde_mm_store") && s.find("REX_RAW_ADDR(") != std::string_view::npos;
+  size_t frameValue = std::string_view::npos;
+  if (StartsWith(s, "REX_STORE")) {
+    size_t open = s.find('(');
+    size_t comma = s.find(", ", open);
+    if (open != std::string_view::npos && comma != std::string_view::npos &&
+        s.substr(open + 1, comma - open - 1).find("ctx.r1.") != std::string_view::npos)
+      frameValue = comma;
+  }
+  const bool mfcr = s.find(" ? 0x") != std::string_view::npos && s.find(" : 0;") != std::string_view::npos;
+  auto wordEnd = [&](size_t p) {
+    while (p < s.size() && IsWord(s[p]))
+      ++p;
+    return p;
+  };
+  int target = -1;
+  size_t rest = 0;
+  size_t start = (StartsWith(s, "--") || StartsWith(s, "++")) ? 2 : 0;
+  size_t e = wordEnd(start);
+  if (int idx = LocalIndex(s.substr(start, e - start)); idx >= 0 && e < s.size()) {
+    size_t q = e;
+    bool rmw = start == 2;
+    bool assign = false;
+    if (s[q] == '.') {
+      size_t m = wordEnd(q + 1);
+      q = m;
+      if (m < s.size() && (s[m] == '(' || s[m] == '<')) {
+        assign = true;
+      } else {
+        while (q < s.size() && s[q] == '[') {
+          size_t close = s.find(']', q);
+          q = close == std::string_view::npos ? s.size() : close + 1;
+        }
+        while (q < s.size() && s[q] == ' ')
+          ++q;
+        if (q + 1 < s.size() && s[q] == '=' && s[q + 1] != '=')
+          assign = true;
+        else if (q + 1 < s.size() && std::strchr("+-*/%|&^", s[q]) && s[q + 1] == '=')
+          rmw = true;
+        else if (q + 2 < s.size() && ((s[q] == '<' && s[q + 1] == '<') || (s[q] == '>' && s[q + 1] == '>')) &&
+                 s[q + 2] == '=')
+          rmw = true;
+        else if (q + 1 < s.size() && ((s[q] == '+' && s[q + 1] == '+') || (s[q] == '-' && s[q + 1] == '-')))
+          rmw = true;
+      }
+    } else {
+      while (q < s.size() && s[q] == ' ')
+        ++q;
+      if (q + 1 < s.size() && s[q] == '=' && s[q + 1] != '=')
+        assign = true;
+    }
+    if (assign || rmw) {
+      target = idx;
+      rest = e;
+      if (rmw)
+        use.set(idx);
+    }
+  }
+  if (target < 0) {
+    for (std::string_view st : {std::string_view("simde_mm_store_si128((simde__m128i*)"),
+                                std::string_view("simde_mm_store_ps("), std::string_view("simde_mm_storeu_ps("),
+                                std::string_view("memcpy(")}) {
+      if (!StartsWith(s, st))
+        continue;
+      size_t b0 = st.size();
+      if (b0 < s.size() && s[b0] == '&')
+        ++b0;
+      size_t e0 = wordEnd(b0);
+      int idx = LocalIndex(s.substr(b0, e0 - b0));
+      if (idx >= 0 && e0 < s.size() && s[e0] == '.') {
+        target = idx;
+        rest = e0;
+      }
+      break;
+    }
+  }
+  size_t pos = rest;
+  while (pos < s.size()) {
+    if (!IsWord(s[pos]) || (pos > 0 && (IsWord(s[pos - 1]) || s[pos - 1] == '.'))) {
+      ++pos;
+      continue;
+    }
+    size_t we = wordEnd(pos);
+    int idx = LocalIndex(s.substr(pos, we - pos));
+    if (idx >= 0 && we < s.size() && (s[we] == '.' || s[we] == ';' || s[we] == ',' || s[we] == ')')) {
+      const bool save = (NonVolatile(idx) && ((idx >= 64 && idx < 192 && vectorStore) ||
+                                              (idx < 64 && frameValue != std::string_view::npos && pos > frameValue))) ||
+                        (mfcr && idx >= 192 && idx < 200);
+      if (!save)
+        use.set(idx);
+    }
+    pos = we;
+  }
+  if (target >= 0)
+    def.set(target);
+}
+
+}  // namespace
+
+void FindUninitializedLocalReads(std::string_view functionText, std::vector<std::string>& definite,
+                                 std::vector<std::string>& possible) {
+  definite.clear();
+  possible.clear();
+  ArgsInRegistersOptions opt;
+  Pass P(opt);
+  Fn f;
+  if (!ParseFunction(P, f, functionText, false))
+    return;
+  const int n = f.n;
+  std::vector<LocalSet> use(n), def(n);
+  for (int i = 0; i < n; ++i) {
+    if (f.rawLine[i] < 0)
+      continue;
+    std::string_view t = Trim(f.lines[f.rawLine[i]]);
+    size_t c = t.find("//");
+    if (c != std::string_view::npos)
+      t = Trim(t.substr(0, c));
+    LocalMasks(t, use[i], def[i]);
+  }
+  std::vector<LocalSet> must(n + 1), may(n + 1);
+  std::vector<uint8_t> seen(n + 1, 0);
+  for (auto& m : must)
+    m.set();
+  must[0].reset();
+  seen[0] = 1;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 0; i < n; ++i) {
+      if (!seen[i])
+        continue;
+      LocalSet outMust = must[i] | def[i];
+      LocalSet outMay = may[i] | def[i];
+      for (uint32_t e = f.succOff[i]; e < f.succOff[i + 1]; ++e) {
+        int j = f.succ[e];
+        if (j > n)
+          continue;
+        LocalSet nm = seen[j] ? (must[j] & outMust) : outMust;
+        LocalSet ny = may[j] | outMay;
+        if (!seen[j] || nm != must[j] || ny != may[j]) {
+          seen[j] = 1;
+          must[j] = nm;
+          may[j] = ny;
+          changed = true;
+        }
+      }
+    }
+  }
+  LocalSet def1, poss1;
+  for (int i = 0; i < n; ++i) {
+    if (!seen[i])
+      continue;
+    def1 |= use[i] & ~may[i];
+    poss1 |= use[i] & may[i] & ~must[i];
+  }
+  for (int idx = 0; idx < 201; ++idx) {
+    if (def1.test(idx))
+      definite.push_back(LocalName(idx));
+    else if (poss1.test(idx))
+      possible.push_back(LocalName(idx));
   }
 }
 

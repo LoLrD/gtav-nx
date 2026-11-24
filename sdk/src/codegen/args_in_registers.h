@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -64,5 +65,8 @@ struct ArgsInRegistersStats {
 void ApplyArgsInRegisters(const std::vector<std::string>& names, std::vector<std::string>& bodies,
                           std::vector<std::vector<std::string>>& declarations,
                           const ArgsInRegistersOptions& options, ArgsInRegistersStats* stats = nullptr);
+
+void FindUninitializedLocalReads(std::string_view functionText, std::vector<std::string>& definite,
+                                 std::vector<std::string>& possible);
 
 }  // namespace rex::codegen
