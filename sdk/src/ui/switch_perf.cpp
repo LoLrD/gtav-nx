@@ -80,6 +80,7 @@ Result __real_threadClose(Thread* t);
 Result __real_nvFenceWait(NvFence* f, s32 timeout_us);
 Result __real_nvGpuChannelKickoff(NvGpuChannel* c);
 Result __real_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable);
+void __real_nvMapClose(NvMap* m);
 Result __real_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova);
 Result __real_nvioctlNvhostAsGpu_MapBufferEx(u32 fd, u32 flags, u32 kind, u32 nvmap_handle, u32 page_size,
                                              u64 buffer_offset, u64 mapping_size, u64 input_offset, u64* offset);
@@ -229,6 +230,7 @@ struct Calls {
   std::atomic<u64> bytes{0};
 };
 Calls g_calls[kCallsCount];
+std::atomic<u64> g_nvmap_live_bytes{0}, g_nvmap_live_count{0};
 
 inline void Note(unsigned id, u64 from, u64 bytes = 0) {
   const u64 ticks = armGetSystemTick() - from;
@@ -753,12 +755,14 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     std::fprintf(f,
                  "     libnx per second (calls and ms inside): fences queried %.0f (%.1f ms), waited %.0f "
                  "(%.1f ms) | kickoff %.0f (%.1f ms) | NvMap new %.1f cached (%.1f MB) and %.1f uncached "
-                 "(%.1f MB), %.1f ms | GPU addresses %.1f (%.1f ms), mappings %.1f (%.1f MB, %.1f ms) | "
+                 "(%.1f MB), %.1f ms, live %llu (%.1f MB) | GPU addresses %.1f (%.1f ms), mappings %.1f (%.1f MB, %.1f ms) | "
                  "armDCacheClean %.0f (%.1f MB, %.1f ms) | window queue %.1f (%.1f ms), dequeue buffer %.1f "
                  "(%.1f ms) | svcSleepThread: 0 %.0f, yield %.0f, up to 1 ms %.0f (%.1f ms), more %.0f\n",
                  n[kFenceQuery], ms[kFenceQuery], n[kFenceWait], ms[kFenceWait], n[kKickoff],
                  ms[kKickoff], n[kNvMapCached], mb[kNvMapCached], n[kNvMapNoCache], mb[kNvMapNoCache],
-                 ms[kNvMapCached] + ms[kNvMapNoCache], n[kReserveAddress], ms[kReserveAddress],
+                 ms[kNvMapCached] + ms[kNvMapNoCache],
+                 (unsigned long long)g_nvmap_live_count.load(std::memory_order_relaxed),
+                 double(g_nvmap_live_bytes.load(std::memory_order_relaxed)) / 1048576.0, n[kReserveAddress], ms[kReserveAddress],
                  n[kMappingGpu], mb[kMappingGpu], ms[kMappingGpu], n[kCacheClean], mb[kCacheClean], ms[kCacheClean],
                  n[kQueueBuffer], ms[kQueueBuffer], n[kDequeueBuffer], ms[kDequeueBuffer], n[kSleep0],
                  n[kSleepYield], n[kSleepShort], ms[kSleepShort], n[kSleepLong]);
@@ -1257,7 +1261,18 @@ Result __wrap_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind 
   const u64 from = armGetSystemTick();
   const Result rc = __real_nvMapCreate(m, cpu_addr, size, align, kind, is_cpu_cacheable);
   Note(is_cpu_cacheable ? kNvMapCached : kNvMapNoCache, from, size);
+  if (R_SUCCEEDED(rc)) {
+    g_nvmap_live_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_nvmap_live_count.fetch_add(1, std::memory_order_relaxed);
+  }
   return rc;
+}
+
+void __wrap_nvMapClose(NvMap* m) {
+  const u32 size = nvMapGetSize(m);
+  __real_nvMapClose(m);
+  g_nvmap_live_bytes.fetch_sub(size, std::memory_order_relaxed);
+  g_nvmap_live_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
 Result __wrap_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova) {
