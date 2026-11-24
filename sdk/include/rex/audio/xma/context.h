@@ -249,6 +249,13 @@ class XmaContext {
     is_allocated_.store(is_allocated, std::memory_order_release);
   }
   void set_is_enabled(bool is_enabled) { is_enabled_.store(is_enabled, std::memory_order_release); }
+  static inline std::atomic<uint64_t> frames_decoded_{0};
+  static inline std::atomic<uint64_t> frames_quiet_{0};
+  static inline std::atomic<uint64_t> reopens_{0};
+  static inline std::atomic<uint64_t> blocks_written_{0};
+
+  bool is_quiet() const { return quiet_.load(std::memory_order_relaxed); }
+  void set_quiet(bool quiet) { quiet_.store(quiet, std::memory_order_relaxed); }
 
   void SignalWorkDone() {
     if (work_completion_event_) {
@@ -324,6 +331,8 @@ class XmaContext {
   bool loop_off_reported_ = false;  // audio_xma_loop_zero_end_off diagnostic, once per sound
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
+  std::atomic<bool> quiet_ = false;
+  bool decoder_stale_ = false;
 
   // ffmpeg structures
   AVPacket* av_packet_ = nullptr;
