@@ -45,6 +45,7 @@
 // libnx: the end of the heap that newlib's sbrk hands out (see HeapState).
 extern "C" char* fake_heap_end;
 extern "C" const char* RexSwitchCodeBlocksReport(void) __attribute__((weak));
+extern "C" void RexSwitchMallocCacheStats(uint64_t out[6]) __attribute__((weak));
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -773,6 +774,15 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                delta(44) / seconds, delta(45) / seconds, delta(46) / seconds, delta(47) / seconds,
                delta(48) / seconds, delta(49) / seconds, delta(50) / seconds, delta(51) / seconds,
                delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds);
+  if (RexSwitchMallocCacheStats) {
+    uint64_t cache[6];
+    RexSwitchMallocCacheStats(cache);
+    std::fprintf(f,
+                 "     malloc cache per second: %.0f hits, %.0f misses, %.0f depot batches | %.1f MB held | "
+                 "blocks of 256 KB or more: %.1f MB in use, peak %.1f MB\n",
+                 cache[0] / seconds, cache[1] / seconds, cache[2] / seconds, cache[3] / 1048576.0,
+                 cache[4] / 1048576.0, cache[5] / 1048576.0);
+  }
   if (frames > 0) {
     std::fprintf(f,
                  "     per frame: %.0f draws | scissor %.1f screens | %.1f submits | "
