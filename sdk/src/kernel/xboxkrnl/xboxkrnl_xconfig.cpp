@@ -22,6 +22,8 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xtypes.h>
 
+REXCVAR_DECLARE(uint32_t, audio_speaker_config);
+
 namespace rex::kernel::xboxkrnl {
 
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
@@ -69,7 +71,7 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
           break;
         case 0x000B:  // XCONFIG_USER_AUDIO_FLAGS
           setting_size = 4;
-          memory::store_and_swap<uint32_t>(value, 0x00010001);
+          memory::store_and_swap<uint32_t>(value, REXCVAR_GET(audio_speaker_config));
           break;
         case 0x000C:  // XCONFIG_USER_RETAIL_FLAGS
           setting_size = 4;

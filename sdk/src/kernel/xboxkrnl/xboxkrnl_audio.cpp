@@ -36,6 +36,8 @@
 #include <unordered_map>
 #include <vector>
 
+REXCVAR_DEFINE_UINT32(audio_speaker_config, 0x00010001, "Audio",
+                      "Speaker configuration reported to the game (XAudioGetSpeakerConfig, XConfig audio flags)");
 REXCVAR_DEFINE_INT32(audio_volumemask_sleep_us, 0, "Audio",
                      "Sleep inside the XAudioGetVoiceCategoryVolumeChangeMask stub. The guest mixer calls it once per "
                      "frame (not in a poll loop); on Horizon even a 1 us sleep gives the core to another thread for up "
@@ -185,7 +187,7 @@ namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
-  *config_ptr = 0x00010001;
+  *config_ptr = REXCVAR_GET(audio_speaker_config);
   return X_ERROR_SUCCESS;
 }
 

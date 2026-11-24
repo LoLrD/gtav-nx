@@ -68,6 +68,7 @@ set(GTAV_SOURCES
     src/crash_guards.cpp
     src/script_timer_fix.cpp
     src/pc_controls.cpp
+    src/audio_diag.cpp
     src/bug_report.cpp
     src/frame_limit.cpp
     src/wait_profile.cpp
