@@ -53,6 +53,7 @@ extern "C" {
 extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
 void RexSwitchNeonProbe(void);
+const char* RexSwitchCodeBlocksReport(void) __attribute__((weak));
 }
 #endif
 
@@ -203,6 +204,11 @@ bool ReXApp::SetupEnvironment() {
     REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
 
   REXLOG_DEBUG("{} starting", GetName());
+#if REX_PLATFORM_SWITCH
+  if (RexSwitchCodeBlocksReport) {
+    REXLOG_INFO("Switch {}", RexSwitchCodeBlocksReport());
+  }
+#endif
   if (!game_data_root_.empty()) {
     REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
   }

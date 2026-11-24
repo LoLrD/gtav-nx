@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -84,6 +86,30 @@ class ObjectTable {
     XObject* object = nullptr;
   };
 
+  class TableLock {
+   public:
+    void LockShared();
+    void UnlockShared() { state_.fetch_sub(1, std::memory_order_release); }
+    void Lock();
+    void Unlock() { state_.store(0, std::memory_order_release); }
+
+   private:
+    bool TryLockShared();
+    std::atomic<int32_t> state_{0};
+    std::atomic<uint32_t> writers_waiting_{0};
+  };
+
+  class ExclusiveGuard {
+   public:
+    explicit ExclusiveGuard(TableLock& lock) : lock_(lock) { lock_.Lock(); }
+    ~ExclusiveGuard() { lock_.Unlock(); }
+    ExclusiveGuard(const ExclusiveGuard&) = delete;
+    ExclusiveGuard& operator=(const ExclusiveGuard&) = delete;
+
+   private:
+    TableLock& lock_;
+  };
+
   ObjectTableEntry* LookupTable(X_HANDLE handle);
   XObject* LookupObject(X_HANDLE handle, bool already_locked);
   void GetObjectsByType(XObject::Type type, std::vector<object_ref<XObject>>* results);
@@ -96,6 +122,7 @@ class ObjectTable {
   bool Resize(uint32_t new_capacity);
 
   rex::thread::global_critical_region global_critical_region_;
+  TableLock table_lock_;
   std::mutex name_mutex_;
   uint32_t table_capacity_ = 0;
   ObjectTableEntry* table_ = nullptr;

@@ -539,6 +539,9 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
   if (QueryReadable(base, 4, &mi)) {
     text_lo = mi.addr;
     text_hi = mi.addr + mi.size;
+    while (QueryReadable(text_hi, 4, &mi) && mi.addr == text_hi && (mi.perm & Perm_X)) {
+      text_hi = mi.addr + mi.size;
+    }
   }
   u64 tid = 0;
   svcGetThreadId(&tid, CUR_THREAD_HANDLE);

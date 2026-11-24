@@ -73,6 +73,22 @@ if(NOT TARGET rexglue_switch_startup)
         "LINKER:--wrap=svcSleepThread")
 endif()
 
+option(REXGLUE_SWITCH_CODE_BLOCKS
+    "Move the NRO's hot .text (or all text and rodata, switch_code_blocks in the toml) onto 2 MB blocks at startup" OFF)
+if(REXGLUE_SWITCH_CODE_BLOCKS)
+    target_sources(rexglue_switch_startup PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_code_blocks.cpp")
+endif()
+
+option(REXGLUE_SWITCH_MALLOC_CACHE
+    "Per-thread cache of small newlib heap blocks (wraps _malloc_r, _free_r, _memalign_r, _realloc_r)" OFF)
+if(REXGLUE_SWITCH_MALLOC_CACHE)
+    target_sources(rexglue_switch_startup PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_malloc_cache.cpp")
+    target_link_options(rexglue_switch_startup INTERFACE
+        "LINKER:--wrap=_malloc_r,--wrap=_free_r,--wrap=_memalign_r,--wrap=_realloc_r")
+endif()
+
 function(rexglue_switch_configure_target target_name)
     cmake_parse_arguments(ARG "" "" "GPU_PLUGINS" ${ARGN})
 

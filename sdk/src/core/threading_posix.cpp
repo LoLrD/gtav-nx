@@ -87,6 +87,9 @@ REXCVAR_DEFINE_INT32(thread_alertable_slice_ms, 8, "Threading",
 REXCVAR_DEFINE_INT32(thread_multiwait_safety_ms, 20, "Threading",
                      "With thread_wait_blocking: a parked WaitMultiple re-polls its handles at least this "
                      "often even if nobody poked it (safety net against a state change that did not notify)");
+REXCVAR_DEFINE_BOOL(thread_wake_one, true, "Threading",
+                    "Setting an auto-reset event, releasing a semaphore by one or a mutant wakes one blocked "
+                    "waiter instead of all of them. false = wake every waiter (the original behaviour)");
 
 namespace rex::thread {
 
@@ -646,7 +649,11 @@ class PosixCondition<Event> : public PosixConditionBase {
     // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
     // threads) would otherwise run straight into the mutex its signaller still holds and go back to sleep.
     if (notify) {
-      cond_.notify_all();
+      if (manual_reset_ || !REXCVAR_GET(thread_wake_one)) {
+        cond_.notify_all();
+      } else {
+        cond_.notify_one();
+      }
     }
     NotifyMulti();
     return true;
@@ -688,7 +695,11 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     const bool notify = has_cond_waiters();
     lock.unlock();
     if (notify) {
-      cond_.notify_all();
+      if (release_count == 1 && REXCVAR_GET(thread_wake_one)) {
+        cond_.notify_one();
+      } else {
+        cond_.notify_all();
+      }
     }
     NotifyMulti();
     return true;
@@ -699,8 +710,13 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline void post_execution() override {
     count_--;
     // Runs with mutex_ held (Wait and WaitMultiple).
-    if (has_cond_waiters()) {
+    if (!has_cond_waiters()) {
+      return;
+    }
+    if (!REXCVAR_GET(thread_wake_one)) {
       cond_.notify_all();
+    } else if (count_ > 0) {
+      cond_.notify_one();
     }
   }
   uint32_t count_;
@@ -731,7 +747,11 @@ class PosixCondition<Mutant> : public PosixConditionBase {
         notify = released && has_cond_waiters();
       }
       if (notify) {
-        cond_.notify_all();
+        if (REXCVAR_GET(thread_wake_one)) {
+          cond_.notify_one();
+        } else {
+          cond_.notify_all();
+        }
       }
       if (released) {
         NotifyMulti();
