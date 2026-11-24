@@ -243,6 +243,9 @@ REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
                      "not shaded): 1 = draws whose pixel shader can kill pixels and that write neither depth nor "
                      "stencil, 2 = also every draw whose pixel shader cannot kill (no texkill, alpha test or "
                      "alpha-to-mask)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
+                    "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
+                    "queries");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -2239,7 +2242,7 @@ struct Backend::Impl {
 
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
-  uint32_t stat_early = 0;
+  uint32_t stat_early = 0, stat_silent = 0;
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -4711,6 +4714,11 @@ struct Backend::Impl {
       bind_count = 0;
       while (bind_count < 4 && bound_color[bind_count]) bind_count++;
     }
+    if (REXCVAR_GET(gtav_native_skip_silent_draws) && count == 0 && active_query < 0 && d.vs_use &&
+        !d.vs_use->memexport && !(d.ps_use && d.ps_use->memexport) && !DepthStencilWrites(r, dc)) {
+      stat_silent++;
+      return false;
+    }
     prof.Mark(prof.setup);
 
     // Texture and sampler slots (shared constant words 0-127 and 160-191), into a block of the
@@ -6724,7 +6732,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
-  s.stat_early = 0;
+  s.stat_early = s.stat_silent = 0;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
@@ -6976,10 +6984,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached, {} early-test "
-                "draws",
+                "draws, {} silent draws skipped",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
                 s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size(),
-                s.stat_early);
+                s.stat_early, s.stat_silent);
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;

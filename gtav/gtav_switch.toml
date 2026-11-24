@@ -51,3 +51,4 @@ gtav_physics_max_step = 0.034
 gtav_native_pass_gpu_times = true
 gtav_native_depth_zcull = true
 gtav_native_early_depth_tests = 1
+gtav_native_skip_silent_draws = true
