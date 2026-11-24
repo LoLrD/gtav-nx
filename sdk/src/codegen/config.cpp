@@ -13,8 +13,10 @@
 // TOML config file loading
 
 #include <algorithm>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 
 #include <fmt/format.h>
 
@@ -43,6 +45,36 @@ std::optional<uint32_t> ParseHexAddress(const std::string& keyStr) {
   } catch (...) {
     return std::nullopt;
   }
+}
+
+std::unordered_map<uint32_t, std::vector<uint32_t>> LoadIndirectPromotions(const std::filesystem::path& path) {
+  std::unordered_map<uint32_t, std::vector<uint32_t>> out;
+  std::ifstream in(path);
+  if (!in) {
+    REXCODEGEN_ERROR("indirect_promotions_file: cannot read {}", path.string());
+    return out;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    auto hash = line.find('#');
+    if (hash != std::string::npos)
+      line.resize(hash);
+    std::istringstream words(line);
+    std::string word;
+    std::vector<uint32_t> addrs;
+    while (words >> word) {
+      auto addr = ParseHexAddress(word);
+      if (!addr) {
+        addrs.clear();
+        break;
+      }
+      addrs.push_back(*addr);
+    }
+    if (addrs.size() >= 2)
+      out[addrs[0]].assign(addrs.begin() + 1, addrs.end());
+  }
+  REXCODEGEN_INFO("indirect_promotions_file: {} call sites from {}", out.size(), path.string());
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +169,23 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       p = std::filesystem::path(filePath).parent_path() / p;
     MergeScalar(cfg.argsInRegistersExcludeFile, p.string(), "args_in_registers_exclude_file");
   }
+  MergeBool(cfg.indirectProfile, toml["indirect_profile"].value_or(false), hasBool("indirect_profile"),
+            "indirect_profile");
+  MergeBool(cfg.indirectPromotionsVerify, toml["indirect_promotions_verify"].value_or(false),
+            hasBool("indirect_promotions_verify"), "indirect_promotions_verify");
   MergeBool(cfg.fastVmxEstimates, toml["fast_vmx_estimates"].value_or(false), hasBool("fast_vmx_estimates"),
             "fast_vmx_estimates");
   MergeBool(cfg.singleFloatOps, toml["single_float_ops"].value_or(false), hasBool("single_float_ops"),
             "single_float_ops");
   MergeBool(cfg.fpFormsVerify, toml["fp_forms_verify"].value_or(false), hasBool("fp_forms_verify"),
             "fp_forms_verify");
+  if (auto v = toml["indirect_promotions_file"].value<std::string>()) {
+    std::filesystem::path p(*v);
+    if (p.is_relative())
+      p = std::filesystem::path(filePath).parent_path() / p;
+    MergeScalar(cfg.indirectPromotionsFile, p.string(), "indirect_promotions_file");
+    cfg.indirectPromotions = LoadIndirectPromotions(p);
+  }
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

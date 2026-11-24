@@ -119,6 +119,10 @@ struct RecompilerConfig {
   bool argsInRegistersInstrument = false;  ///< ME_ARGS_COUNT entries (validation builds)
   bool argsInRegistersPoison = false;      ///< ME_ARGS_POISON before fast calls (validation builds)
 
+  bool indirectProfile = false;
+  std::string indirectPromotionsFile;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> indirectPromotions;
+  bool indirectPromotionsVerify = false;
   bool fastVmxEstimates = false;
   bool singleFloatOps = false;
   bool fpFormsVerify = false;

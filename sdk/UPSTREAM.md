@@ -121,3 +121,10 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   so polling loops still re-read memory. MMIO stays volatile; the generated code needs `-fno-strict-aliasing` (CMake
   option `GTAV_PLAIN_GUEST_MEMORY`). The
   AArch64 FPCR accessors clobber memory, so guest loads cannot move across a rounding-mode change.
+- Indirect call promotion (`indirect_profile`, `indirect_promotions_file`, `indirect_promotions_verify` in the
+  manifest; `src/codegen/builders/control_flow.cpp`, `src/system/indirect_dispatch.cpp`,
+  `resources/templates/codegen/_indirect_call.inja`): a profile build counts guest call site -> target pairs
+  (`REX_INDIRECT_PROFILE`, cvar `indirect_profile_file`); the listed `bctrl` / tail `bctr` sites then call their one or
+  two dominant targets directly behind a compare of the target (`if (ctr != T) goto miss; sub_T(ctx, base);`), so the
+  arguments-in-registers pass sees an ordinary direct call. Any other target takes the dispatch table as before. The
+  verify option checks every guarded call against the table (`indirect promotion DIFFERENCE`).

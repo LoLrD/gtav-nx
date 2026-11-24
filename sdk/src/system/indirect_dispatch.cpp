@@ -8,8 +8,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -41,9 +44,120 @@ REXCVAR_DEFINE_INT32(indirect_dispatch_verify_calls, 1000000, "CPU",
                      "Builds with MASSEFFECT_INDIRECT_DISPATCH_VERIFY only: compare the fast and the legacy result "
                      "for this many indirect calls (the legacy one is used), log every DIFFERENCE (first 64)");
 
+REXCVAR_DEFINE_STRING(indirect_profile_file, "", "CPU",
+                      "Builds generated with indirect_profile = true: file that receives the indirect call counts "
+                      "(one line per call site and target: site target calls), rewritten periodically");
+REXCVAR_DEFINE_INT32(indirect_profile_dump_seconds, 10, "CPU",
+                     "Builds generated with indirect_profile = true: seconds between rewrites of indirect_profile_file");
+
 namespace rex::runtime::indirect {
 
 alignas(64) uint64_t g_table[kTableSize];
+
+namespace {
+
+constexpr uint32_t kProfileBits = 18;
+constexpr uint32_t kProfileSize = 1u << kProfileBits;
+
+struct ProfileSlot {
+  std::atomic<uint64_t> key{0};
+  std::atomic<uint64_t> calls{0};
+};
+
+ProfileSlot* ProfileSlots() {
+  static ProfileSlot* slots = new ProfileSlot[kProfileSize];
+  return slots;
+}
+
+std::atomic<uint64_t> g_profile_lost{0};
+std::atomic<int64_t> g_profile_next_dump{0};
+std::mutex g_profile_dump_mutex;
+
+std::atomic<uint64_t> g_promoted_checks{0};
+std::atomic<uint64_t> g_promoted_differences{0};
+
+void DumpProfile(const std::string& path) {
+  std::unique_lock lock(g_profile_dump_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  std::string tmp = path + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "w");
+  if (!f) {
+    return;
+  }
+  ProfileSlot* slots = ProfileSlots();
+  uint64_t total = 0;
+  uint32_t sites = 0;
+  for (uint32_t i = 0; i < kProfileSize; ++i) {
+    uint64_t key = slots[i].key.load(std::memory_order_relaxed);
+    if (!key) {
+      continue;
+    }
+    uint64_t calls = slots[i].calls.load(std::memory_order_relaxed);
+    total += calls;
+    ++sites;
+    std::fprintf(f, "%08X %08X %llu\n", static_cast<uint32_t>(key >> 32), static_cast<uint32_t>(key),
+                 static_cast<unsigned long long>(calls));
+  }
+  std::fprintf(f, "# pairs %u calls %llu lost %llu\n", sites, static_cast<unsigned long long>(total),
+               static_cast<unsigned long long>(g_profile_lost.load(std::memory_order_relaxed)));
+  std::fclose(f);
+  std::rename(tmp.c_str(), path.c_str());
+}
+
+}  // namespace
+
+void Profile(uint32_t site, uint32_t target) {
+  const uint64_t key = (static_cast<uint64_t>(site) << 32) | target;
+  ProfileSlot* slots = ProfileSlots();
+  uint32_t s = static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ull) >> (64 - kProfileBits));
+  for (uint32_t i = 0; i < 64; ++i, s = (s + 1) & (kProfileSize - 1)) {
+    ProfileSlot& slot = slots[s];
+    uint64_t k = slot.key.load(std::memory_order_relaxed);
+    if (k == 0) {
+      uint64_t expected = 0;
+      if (slot.key.compare_exchange_strong(expected, key, std::memory_order_relaxed)) {
+        k = key;
+      } else {
+        k = expected;
+      }
+    }
+    if (k == key) {
+      uint64_t n = slot.calls.fetch_add(1, std::memory_order_relaxed);
+      if ((n & 0xFFFF) == 0) {
+        int64_t now = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count());
+        int64_t next = g_profile_next_dump.load(std::memory_order_relaxed);
+        if (now >= next && g_profile_next_dump.compare_exchange_strong(
+                               next, now + std::max<int32_t>(1, REXCVAR_GET(indirect_profile_dump_seconds)))) {
+          const std::string& path = REXCVAR_GET(indirect_profile_file);
+          if (!path.empty()) {
+            DumpProfile(path);
+          }
+        }
+      }
+      return;
+    }
+  }
+  g_profile_lost.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CheckPromoted(uint32_t target, PPCFunc* direct, PPCFunc* looked_up) {
+  uint64_t n = g_promoted_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (direct != looked_up) {
+    uint64_t d = g_promoted_differences.fetch_add(1, std::memory_order_relaxed);
+    if (d < 64) {
+      REXLOG_ERROR("indirect promotion DIFFERENCE: guest {:08X} direct {} table {}", target,
+                   reinterpret_cast<void*>(direct), reinterpret_cast<void*>(looked_up));
+    }
+  }
+  if (n == 1 || (n & ((1u << 24) - 1)) == 0) {
+    REXLOG_INFO("indirect promotion verify: {} guarded calls checked, {} differences", n,
+                g_promoted_differences.load(std::memory_order_relaxed));
+  }
+}
 
 // Hot-miss cache: direct-mapped, kHotSize entries in the table's packing (one 64-bit word = key + value), shared by all
 // threads. 4 KB stays in the L1 data cache; the hot set of the 1 MB table (~1,100 lines over ~250 pages) does not.

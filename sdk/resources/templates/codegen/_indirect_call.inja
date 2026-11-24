@@ -33,6 +33,16 @@
 #define REX_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
 
+#include <rex/ppc/indirect_dispatch.h>
+
+#define REX_INDIRECT_PROFILE(site, target) rex::runtime::indirect::Profile((site), (target))
+#define REX_INDIRECT_PROMOTED_CHECK(target, fn)                                                    \
+  rex::runtime::indirect::CheckPromoted((target), (fn),                                            \
+                                        ((uint32_t)((target) - REX_CODE_BASE) <                    \
+                                         REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE)                   \
+                                            ? REX_LOOKUP_FUNC(base, (target))                      \
+                                            : nullptr)
+
 #if REX_INDIRECT_DISPATCH == 0
 
 #define REX_CALL_INDIRECT_FUNC(x)                                                          \

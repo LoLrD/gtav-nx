@@ -97,6 +97,10 @@ inline PPCFunc* Lookup(uint32_t guest) {
  */
 PPCFunc* Verify(uint32_t guest, PPCFunc* fast_fn, PPCFunc* legacy_fn);
 
+void Profile(uint32_t site, uint32_t target);
+
+void CheckPromoted(uint32_t target, PPCFunc* direct, PPCFunc* looked_up);
+
 }  // namespace rex::runtime::indirect
 
 // Table maintenance, called by FunctionDispatcher with its dispatch mutex held (function_dispatcher.cpp).
