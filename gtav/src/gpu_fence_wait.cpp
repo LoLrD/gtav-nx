@@ -12,6 +12,7 @@
 #include <rex/logging.h>
 
 #include <chrono>
+#include <thread>
 
 #include <atomic>
 
@@ -74,3 +75,11 @@ REX_HOOK_RAW(sub_8380CEF8) {
     }
   }
 }
+
+#if defined(__SWITCH__)
+REX_EXTERN(__imp__sub_83807DC8);
+REX_HOOK_RAW(sub_83807DC8) {
+  std::this_thread::sleep_for(std::chrono::microseconds(50));
+  __imp__sub_83807DC8(ctx, base);
+}
+#endif
