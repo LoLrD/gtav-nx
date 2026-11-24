@@ -94,6 +94,9 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 30, "GTAV",
 #endif
 REXCVAR_DEFINE_INT32(gtav_native_texture_sample_frames, GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT, "GTAV",
                      "Frames between the sampled checks of a large cached texture (1: every frame it is used)");
+REXCVAR_DEFINE_INT32(gtav_native_texture_stable_frames, 1, "GTAV",
+                     "Frames between the checks of a cached texture whose guest bytes never changed in its last 8 "
+                     "checks (1: every frame it is used; one change makes it checked every frame for good)");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
@@ -1458,6 +1461,8 @@ struct CachedTexture {
   uint32_t pre_words[6] = {};
   bool failed = false;
   bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
+  bool unstable = false;  // its guest bytes changed after the first upload
+  uint8_t unchanged = 0;  // checks in a row that found the guest bytes unchanged (saturates)
 };
 
 struct CachedBuffer {
@@ -3018,6 +3023,15 @@ struct Backend::Impl {
     if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_sample_frames)));
         every > 1 && t.texture && t.bytes > kSmallTexture && t.sample_frame != ~0ull && frame - t.sample_frame < every)
       return t.descriptor;
+    // Stable textures (no change in their last kStableChecks checks): checked every N frames.
+    constexpr uint8_t kStableChecks = 8;
+    if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_stable_frames)));
+        every > 1 && t.texture && !t.unstable && t.unchanged >= kStableChecks &&
+        frame - std::max(t.checked_frame, t.sample_frame == ~0ull ? 0 : t.sample_frame) < every) {
+      tprof.stable++;
+      return t.descriptor;
+    }
+    auto unchanged = [&t] { t.unchanged = uint8_t(std::min<uint32_t>(t.unchanged + 1u, 255u)); };
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
@@ -3038,6 +3052,7 @@ struct Backend::Impl {
       tprof.sampled++;
       if (HashGuestTexture(words, true) == t.sampled_hash) {
         t.sample_frame = frame;
+        unchanged();
         return t.descriptor;
       }
     }
@@ -3075,8 +3090,10 @@ struct Backend::Impl {
     t.sample_frame = frame;
     if (t.texture && raw && raw == t.raw_hash) {
       t.checked_frame = frame;
+      unchanged();
       return t.descriptor;
     }
+    if (t.texture) t.unstable = true, t.unchanged = 0;
     ScopedMs timer{t_texture};
     DecodedTexture dec;
     if (!DecodeGuestTexture(words, &dec)) {
@@ -3707,7 +3724,7 @@ struct Backend::Impl {
   DrawProfile prof, prof_sum;
   uint64_t conv_bytes[4] = {}, conv_draws[4] = {};  // vertices converted: rect lists, inline, snapshots, rebuilt buffers
   struct TextureProfile {
-    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0;
+    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0, stable = 0;
     double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
   } tprof;
   // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
@@ -6765,9 +6782,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_fetch_resolves = 0;
       auto& t = s.tprof;
       REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
-                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms)",
+                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms), {:.0f} stable ones not checked",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
-                  t.full_bytes / n / 1048576.0, t.full_ms / n);
+                  t.full_bytes / n / 1048576.0, t.full_ms / n, t.stable / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
                   "{:.0f} pipeline binds",
                   t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);
