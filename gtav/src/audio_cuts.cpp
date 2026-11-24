@@ -222,6 +222,8 @@ void BuildFrameState(uint8_t* base, uint32_t mixer) {
 }
 }  // namespace
 
+bool GtavAudioFiltersAbOff() { return AbOff(kAbFilters); }
+
 REX_EXTERN(__imp__sub_831C4708);
 REX_HOOK_RAW(sub_831C4708) {
   ++g_frame;
