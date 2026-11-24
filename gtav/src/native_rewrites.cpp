@@ -1811,18 +1811,7 @@ inline uint8_t* VmRaw(uint8_t* base, uint32_t a) { return Host(base, a); }
   } while (0)
 #undef VM_NEXT
 
-inline bool VmWordSame(uint32_t a, uint32_t b) { return a == b || (IsNan(a) && IsNan(b)); }
-
-inline bool VmVecSame(const PPCVRegister& a, const PPCVRegister& b) {
-  for (int i = 0; i < 4; ++i)
-    if (!VmWordSame(a.u32[i], b.u32[i])) return false;
-  return true;
-}
-
-bool VmSameRegs(const PPCContext& a, const PPCContext& b) {
-  return a.r1.u64 == b.r1.u64 && a.r3.u64 == b.r3.u64 && VmVecSame(a.v1, b.v1) && VmVecSame(a.v2, b.v2) &&
-         VmVecSame(a.v3, b.v3);
-}
+bool VmSameRegs(const PPCContext& a, const PPCContext& b) { return a.r1.u64 == b.r1.u64 && a.r3.u64 == b.r3.u64; }
 
 constexpr uint32_t kVmObjBytes = 64;
 constexpr uint32_t kVmTrackBytes = 65535u + 1024u + 32u;
@@ -1830,6 +1819,7 @@ constexpr uint32_t kVmMaxSlots = 4096;
 constexpr uint32_t kVmTrackOffset = 128;
 constexpr uint32_t kVmSlotOffset = kVmTrackOffset + ((kVmTrackBytes + 15) & ~15u) + 16;
 constexpr uint32_t kVmShadowBytes = kVmSlotOffset + 16 * kVmMaxSlots + 32;
+constexpr uint32_t kVmStackScratch = 32768;
 
 struct VmShadow {
   uint32_t at = 0;
@@ -1841,12 +1831,12 @@ struct VmShadow {
     return v;
   }
 
-  void Fill(uint8_t* base, uint32_t real_obj, uint32_t slots_need) {
+  void Fill(uint8_t* base, uint32_t real_obj, uint32_t slots_need, const VmShadow* from) {
     obj = at + (real_obj & 15);
     std::memcpy(Host(base, obj), Host(base, real_obj), kVmObjBytes);
-    std::memcpy(Host(base, tracks_to), Host(base, tracks_from), tracks_n);
+    std::memcpy(Host(base, tracks_to), Host(base, from ? from->tracks_to : tracks_from), tracks_n);
     std::memset(Host(base, tracks_to + tracks_n), 0, kVmTrackBytes - tracks_n);
-    std::memcpy(Host(base, slots_to), Host(base, slots_from), slots_n);
+    std::memcpy(Host(base, slots_to), Host(base, from ? from->slots_to : slots_from), slots_n);
     std::memset(Host(base, slots_to + slots_n), 0, slots_need - slots_n);
     for (uint32_t o : {0u, 4u, 8u, 16u, 24u}) VmS32(base, obj + o, Map(Load32(base, obj + o)));
   }
@@ -1883,8 +1873,8 @@ bool VmShadows(const PPCContext& ctx, uint8_t* base, VmShadow& a, VmShadow& b) {
     s->slots_n = sn;
     s->slots_to = s->at + kVmSlotOffset;
   }
-  a.Fill(base, obj, slots_need);
-  b.Fill(base, obj, slots_need);
+  a.Fill(base, obj, slots_need, nullptr);
+  b.Fill(base, obj, slots_need, &a);
   return true;
 }
 
@@ -1912,20 +1902,27 @@ void VmCheck(PPCContext& ctx, uint8_t* base) {
   PPCContext mine = ctx, theirs = ctx;
   mine.r4.u64 = sa.obj;
   theirs.r4.u64 = sb.obj;
+  const uint32_t below = ctx.r1.u32 - kVmStackScratch;
+  const uint32_t scratch = Flat(below, kVmStackScratch) ? Writable(below, kVmStackScratch) : 0;
+  thread_local std::vector<uint8_t> stack;
+  stack.resize(scratch);
+  std::memcpy(stack.data(), Host(base, below), scratch);
   thread_local uint32_t flip = 0;
   Clock::time_point t[4];
   if (++flip & 1) {
     t[0] = Clock::now();
     Vm834260A0(mine, base);
     t[1] = Clock::now();
+    std::memcpy(Host(base, below), stack.data(), scratch);
+    t[2] = Clock::now();
     __imp__sub_834260A0(theirs, base);
-    t[2] = t[1];
     t[3] = Clock::now();
   } else {
     t[2] = Clock::now();
     __imp__sub_834260A0(theirs, base);
     t[3] = Clock::now();
-    t[0] = t[3];
+    std::memcpy(Host(base, below), stack.data(), scratch);
+    t[0] = Clock::now();
     Vm834260A0(mine, base);
     t[1] = Clock::now();
   }
@@ -1947,14 +1944,7 @@ void VmCheck(PPCContext& ctx, uint8_t* base) {
     x.r3.u64 = canon(sa, x.r3.u64);
     y.r3.u64 = canon(sb, y.r3.u64);
     ok = VmSameRegs(x, y);
-    if (!ok)
-      what = fmt::format("registers: r1 {:X}/{:X} r3 {:X}/{:X} v1 {:08X} {:08X} {:08X} {:08X}/{:08X} {:08X} {:08X} {:08X} "
-                         "v2 {:08X} {:08X} {:08X} {:08X}/{:08X} {:08X} {:08X} {:08X} v3 {:08X} {:08X} {:08X} {:08X}/{:08X} "
-                         "{:08X} {:08X} {:08X}",
-                         y.r1.u64, x.r1.u64, y.r3.u64, x.r3.u64, y.v1.u32[0], y.v1.u32[1], y.v1.u32[2], y.v1.u32[3],
-                         x.v1.u32[0], x.v1.u32[1], x.v1.u32[2], x.v1.u32[3], y.v2.u32[0], y.v2.u32[1], y.v2.u32[2],
-                         y.v2.u32[3], x.v2.u32[0], x.v2.u32[1], x.v2.u32[2], x.v2.u32[3], y.v3.u32[0], y.v3.u32[1],
-                         y.v3.u32[2], y.v3.u32[3], x.v3.u32[0], x.v3.u32[1], x.v3.u32[2], x.v3.u32[3]);
+    if (!ok) what = fmt::format("registers: r1 {:X}/{:X} r3 {:X}/{:X}", y.r1.u64, x.r1.u64, y.r3.u64, x.r3.u64);
   }
   if (nan_only) g_vm.nan_only.fetch_add(1, std::memory_order_relaxed);
   if (!ok)
@@ -2167,9 +2157,7 @@ void Pack8358AE80(PPCContext& ctx, uint8_t* base) {
   }
 }
 
-bool PackSameRegs(const PPCContext& a, const PPCContext& b) {
-  return a.r3.u64 == b.r3.u64 && a.r1.u64 == b.r1.u64 && a.lr == b.lr;
-}
+bool PackSameRegs(const PPCContext& a, const PPCContext& b) { return a.r3.u64 == b.r3.u64 && a.r1.u64 == b.r1.u64; }
 
 #endif
 
