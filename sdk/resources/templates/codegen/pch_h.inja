@@ -142,17 +142,25 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
 
-#define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#if defined(REX_PLAIN_GUEST_MEMORY)
+#define REX_GUEST_VOLATILE
+#define REX_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
+#else
+#define REX_GUEST_VOLATILE volatile
+#define REX_LOOP_BARRIER() ((void)0)
+#endif
+
+#define REX_LOAD_U8(x) (*(REX_GUEST_VOLATILE u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U16(x) __builtin_bswap16(*(REX_GUEST_VOLATILE u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U32(x) __builtin_bswap32(*(REX_GUEST_VOLATILE u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+#define REX_LOAD_U64(x) __builtin_bswap64(*(REX_GUEST_VOLATILE u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
 #define REX_LOAD_STRING(x, len) \
   std::string_view(reinterpret_cast<const char*>(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (len))
 
-#define REX_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
-#define REX_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
-#define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
-#define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
+#define REX_STORE_U8(x, y)  (*(REX_GUEST_VOLATILE u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
+#define REX_STORE_U16(x, y) (*(REX_GUEST_VOLATILE u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
+#define REX_STORE_U32(x, y) (*(REX_GUEST_VOLATILE u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+#define REX_STORE_U64(x, y) (*(REX_GUEST_VOLATILE u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
 // Mass Effect diet (codegen option dform_disp_split): D-form accesses pass the register and the signed
 // displacement apart, so the address is base + zext(reg) + disp (one add shared by neighbouring accesses, the
@@ -170,14 +178,14 @@ extern PPCFuncMapping PPCFuncMappings[];
 #define REX_STORE_D_U64(r, d, y) REX_STORE_U64((u32)(r) + (d), y)
 #else
 #define REX_ADDR_D(r, d) (base + (uint64_t)(u32)(r) + (int64_t)(d))
-#define REX_LOAD_D_U8(r, d) (*(volatile u8*)REX_ADDR_D(r, d))
-#define REX_LOAD_D_U16(r, d) __builtin_bswap16(*(volatile u16*)REX_ADDR_D(r, d))
-#define REX_LOAD_D_U32(r, d) __builtin_bswap32(*(volatile u32*)REX_ADDR_D(r, d))
-#define REX_LOAD_D_U64(r, d) __builtin_bswap64(*(volatile u64*)REX_ADDR_D(r, d))
-#define REX_STORE_D_U8(r, d, y) (*(volatile u8*)REX_ADDR_D(r, d) = (y))
-#define REX_STORE_D_U16(r, d, y) (*(volatile u16*)REX_ADDR_D(r, d) = __builtin_bswap16(y))
-#define REX_STORE_D_U32(r, d, y) (*(volatile u32*)REX_ADDR_D(r, d) = __builtin_bswap32(y))
-#define REX_STORE_D_U64(r, d, y) (*(volatile u64*)REX_ADDR_D(r, d) = __builtin_bswap64(y))
+#define REX_LOAD_D_U8(r, d) (*(REX_GUEST_VOLATILE u8*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U16(r, d) __builtin_bswap16(*(REX_GUEST_VOLATILE u16*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U32(r, d) __builtin_bswap32(*(REX_GUEST_VOLATILE u32*)REX_ADDR_D(r, d))
+#define REX_LOAD_D_U64(r, d) __builtin_bswap64(*(REX_GUEST_VOLATILE u64*)REX_ADDR_D(r, d))
+#define REX_STORE_D_U8(r, d, y) (*(REX_GUEST_VOLATILE u8*)REX_ADDR_D(r, d) = (y))
+#define REX_STORE_D_U16(r, d, y) (*(REX_GUEST_VOLATILE u16*)REX_ADDR_D(r, d) = __builtin_bswap16(y))
+#define REX_STORE_D_U32(r, d, y) (*(REX_GUEST_VOLATILE u32*)REX_ADDR_D(r, d) = __builtin_bswap32(y))
+#define REX_STORE_D_U64(r, d, y) (*(REX_GUEST_VOLATILE u64*)REX_ADDR_D(r, d) = __builtin_bswap64(y))
 #endif
 
 #define REX_MEMORY_SIZE 0x100000000ull

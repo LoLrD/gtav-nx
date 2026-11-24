@@ -116,3 +116,8 @@ code generator and runtime changes of masseffect-nx. The third-party sources are
   is innocuous for them) and `fmadds` / `fmsubs` / `fnmadds` / `fnmsubs` are one `fmaf` (one rounding to single, as on
   the Xenon). `fp_forms_verify` (validation builds) computes both forms at every converted instruction, keeps the old
   value and counts input / result differences (`rex_fp_check` in the pch).
+- Plain guest memory (`REX_PLAIN_GUEST_MEMORY`, ported from the NieR SDK): `REX_LOAD_*` / `REX_STORE_*` drop `volatile`
+  and the code generator emits `REX_LOOP_BARRIER()` at every loop head (target of a backward branch or jump-table entry),
+  so polling loops still re-read memory. MMIO stays volatile; the generated code needs `-fno-strict-aliasing` (CMake
+  option `GTAV_PLAIN_GUEST_MEMORY`). The
+  AArch64 FPCR accessors clobber memory, so guest loads cannot move across a rounding-mode change.
