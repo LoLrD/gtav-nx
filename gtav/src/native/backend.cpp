@@ -3848,6 +3848,7 @@ struct Backend::Impl {
   uint64_t stat_pipeline_binds = 0;  // vkCmdBindPipeline calls (5% of the render thread in the driver, 11-15)
   uint32_t prof_frames = 0;
   uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
+  uint64_t hashed_bytes[2] = {};
 
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
   // The capture shares a block between consecutive draws with equal constants (same offset).
@@ -4020,6 +4021,7 @@ struct Backend::Impl {
     uint64_t snap_hits = 0, snap_misses = 0, rect_hits = 0, rect_misses = 0;
     uint64_t prehash_hits = 0, prehash_late = 0, prehash_misses = 0;
     uint64_t watched_buffers = 0, watch_missed = 0, watch_late = 0;
+    uint64_t hashed_bytes[2] = {};  // guest vertex/index bytes hashed: buffers, fence-copied snapshots
     void BeginFrame(bool profile) {
       draw_state = DrawState{};
       last_vs.valid = last_ps.valid = false;  // upload memory is per frame
@@ -4982,9 +4984,12 @@ struct Backend::Impl {
     // watch epoch alone: only a full hash makes the copy current.)
     constexpr uint64_t kSmallBuffer = 64 << 10;
     if (b.buffer && guest_size > kSmallBuffer && b.size == host_size && frame - b.full_frame < 8 &&
-        !REXCVAR_GET(gtav_native_exact_cache) && SampledHash(guest, guest_size) == b.sampled) {
-      b.checked_frame.store(frame, std::memory_order_release);
-      return b.buffer.get();
+        !REXCVAR_GET(gtav_native_exact_cache)) {
+      rc.hashed_bytes[0] += 16 * 256;
+      if (SampledHash(guest, guest_size) == b.sampled) {
+        b.checked_frame.store(frame, std::memory_order_release);
+        return b.buffer.get();
+      }
     }
     if (watching) {  // before reading: a write from now on is seen
       b.watch.ranges[0] = physical, b.watch.ranges[1] = uint32_t(guest_size);
@@ -5003,6 +5008,7 @@ struct Backend::Impl {
       rc.prehash_misses += prehash_on;
     }
     content = pre ? pre->raw : Hash(guest, guest_size);
+    if (!pre) rc.hashed_bytes[0] += guest_size;
     if (prehash_on && guest_size <= kSmallBuffer) rc.prehash_next.push_back({key, guest, guest_size, {}});
     b.full_frame = frame;
     if (guest_size > kSmallBuffer) b.sampled = SampledHash(guest, guest_size);
@@ -5287,6 +5293,7 @@ struct Backend::Impl {
         const uint64_t bytes = uint64_t(vertices) * stride, host = uint64_t(vertices) * host_stride;
         const uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
         const uint64_t skey = Hash(guest, bytes, key ^ (host << 20));
+        rc.hashed_bytes[1] += bytes;
         SnapEntry* entry;
         {
           std::lock_guard lock(snap_mutex);
@@ -5502,6 +5509,8 @@ struct Backend::Impl {
     rect_hits += rc.rect_hits, rect_misses += rc.rect_misses;
     prehash_hits += rc.prehash_hits, prehash_late += rc.prehash_late, prehash_misses += rc.prehash_misses;
     tstats_watched_buffers += rc.watched_buffers, watch_missed += rc.watch_missed, watch_late += rc.watch_late;
+    hashed_bytes[0] += rc.hashed_bytes[0], hashed_bytes[1] += rc.hashed_bytes[1];
+    rc.hashed_bytes[0] = rc.hashed_bytes[1] = 0;
     buffer_bytes_total += rc.buffer_bytes;
     snap_bytes_total += rc.snap_bytes;
     for (auto& b : rc.dead_buffers) dead_buffers.push_back(std::move(b));
@@ -6687,6 +6696,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
         if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
         s.cur_draw = c.index;
+        if (!s.stream && !s.dumping && !s.take_notes) FenceReleaseBefore(f.draws[c.index].fence);
         s.Draw(list, f, f.draws[c.index]);
         s.cur_draw = c.index + 1;
         s.pass_draws++;
@@ -6760,6 +6770,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   s.conv_draws[2] / n, s.conv_bytes[3] / n / 1024, s.conv_draws[3] / n);
       REXLOG_INFO("[native]   snapshots per frame: {:.1f} from the cache, {:.1f} converted ({} cached, {:.1f} MB)",
                   s.snap_hits / n, s.snap_misses / n, s.snap_cache.size(), s.snap_bytes_total / 1048576.0);
+      REXLOG_INFO("[native]   vertex and index bytes hashed per frame: {:.0f} KB of buffers, {:.0f} KB of snapshots",
+                  s.hashed_bytes[0] / n / 1024, s.hashed_bytes[1] / n / 1024);
+      s.hashed_bytes[0] = s.hashed_bytes[1] = 0;
       s.snap_hits = s.snap_misses = 0;
       REXLOG_INFO("[native]   rect lists per frame: {:.1f} from the cache, {:.1f} expanded ({} sites cached)",
                   s.rect_hits / n, s.rect_misses / n, s.rect_cache.size());

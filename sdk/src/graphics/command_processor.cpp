@@ -101,10 +101,12 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 // processor has been idle for 2 ms, rex_skip_rendering_idle lets it release what it held back
 // (the game is probably waiting for it).
 using SkipRenderingFenceHook = uint32_t (*)(uint32_t address, uint32_t value, uint32_t endian);
+using SkipRenderingFenceStoreHook = bool (*)(uint32_t address, uint32_t value, uint32_t endian);
 using SkipRenderingIdleHook = void (*)();
 #if defined(__SWITCH__)
 extern "C" __attribute__((weak)) void rex_skip_rendering_idle();
 extern "C" __attribute__((weak)) uint32_t rex_skip_rendering_fence(uint32_t address, uint32_t value, uint32_t endian);
+extern "C" __attribute__((weak)) bool rex_skip_rendering_fence_store(uint32_t address, uint32_t value, uint32_t endian);
 extern "C" __attribute__((weak)) int rex_skip_rendering_gpu_waiters();
 #endif
 static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
@@ -114,6 +116,19 @@ static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
   return &rex_skip_rendering_idle;
 #else
   return reinterpret_cast<SkipRenderingIdleHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_idle"));
+#endif
+}
+// rex_skip_rendering_fence_store, when the title exports it, may take over an EVENT_WRITE_SHD whole (returns true
+// after writing the fence itself): the title's renderer also writes that fence from its own thread, and both
+// stores have to be ordered under one lock.
+static SkipRenderingFenceStoreHook ResolveSkipRenderingFenceStoreHook() {
+#ifdef _WIN32
+  return reinterpret_cast<SkipRenderingFenceStoreHook>(
+      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_fence_store"));
+#elif defined(__SWITCH__)
+  return &rex_skip_rendering_fence_store;
+#else
+  return reinterpret_cast<SkipRenderingFenceStoreHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_fence_store"));
 #endif
 }
 static SkipRenderingFenceHook ResolveSkipRenderingFenceHook() {
@@ -348,10 +363,10 @@ void CommandProcessor::WorkerThreadMain() {
       auto idle_start = std::chrono::steady_clock::now();
       bool idle_reported = false;
       do {
-        if (idle_hook && !idle_reported &&
-            std::chrono::steady_clock::now() - idle_start >= std::chrono::milliseconds(2)) {
+        if (idle_hook && std::chrono::steady_clock::now() - idle_start >= std::chrono::milliseconds(2)) {
           idle_hook();
           idle_reported = true;
+          idle_start = std::chrono::steady_clock::now();
         }
 #if REX_PLATFORM_SWITCH
         // UpdateWritePointer and CallInThread signal the event. Leave the CPU free
@@ -1443,6 +1458,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
+  static const SkipRenderingFenceStoreHook store_hook = ResolveSkipRenderingFenceStoreHook();
+  if (store_hook && store_hook(address, data_value, uint32_t(endianness))) return true;
   static const SkipRenderingFenceHook fence_hook = ResolveSkipRenderingFenceHook();
   if (fence_hook) data_value = fence_hook(address, data_value, uint32_t(endianness));
   data_value = GpuSwap(data_value, endianness);

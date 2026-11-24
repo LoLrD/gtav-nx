@@ -216,7 +216,7 @@ REX_HOOK_RAW(sub_838045E0) {
 REX_EXTERN(__imp__sub_838146B8);
 REX_HOOK_RAW(sub_838146B8) {
   ProbeFrame();
-  OnCaptureSwap(ctx.r4.u32);
+  OnCaptureSwap(ctx.r3.u32, ctx.r4.u32);
   if (!StatsEnabled()) {
     __imp__sub_838146B8(ctx, base);
     return;

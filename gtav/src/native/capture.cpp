@@ -99,6 +99,14 @@ REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
                     "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
                     "frame was recorded (the game may reuse that memory from then on)");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_release, false, "GTAV",
+                    "The game sees a GPU fence only once the renderer recorded every draw issued before it (no copies "
+                    "and no command processor waits); draw data is copied only when the game blocks on a fence of the "
+                    "frame it is still building");
+REXCVAR_DEFINE_INT32(gtav_native_fence_release_stall_ms, 250, "GTAV",
+                     "With --gtav_native_fence_release: held GPU fences are released anyway (copying the draw data) "
+                     "once the command processor idled this long without the renderer releasing any (a game thread "
+                     "may be polling one)");
 REXCVAR_DEFINE_BOOL(gtav_native_check_draw_data, false, "GTAV",
                     "Hash every draw's vertex and index data at capture and again at record time, and log how "
                     "many draws the game rewrote in between (diagnostic; costs ~40% of both threads)");
@@ -502,7 +510,30 @@ static struct {
   double wait_ms = 0;
 } g_copy_stats;
 
+// --gtav_native_fence_release state. g_release_limit: the newest fence value the renderer allows (every draw
+// issued before it was recorded, or copied by an emergency release); the game sees min(limit, the command
+// processor's newest fence).
+static std::atomic<bool> g_release_started{false};  // the renderer recorded its first draw
+static std::atomic<uint32_t> g_release_limit{0};
+static std::atomic<uint32_t> g_fence_seen{0}, g_fence_shown{0};  // newest fence the CP reached / the game sees
+static std::atomic<uint32_t> g_last_end_fence{0};  // end_fence of the last frame handed to the renderer
+static std::atomic<int> g_urgent_waiters{0};
+static std::mutex g_emergency_mutex;
+enum ReleaseCause { kReleaseWaiter, kReleaseStall, kReleaseCauses };
+static struct {
+  std::atomic<uint64_t> stores{0}, emergencies[kReleaseCauses]{};
+  std::atomic<uint32_t> longest_hold_ms{0};
+} g_release_stats;
+
+static bool ReleaseMode() {
+  static const bool on = REXCVAR_GET(gtav_native_fence_release) && REXCVAR_GET(gtav_native_fence_copy) &&
+                         REXCVAR_GET(gtav_native) != "off";
+  return on;
+}
+static bool FenceWaitMode() { return REXCVAR_GET(gtav_native_fence_wait) || ReleaseMode(); }
+
 static void FenceReached(uint32_t value) {
+  std::lock_guard serial(g_emergency_mutex);
   std::unique_lock lock(g_copy_mutex);
   DrainIncomingCopies();
   while (!g_pending_copies.empty() && int32_t(value - g_pending_copies.front().fence) >= 0) {
@@ -518,7 +549,7 @@ static void FenceReached(uint32_t value) {
     // Being recorded: a draw reads its guest data (vertices, indices, textures) when it is recorded,
     // so only a draw the renderer has not reached yet must wait, and only until it is reached.
     // (Waiting for the whole frame stalled the GPU, and with it the game, for ~10 ms a time.)
-    if (p.frame == g_recording && !REXCVAR_GET(gtav_native_fence_wait)) {
+    if (p.frame == g_recording && !FenceWaitMode()) {
       if (g_recorded_draws.load(std::memory_order_acquire) > p.draw) {
         g_pending_copies.pop_front();
         continue;
@@ -539,7 +570,7 @@ static void FenceReached(uint32_t value) {
       if (!reached) break;
       continue;  // re-evaluate the front: it may have been recorded and popped meanwhile
     }
-    if (REXCVAR_GET(gtav_native_fence_wait) && REXCVAR_GET(gtav_native_fence_wait_draw) &&
+    if (FenceWaitMode() && REXCVAR_GET(gtav_native_fence_wait_draw) &&
         p.frame < g_frame.load(std::memory_order_relaxed)) {
       // Until this draw is recorded (it read its vertices, indices and textures then), not until
       // its whole frame is: the later draws' fences hold the game off their memory meanwhile.
@@ -571,8 +602,7 @@ static void FenceReached(uint32_t value) {
       if (recorded()) g_pending_copies.pop_front();
       continue;  // a finished frame's entries are popped at the top
     }
-    if (p.frame == g_recording ||
-        (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {
+    if (p.frame == g_recording || (FenceWaitMode() && p.frame < g_frame.load(std::memory_order_relaxed))) {
       uint64_t frame = p.frame;
       auto start = std::chrono::steady_clock::now();
       g_copy_stats.waits++;
@@ -692,6 +722,13 @@ void FenceCopiesRecorded(uint64_t frame) {
                   st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
                   g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
       st = {};
+      if (ReleaseMode()) {
+        auto& rs = g_release_stats;
+        REXLOG_INFO("[native] fence release per 300 frames: {} stores by the renderer, emergency releases {} for a "
+                    "blocked game thread and {} after a stall, longest hold {} ms",
+                    rs.stores.exchange(0), rs.emergencies[kReleaseWaiter].exchange(0),
+                    rs.emergencies[kReleaseStall].exchange(0), rs.longest_hold_ms.exchange(0));
+      }
     }
   }
   g_copy_cv.notify_all();
@@ -834,13 +871,14 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
+  d.fence = be32(dev + kDevFence);
   if (REXCVAR_GET(gtav_native_check_draw_data))
     d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
   if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
     SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
   } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {
     if (uint32_t done = be32(dev + kDevFenceDone)) g_fence_address = GuestPhysical(done);
-    PendingCopy p{GuestFrame(), index, be32(dev + kDevFence), d.indexed, d.index32,
+    PendingCopy p{GuestFrame(), index, d.fence, d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
     std::lock_guard lock(g_incoming_mutex);
@@ -1212,13 +1250,17 @@ void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_a
     RecordedBuffer& b = BufferFor(begin, end);
     g_buffer_stats.recorded += TakeRecorded(begin, end, b.packet);
     if (b.packet.commands.empty()) g_buffer_stats.empty++;
-    for (const auto& c : b.packet.commands) CopyCommand(g_packet, b.packet, c, 0);
+    const uint32_t fence = be32(Guest(device) + kDevFence);
+    for (const auto& c : b.packet.commands) {
+      CopyCommand(g_packet, b.packet, c, 0);
+      if (c.kind == CommandKind::kDraw) g_packet.draws.back().fence = fence;
+    }
     g_buffer_stats.replayed += uint32_t(b.packet.commands.size());
     at += 8;
   }
 }
 
-void OnCaptureSwap(uint32_t front_buffer) {
+void OnCaptureSwap(uint32_t device, uint32_t front_buffer) {
   linux_threads::Note(linux_threads::kD3D);
   FlushIndexedVertices();
   // Commands recorded this frame into known buffers that did not run yet: they run later.
@@ -1265,6 +1307,8 @@ void OnCaptureSwap(uint32_t front_buffer) {
   if (!Active()) return;
   g_packet.index = frame;
   g_packet.front_buffer = front_buffer;
+  g_packet.end_fence = device ? be32(Guest(device) + kDevFence) : 0;
+  if (device) g_last_end_fence.store(g_packet.end_fence, std::memory_order_release);
   if (REXCVAR_GET(gtav_native) == "on") NoteGuestSwap(frame);
   {
     static size_t max_bytes = 0, max_draws = 0, max_inline = 0;
@@ -1309,14 +1353,112 @@ static void StoreFence(uint32_t address, uint32_t value, uint32_t endian) {
   std::memcpy(REX_KERNEL_MEMORY()->TranslatePhysical(address), &value, 4);
 }
 
+static bool Releasing() { return ReleaseMode() && g_release_started.load(); }
+
+// --gtav_native_fence_release, g_fence_mutex held: shows the game the newest fence the renderer allows.
+static std::chrono::steady_clock::time_point g_hold_since;  // start of the current wait for the renderer
+static bool g_holding = false;
+static void StoreReleasedLocked() {
+  const uint32_t address = g_fence_address.load(std::memory_order_relaxed);
+  if (!g_fence_any || !address) return;
+  const uint32_t limit = g_release_limit.load();
+  const uint32_t shown = int32_t(g_fence_latest - limit) > 0 ? limit : g_fence_latest;
+  const auto now = std::chrono::steady_clock::now();
+  if (int32_t(shown - g_fence_written) > 0) {
+    if (g_holding) {
+      const uint32_t held = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hold_since).count());
+      for (uint32_t longest = g_release_stats.longest_hold_ms.load(std::memory_order_relaxed);
+           held > longest && !g_release_stats.longest_hold_ms.compare_exchange_weak(longest, held);) {
+      }
+    }
+    g_fence_written = shown;
+    g_fence_shown.store(shown);
+    StoreFence(address & 0x1FFFFFFF, shown, g_fence_endian);
+    g_hold_since = now;
+  }
+  const bool holding = g_fence_written != g_fence_latest;
+  if (holding && !g_holding) g_hold_since = now;
+  g_holding = holding;
+}
+
+static void RaiseLimit(uint32_t value) {
+  for (uint32_t limit = g_release_limit.load(); int32_t(value - limit) > 0 &&
+                                                  !g_release_limit.compare_exchange_weak(limit, value);) {
+  }
+}
+
+// The game may need a fence the renderer cannot release yet (it was issued in the frame still being built):
+// copies the draw data the way --gtav_native_fence_wait does (waiting for frames already handed over) and lets
+// the game see everything the command processor reached.
+static void Emergency(uint32_t target, ReleaseCause cause) {
+  FenceReached(target);
+  RaiseLimit(target);
+  g_release_stats.emergencies[cause]++;
+}
+
+void FenceReleaseBefore(uint32_t fence) {
+  if (!ReleaseMode() || !fence) return;
+  const bool first = !g_release_started.load(std::memory_order_relaxed) && !g_release_started.exchange(true);
+  const uint32_t limit = fence - 2;  // the fence issued last before it (the kick adds 2)
+  RaiseLimit(limit);
+  const uint32_t shown = g_fence_shown.load(), seen = g_fence_seen.load();
+  if (int32_t(seen - shown) <= 0 || int32_t(limit - shown) <= 0) return;
+  // (The first time the command processor may still be in a --gtav_native_fence_wait wait under the lock.)
+  std::unique_lock lock(g_fence_mutex, std::defer_lock);
+  if (!first) lock.lock();
+  else if (!lock.try_lock()) return;
+  g_release_stats.stores++;
+  StoreReleasedLocked();
+}
+
+bool FenceWaitBegin(uint32_t fence) {
+  if (!Releasing() || int32_t(fence - g_last_end_fence.load()) < 0) return false;
+  g_urgent_waiters.fetch_add(1);
+  if (const uint32_t seen = g_fence_seen.load(); int32_t(seen - g_fence_shown.load()) > 0) {
+    Emergency(seen, kReleaseWaiter);
+    std::lock_guard lock(g_fence_mutex);
+    StoreReleasedLocked();
+  }
+  return true;
+}
+
+void FenceWaitEnd(bool urgent) {
+  if (urgent) g_urgent_waiters.fetch_sub(1);
+}
+
+// Command processor idle: shows what the renderer released meanwhile; a game thread blocked on a fence of the
+// frame being built, or no release for --gtav_native_fence_release_stall_ms, gets an emergency release.
+static void ReleaseIdle() {
+  uint32_t target;
+  bool stalled;
+  {
+    std::lock_guard lock(g_fence_mutex);
+    StoreReleasedLocked();
+    if (!g_holding) return;
+    target = g_fence_latest;
+    stalled = std::chrono::steady_clock::now() - g_hold_since >
+              std::chrono::milliseconds(std::max(1, REXCVAR_GET(gtav_native_fence_release_stall_ms)));
+  }
+  if (g_urgent_waiters.load() > 0) Emergency(target, kReleaseWaiter);
+  else if (stalled) Emergency(target, kReleaseStall);
+  else return;
+  std::lock_guard lock(g_fence_mutex);
+  StoreReleasedLocked();
+}
+
 // Releases every held-back fence (command processor thread: idle, or before its swap).
 void FenceFlush() {
   std::lock_guard lock(g_fence_mutex);
+  if (Releasing()) {
+    StoreReleasedLocked();
+    return;
+  }
   uint32_t address = g_fence_address.load(std::memory_order_relaxed);
   if (!g_fence_any || !address || g_fence_written == g_fence_latest) return;
   g_fence_written = g_fence_latest;
   FenceReached(g_fence_written);
   StoreFence(address & 0x1FFFFFFF, g_fence_written, g_fence_endian);
+  g_fence_shown.store(g_fence_written);
 }
 }  // namespace gtav::native
 
@@ -1333,12 +1475,35 @@ extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, 
   std::lock_guard lock(g_fence_mutex);
   g_fence_latest = value;
   g_fence_endian = endian;
+  g_fence_seen.store(value);
   uint32_t lag = uint32_t(std::max(0, REXCVAR_GET(gtav_native_fence_lag))) * 2;  // the kick adds 2
   uint32_t target = value - lag;
   if (!g_fence_any || int32_t(target - g_fence_written) > 0) g_fence_written = target;
   g_fence_any = true;
   FenceReached(g_fence_written);
+  g_fence_shown.store(g_fence_written);
   return g_fence_written;
 }
 
-extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_idle() { gtav::native::FenceFlush(); }
+// --gtav_native_fence_release: the command processor's EVENT_WRITE_SHD of the game's fence, written here (under
+// the lock the render thread's releases take) as min(value, what the renderer allows).
+extern "C" GTAV_HOOK_EXPORT bool rex_skip_rendering_fence_store(uint32_t address, uint32_t value, uint32_t endian) {
+  using namespace gtav::native;
+  if (!Releasing()) return false;
+  gtav::linux_threads::Note(gtav::linux_threads::kCommandProcessor);
+  const uint32_t fence = g_fence_address.load(std::memory_order_relaxed);
+  if (!fence || (address & 0x1FFFFFFF) != (fence & 0x1FFFFFFF)) return false;
+  g_fence_seen.store(value);
+  if (g_urgent_waiters.load() > 0) Emergency(value, kReleaseWaiter);
+  std::lock_guard lock(g_fence_mutex);
+  g_fence_latest = value;
+  g_fence_endian = endian;
+  g_fence_any = true;
+  StoreReleasedLocked();
+  return true;
+}
+
+extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_idle() {
+  if (gtav::native::Releasing()) gtav::native::ReleaseIdle();
+  else gtav::native::FenceFlush();
+}

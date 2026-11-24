@@ -1467,6 +1467,7 @@ class Renderer {
     if (REXCVAR_GET(gtav_native_early_fence) && !(backend_ok_ && backend_.Dumping()) &&
         !REXCVAR_GET(gtav_native_flicker_catch) && !REXCVAR_GET(gtav_native_replay) && !key_replay_.load()) {
       FenceCopiesRecorded(frame.index);
+      FenceReleaseBefore(frame.end_fence);
       fence_released_ = frame.index + 1;
     }
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
@@ -1805,7 +1806,10 @@ class Renderer {
       AbStep(presented);
       Present(frame);
       AbRecord(presented);
-      if (fence_released_ != frame.index + 1) FenceCopiesRecorded(frame.index);
+      if (fence_released_ != frame.index + 1) {
+        FenceCopiesRecorded(frame.index);
+        FenceReleaseBefore(frame.end_fence);
+      }
       render_state_ = 2;
       {
         std::lock_guard lock(recorded_mutex_);

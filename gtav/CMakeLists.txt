@@ -138,6 +138,7 @@ else()
     if(NOT APPLE AND NOT REXGLUE_PLATFORM_SWITCH)
         target_link_options(gtav PRIVATE -Wl,--export-dynamic-symbol=rex_skip_rendering_swap
                             -Wl,--export-dynamic-symbol=rex_skip_rendering_fence
+                            -Wl,--export-dynamic-symbol=rex_skip_rendering_fence_store
                             -Wl,--export-dynamic-symbol=rex_skip_rendering_idle
                             -Wl,--export-dynamic-symbol=rex_skip_rendering_gpu_waiters)
     endif()

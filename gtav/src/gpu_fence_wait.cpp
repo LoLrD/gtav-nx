@@ -16,6 +16,7 @@
 
 #include <atomic>
 
+#include "native/capture.h"
 #include "wait_profile.h"
 
 // SDK (librexgpu): wakes the command processor from its idle sleep.
@@ -61,7 +62,9 @@ REX_HOOK_RAW(sub_8380CEF8) {
     g_fence_stats.ahead_of_done += int32_t(fence - done) > 0 ? (fence - done) / 2 : 0;
     g_fence_stats.newest += fence == next;
   }
+  const bool urgent = device && fence && gtav::native::FenceWaitBegin(fence);
   gtav::WaitProfileTimed(0x8380CEF8, ctx, base, [](PPCContext& c, uint8_t* b) { __imp__sub_8380CEF8(c, b); });
+  gtav::native::FenceWaitEnd(urgent);
   g_gpu_waiters.fetch_sub(1, std::memory_order_acq_rel);
   if (stats && device && fence) {
     g_fence_stats.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
