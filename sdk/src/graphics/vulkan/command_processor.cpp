@@ -2373,7 +2373,6 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   }
   g_debug_draw_index = 0;
 #if REX_PLATFORM_SWITCH
-  RexSwitchPerfCount(0);
   const bool has_video_native = RexNativeVideoBeginSwap && RexNativeVideoBeginSwap();
 #endif
   vertex_buffers_in_sync_[0] = 0;
