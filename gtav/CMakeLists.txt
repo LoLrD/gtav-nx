@@ -547,7 +547,15 @@ if(REXGLUE_PLATFORM_SWITCH)
         foreach(_gtav_target gtav_recomp gtav)
             target_compile_options(${_gtav_target} PRIVATE -flto=auto -fno-fat-lto-objects ${_gtav_fp_options})
         endforeach()
-        target_link_options(gtav PRIVATE "-flto=${GTAV_SWITCH_LTO_JOBS}" -flto-partition=balanced -O3
+        set(GTAV_SWITCH_LTO_CACHE "${CMAKE_BINARY_DIR}/lto-cache" CACHE PATH
+            "Incremental LTO cache: a relink reoptimizes only the partitions whose code changed (empty = off)")
+        if(GTAV_SWITCH_LTO_CACHE)
+            file(MAKE_DIRECTORY "${GTAV_SWITCH_LTO_CACHE}")
+            set(_gtav_lto_partition -flto-partition=cache "-flto-incremental=${GTAV_SWITCH_LTO_CACHE}")
+        else()
+            set(_gtav_lto_partition -flto-partition=balanced)
+        endif()
+        target_link_options(gtav PRIVATE "-flto=${GTAV_SWITCH_LTO_JOBS}" ${_gtav_lto_partition} -O3
                             ${_gtav_fp_options})
     endif()
 
