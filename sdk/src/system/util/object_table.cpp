@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -27,7 +29,58 @@ REXCVAR_DEFINE_INT32(global_lock_spin, 48, "Kernel",
                      "times (CPU yield between tries, ~1 us in total) before blocking in the kernel. 0 = block at "
                      "once (the original behaviour)");
 
+REXCVAR_DEFINE_BOOL(kernel_object_table_reader_lock, true, "Kernel",
+                    "Handle lookups take the object table's own reader lock instead of the global critical "
+                    "region. false = the global critical region (the original behaviour)");
+
 namespace rex::system::util {
+
+namespace {
+
+void Backoff(uint32_t attempt) {
+  if (attempt < 64) {
+    CpuRelax();
+  } else {
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+}
+
+}  // namespace
+
+bool ObjectTable::TableLock::TryLockShared() {
+  if (writers_waiting_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  int32_t state = state_.load(std::memory_order_relaxed);
+  return state >= 0 && state_.compare_exchange_weak(state, state + 1, std::memory_order_acquire,
+                                                    std::memory_order_relaxed);
+}
+
+void ObjectTable::TableLock::LockShared() {
+  if (TryLockShared()) {
+    return;
+  }
+  REX_SYS_COUNT(rex::syscount::kObjBlocked, 1);
+  for (uint32_t attempt = 0; !TryLockShared(); ++attempt) {
+    Backoff(attempt);
+  }
+}
+
+void ObjectTable::TableLock::Lock() {
+  int32_t expected = 0;
+  if (state_.compare_exchange_strong(expected, -1, std::memory_order_acquire, std::memory_order_relaxed)) {
+    return;
+  }
+  writers_waiting_.fetch_add(1, std::memory_order_relaxed);
+  for (uint32_t attempt = 0;; ++attempt) {
+    expected = 0;
+    if (state_.compare_exchange_weak(expected, -1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      break;
+    }
+    Backoff(attempt);
+  }
+  writers_waiting_.fetch_sub(1, std::memory_order_relaxed);
+}
 
 ObjectTable::ObjectTable() {}
 
@@ -38,18 +91,26 @@ ObjectTable::~ObjectTable() {
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
+  ObjectTableEntry* table = nullptr;
+  uint32_t capacity = 0;
+  {
+    ExclusiveGuard table_guard(table_lock_);
+    table = table_;
+    capacity = table_capacity_;
+    table_capacity_ = 0;
+    last_free_entry_ = 0;
+    table_ = nullptr;
+  }
+
   // Release all objects.
-  for (uint32_t n = 0; n < table_capacity_; n++) {
-    ObjectTableEntry& entry = table_[n];
+  for (uint32_t n = 0; n < capacity; n++) {
+    ObjectTableEntry& entry = table[n];
     if (entry.object) {
       entry.object->Release();
     }
   }
 
-  table_capacity_ = 0;
-  last_free_entry_ = 0;
-  free(table_);
-  table_ = nullptr;
+  free(table);
 }
 
 X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
@@ -111,21 +172,26 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
   {
     auto global_lock = global_critical_region_.Acquire();
 
-    // Find a free slot.
-    uint32_t slot = 0;
-    result = FindFreeSlot(&slot);
+    {
+      ExclusiveGuard table_guard(table_lock_);
 
-    // Stash.
+      // Find a free slot.
+      uint32_t slot = 0;
+      result = FindFreeSlot(&slot);
+
+      // Stash.
+      if (XSUCCEEDED(result)) {
+        // Retain so long as the object is in the table.
+        object->Retain();
+        ObjectTableEntry& entry = table_[slot];
+        entry.object = object;
+        entry.handle_ref_count = 1;
+        handle = XObject::kHandleBase + (slot << 2);
+      }
+    }
+
     if (XSUCCEEDED(result)) {
-      ObjectTableEntry& entry = table_[slot];
-      entry.object = object;
-      entry.handle_ref_count = 1;
-      handle = XObject::kHandleBase + (slot << 2);
       object->handles().push_back(handle);
-
-      // Retain so long as the object is in the table.
-      object->Retain();
-
       REXSYS_NOISY_DEBUG("Added handle:{:08X} for {}", handle, typeid(*object).name());
     }
   }
@@ -192,18 +258,21 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
+  auto global_lock = global_critical_region_.Acquire();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
-  if (entry->object) {
-    auto object = entry->object;
+  XObject* object = nullptr;
+  {
+    ExclusiveGuard table_guard(table_lock_);
+    object = entry->object;
     entry->object = nullptr;
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
-
+  }
+  if (object) {
     // Walk the object's handles and remove this one.
     auto handle_entry = std::find(object->handles().begin(), object->handles().end(), handle);
     if (handle_entry != object->handles().end()) {
@@ -241,12 +310,18 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
 void ObjectTable::PurgeAllObjects() {
   auto lock = global_critical_region_.Acquire();
   for (uint32_t slot = 0; slot < table_capacity_; slot++) {
-    auto& entry = table_[slot];
-    if (entry.object && !entry.object->is_host_object()) {
-      entry.handle_ref_count = 0;
-      entry.object->Release();
-
-      entry.object = nullptr;
+    XObject* object = nullptr;
+    {
+      ExclusiveGuard table_guard(table_lock_);
+      auto& entry = table_[slot];
+      if (entry.object && !entry.object->is_host_object()) {
+        object = entry.object;
+        entry.handle_ref_count = 0;
+        entry.object = nullptr;
+      }
+    }
+    if (object) {
+      object->Release();
     }
   }
 }
@@ -284,8 +359,12 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
 
   XObject* object = nullptr;
   std::unique_lock<std::recursive_mutex> region;
-  if (!already_locked) {
+  const bool reader_lock = REXCVAR_GET(kernel_object_table_reader_lock);
+  if (!reader_lock && !already_locked) {
     region = AcquireGlobalSpin(global_critical_region_.mutex(), rex::syscount::kObjBlocked);
+  }
+  if (reader_lock) {
+    table_lock_.LockShared();
   }
   REX_SYS_COUNT(rex::syscount::kObjLookup, 1);
 
@@ -305,6 +384,9 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
     object->Retain();
   }
 
+  if (reader_lock) {
+    table_lock_.UnlockShared();
+  }
   return object;
 }
 
@@ -391,6 +473,7 @@ bool ObjectTable::Save(stream::ByteStream* stream) {
 }
 
 bool ObjectTable::Restore(stream::ByteStream* stream) {
+  ExclusiveGuard table_guard(table_lock_);
   Resize(stream->Read<uint32_t>());
   for (uint32_t i = 0; i < table_capacity_; i++) {
     auto& entry = table_[i];
@@ -403,6 +486,7 @@ bool ObjectTable::Restore(stream::ByteStream* stream) {
 
 X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
   uint32_t slot = GetHandleSlot(handle);
+  ExclusiveGuard table_guard(table_lock_);
   assert_true(table_capacity_ > slot);
 
   if (table_capacity_ > slot) {
