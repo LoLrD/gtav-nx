@@ -83,21 +83,21 @@ std::atomic<uint32_t> g_generation{1};
 // per call (three per draw) showed up in the game thread's profile.
 struct CachedLookup {
   uint32_t object = 0, generation = 0;
-  uint64_t hash = 0, ucode_hash = 0;
-  const ConstantUse* consts = nullptr;
+  ShaderInfo info;
 };
-const CachedLookup& Lookup(uint32_t guest_object) {
+const ShaderInfo& Lookup(uint32_t guest_object) {
   thread_local CachedLookup cache[64];
   CachedLookup& e = cache[(guest_object >> 4) & 63];
   uint32_t generation = g_generation.load(std::memory_order_acquire);
-  if (e.object == guest_object && e.generation == generation) return e;
+  if (e.object == guest_object && e.generation == generation) return e.info;
   std::lock_guard lock(g_mutex);
   auto it = g_object_hash.find(guest_object);
   auto ut = g_object_ucode_hash.find(guest_object);
   auto ct = g_object_consts.find(guest_object);
-  e = {guest_object, generation, it == g_object_hash.end() ? 0 : it->second,
-       ut == g_object_ucode_hash.end() ? 0 : ut->second, ct == g_object_consts.end() ? &g_all_constants : ct->second};
-  return e;
+  e = {guest_object, generation,
+       {it == g_object_hash.end() ? 0 : it->second, ut == g_object_ucode_hash.end() ? 0 : ut->second,
+        ct == g_object_consts.end() ? &g_all_constants : ct->second}};
+  return e.info;
 }
 
 void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pixel) {
@@ -161,6 +161,8 @@ uint64_t ShaderHash(uint32_t guest_object) { return Lookup(guest_object).hash; }
 uint64_t ShaderUcodeHash(uint32_t guest_object) { return Lookup(guest_object).ucode_hash; }
 
 const ConstantUse& ShaderConstants(uint32_t guest_object) { return *Lookup(guest_object).consts; }
+
+ShaderInfo ShaderLookup(uint32_t guest_object) { return Lookup(guest_object); }
 
 uint64_t ContainerForUcode(uint64_t ucode_hash) {
   std::lock_guard lock(g_mutex);

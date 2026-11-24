@@ -2093,7 +2093,10 @@ Renderer g_renderer;
 
 }  // namespace
 
-bool Active() { return REXCVAR_GET(gtav_native) != "off"; }
+bool Active() {
+  static const bool active = REXCVAR_GET(gtav_native) != "off";
+  return active;
+}
 
 void Submit(FramePacket&& frame) { g_renderer.Submit(std::move(frame)); }
 

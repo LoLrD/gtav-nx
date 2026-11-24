@@ -127,10 +127,17 @@ BoundState g_bound;  // the game renders from one thread; revisit if that change
 // Set*ShaderConstantF overwrites the register again.
 struct InlineConstants {
   uint8_t data[2][256][16];
-  bool valid[2][256];
-  bool any = false;
+  uint64_t valid[2][4] = {};
   // The pending load: its data is written by the caller after 83813580 returns.
   uint32_t pending_ptr = 0, pending_bank = 0, pending_start = 0, pending_count = 0;
+  bool Valid(uint32_t bank, uint32_t r) const { return (valid[bank][r >> 6] >> (r & 63)) & 1; }
+  bool Any(uint32_t bank) const { return (valid[bank][0] | valid[bank][1] | valid[bank][2] | valid[bank][3]) != 0; }
+  void Invalidate(uint32_t bank, uint32_t first, uint32_t end) {
+    for (uint32_t w = first >> 6; w < 4 && (w << 6) < end; w++) {
+      uint32_t lo = std::max(first, w << 6) - (w << 6), hi = std::min(end, (w + 1) << 6) - (w << 6);
+      valid[bank][w] &= ~(hi - lo == 64 ? ~0ull : ((1ull << (hi - lo)) - 1) << lo);
+    }
+  }
 };
 InlineConstants g_inline_consts;
 
@@ -139,10 +146,10 @@ void FlushInlineConstants() {
   if (!c.pending_ptr) return;
   const uint8_t* src = REX_KERNEL_MEMORY()->TranslateVirtual(c.pending_ptr);
   for (uint32_t i = 0; i < c.pending_count && c.pending_start + i < 256; i++) {
-    std::memcpy(c.data[c.pending_bank][c.pending_start + i], src + 16 * i, 16);
-    c.valid[c.pending_bank][c.pending_start + i] = true;
+    const uint32_t r = c.pending_start + i;
+    std::memcpy(c.data[c.pending_bank][r], src + 16 * i, 16);
+    c.valid[c.pending_bank][r >> 6] |= 1ull << (r & 63);
   }
-  c.any = true;
   c.pending_ptr = 0;
 }
 FramePacket g_packet;
@@ -212,17 +219,18 @@ void OnInlineConstants(uint32_t bank, uint32_t start, uint32_t count, uint32_t d
 void OnSetConstants(uint32_t bank, uint32_t start, uint32_t count) {
   FlushInlineConstants();
   auto& c = g_inline_consts;
-  if (!c.any || bank > 1) return;
-  for (uint32_t i = start; i < start + count && i < 256; i++) c.valid[bank][i] = false;
+  if (bank > 1 || start >= 256 || !c.Any(bank)) return;
+  c.Invalidate(bank, start, std::min(start + count, 256u));
 }
 
 void OnFlushConstants(uint32_t bank, uint64_t dirty_mask) {
   FlushInlineConstants();
   auto& c = g_inline_consts;
-  if (!c.any || bank > 1) return;
-  for (uint32_t group = 0; group < 64; group++)
-    if (dirty_mask & (1ull << (63 - group)))
-      for (uint32_t r = 4 * group; r < 4 * group + 4; r++) c.valid[bank][r] = false;
+  if (bank > 1) return;
+  for (uint64_t m = dirty_mask; m; m &= m - 1) {
+    const uint32_t group = 63 - uint32_t(__builtin_ctzll(m));
+    c.valid[bank][group >> 4] &= ~(0xFull << ((group & 15) * 4));
+  }
 }
 
 void OnSetVertexShader(uint32_t, uint32_t shader) { g_bound.vertex_shader = shader; }
@@ -701,11 +709,12 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     uint8_t vs[256 * 16];
     std::memcpy(vs, Guest(device) + d3d::kDevVsConstants, sizeof(vs));
     for (uint32_t i = 0; i < 256; i++)
-      if (g_inline_consts.valid[0][i]) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
+      if (g_inline_consts.Valid(0, i)) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
     pm4scan::OnDraw(WritePointer(device), ShaderHash(g_bound.vertex_shader), vs);
   }
   const uint8_t* dev = Guest(device);
-  DrawCommand d;
+  const uint32_t index = uint32_t(g_packet.draws.size());
+  DrawCommand& d = g_packet.draws.emplace_back();
   d.indexed = indexed;
   d.primitive = primitive;
   d.base_vertex = base_vertex;
@@ -716,9 +725,10 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // way, so the hooked value was a depth pass's null shader and they came out depth-only.
   uint32_t vertex_shader = be32(dev + d3d::kDevVertexShader), pixel_shader = be32(dev + d3d::kDevPixelShader);
   if (!vertex_shader) vertex_shader = g_bound.vertex_shader;
-  d.vs_hash = ShaderHash(vertex_shader);
-  d.ps_hash = ShaderHash(pixel_shader);
-  d.ps_ucode_hash = ShaderUcodeHash(pixel_shader);
+  const ShaderInfo vs_info = ShaderLookup(vertex_shader), ps_info = ShaderLookup(pixel_shader);
+  d.vs_hash = vs_info.hash;
+  d.ps_hash = ps_info.hash;
+  d.ps_ucode_hash = ps_info.ucode_hash;
   d.regs = g_packet.Push(dev + kRegShadowBegin, kRegShadowSize);
   {
     // RB_MODECONTROL in the device shadow lags: D3D derives it while flushing the draw, after this
@@ -735,7 +745,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
   // block instead (the replay then skips the byte swap and texture lookups by offset). Compared
   // before copying: pushing 10 KB a draw and taking it back cost ~8% of the game thread.
-  const DrawCommand* prev = g_packet.draws.empty() ? nullptr : &g_packet.draws.back();
+  const DrawCommand* prev = index ? &g_packet.draws[index - 1] : nullptr;
   // Blocks keep their full size (the renderer reads them by offset), but only the registers the
   // shaders read are copied and compared (the rest of a block is undefined).
   auto push_or_share = [](const uint8_t* src, uint32_t size, const uint32_t* previous, int kind) {
@@ -750,11 +760,11 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   auto push_constants = [&](uint32_t bank, const uint8_t* shadow, const ConstantUse& use, const uint32_t* previous) {
     const uint8_t* src = shadow;
     alignas(16) uint8_t patched[kAluSize];
-    if (g_inline_consts.any) {
+    if (g_inline_consts.Any(bank)) {
       for (const auto& run : use.runs) std::memcpy(patched + 16 * run.first, shadow + 16 * run.first, 16 * run.count);
       for (const auto& run : use.runs)
         for (uint32_t i = run.first; i < uint32_t(run.first + run.count); i++)
-          if (g_inline_consts.valid[bank][i]) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
+          if (g_inline_consts.Valid(bank, i)) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
       src = patched;
     }
     uint32_t bytes = 0;
@@ -776,9 +786,9 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     for (const auto& run : use.runs) std::memcpy(dst + 16 * run.first, src + 16 * run.first, 16 * run.count);
     return at;
   };
-  const ConstantUse& vs_use = ShaderConstants(vertex_shader);
+  const ConstantUse& vs_use = *vs_info.consts;
   static const ConstantUse kNoConstants{0, {}, 0};
-  const ConstantUse& ps_use = pixel_shader ? ShaderConstants(pixel_shader) : kNoConstants;
+  const ConstantUse& ps_use = pixel_shader ? *ps_info.consts : kNoConstants;
   d.vs_const_count = uint16_t(vs_use.count);
   d.ps_const_count = uint16_t(ps_use.count);
   d.vs_use = &vs_use;
@@ -830,15 +840,14 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
   } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {
     if (uint32_t done = be32(dev + kDevFenceDone)) g_fence_address = GuestPhysical(done);
-    PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
+    PendingCopy p{GuestFrame(), index, be32(dev + kDevFence), d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
     std::lock_guard lock(g_incoming_mutex);
     g_incoming_copies.push_back(p);
   }
-  g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
-  g_packet.draws.push_back(d);
-  return &g_packet.draws.back();
+  g_packet.commands.push_back({CommandKind::kDraw, index, WritePointer(device)});
+  return &d;
 }
 
 // BeginVertices(dev, primitive, vertex count, stride) returns where the CPU writes the vertices
