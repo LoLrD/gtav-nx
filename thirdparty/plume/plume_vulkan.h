@@ -56,6 +56,7 @@ namespace plume {
         VulkanPool *pool = nullptr;
         VmaAllocation allocation = VK_NULL_HANDLE;
         VmaAllocationInfo allocationInfo = {};
+        bool dedicated = false;
         RenderBufferDesc desc;
         RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
 
@@ -89,6 +90,7 @@ namespace plume {
         RenderTextureLayout textureLayout = RenderTextureLayout::UNKNOWN;
         RenderBarrierStages barrierStages = RenderBarrierStage::NONE;
         bool ownership = false;
+        bool dedicated = false;
         RenderTextureDesc desc;
 
         VulkanTexture() = default;

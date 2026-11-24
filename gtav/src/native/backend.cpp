@@ -363,6 +363,10 @@ namespace plume {
 extern bool g_colorInputAttachments;  // plume-gtav.patch
 extern std::atomic<uint32_t> g_statRenderPasses;   // plume-gtav.patch
 extern std::atomic<uint64_t> g_statDeviceMemoryAllocs, g_statDeviceMemoryFrees, g_statDeviceMemoryBytes;
+uint64_t VulkanMemorySize(const RenderBuffer* buffer);
+uint64_t VulkanMemorySize(const RenderTexture* texture);
+void VulkanPoolStats(RenderPool* pool, uint64_t* blocks, uint64_t* block_bytes, uint64_t* allocation_bytes);
+std::string VulkanMemoryReport(RenderDevice* device);
 }
 
 namespace gtav::native {
@@ -2532,6 +2536,7 @@ struct Backend::Impl {
                   plume::g_statDeviceMemoryAllocs.exchange(0), plume::g_statDeviceMemoryBytes.exchange(0) >> 20,
                   plume::g_statDeviceMemoryFrees.exchange(0));
       texture_allocs = {};
+      LogMemory();
     }
     if (total <= budget) return;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
@@ -2558,6 +2563,57 @@ struct Backend::Impl {
                   freed_bytes / 1048576.0, textures.size(), (total - freed_bytes) / 1048576.0);
   }
   uint32_t budget_logs = 0, buffer_budget_logs = 0, low_memory_logs = 0, total_drift_logs = 0;
+
+  struct MemorySum {
+    uint64_t count = 0, bytes = 0;
+    void Add(const RenderTexture* t) {
+      if (t) count++, bytes += VulkanMemorySize(t);
+    }
+    void Add(const RenderBuffer* b) {
+      if (b) count++, bytes += VulkanMemorySize(b);
+    }
+    std::string Text() const { return fmt::format("{} ({:.1f} MB)", count, bytes / 1048576.0); }
+  };
+  void LogMemory() {
+    MemorySum guest, targets_sum, resolves, present, resolve_memory, guest_buffers, upload_chunks, vertex_caches, pending;
+    uint64_t decoded = 0;
+    for (const auto& [key, t] : textures) guest.Add(t.texture.get()), decoded += t.texture ? t.bytes : 0;
+    auto add_targets = [&](const std::unordered_map<uint64_t, RenderTarget>& m) {
+      for (const auto& [key, t] : m) targets_sum.Add(t.texture.get());
+    };
+    add_targets(targets);
+    add_targets(msaa_scratch);
+    for (const auto& p : parked) add_targets(p.targets);
+    for (const auto& [key, r] : resolved) resolves.Add(r.texture.get());
+    for (const auto& [key, u] : upscale_images) present.Add(u.texture.get());
+    present.Add(upscale_front.texture.get());
+    present.Add(held.get());
+    for (const auto& [key, m] : memory_images) resolve_memory.Add(m.buffer.get());
+    for (const auto& [key, u] : untiled_views) resolve_memory.Add(u.buffer.get()), resolve_memory.Add(u.texture.get());
+    for (const auto& [key, b] : buffers) guest_buffers.Add(b.buffer.get());
+    for (const auto& c : upload.chunks) upload_chunks.Add(c.buffer.get());
+    for (const auto& p : parked)
+      for (const auto& c : p.upload.chunks) upload_chunks.Add(c.buffer.get());
+    for (const auto& [key, c] : rect_cache)
+      for (const auto& b : c.buffers) vertex_caches.Add(b.get());
+    for (const auto& [key, e] : snap_cache) vertex_caches.Add(e.buffer.get());
+    for (const auto& t : dead_textures) pending.Add(t.get());
+    for (const auto& b : dead_buffers) pending.Add(b.get());
+    for (const auto& p : parked) {
+      for (const auto& t : p.dead_textures) pending.Add(t.get());
+      for (const auto& b : p.dead_buffers) pending.Add(b.get());
+    }
+    uint64_t arena_blocks = 0, arena_bytes = 0, arena_used = 0;
+    if (texture_arena) VulkanPoolStats(texture_arena.get(), &arena_blocks, &arena_bytes, &arena_used);
+    REXLOG_INFO("[native] memory (real allocation sizes): guest textures {} for {:.1f} MB decoded, arena {} blocks "
+                "{:.1f} MB with {:.1f} MB used; render targets {}; resolves {}; upscale and present {}; resolve "
+                "memory {}; guest buffers {}; upload chunks {}; rect and snapshot buffers {}; awaiting free {}; "
+                "{} pipelines, {} shaders",
+                guest.Text(), decoded / 1048576.0, arena_blocks, arena_bytes / 1048576.0, arena_used / 1048576.0,
+                targets_sum.Text(), resolves.Text(), present.Text(), resolve_memory.Text(), guest_buffers.Text(),
+                upload_chunks.Text(), vertex_caches.Text(), pending.Text(), pipelines.size(), shaders.size());
+    REXLOG_INFO("[native] device memory: {}", VulkanMemoryReport(device));
+  }
 
   void EvictTextures() {
     EvictTexturesOverBudget();

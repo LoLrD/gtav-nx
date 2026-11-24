@@ -45,12 +45,86 @@ namespace plume {
     // Counters for the host renderer's per-frame stats: render passes begun, barrier calls.
     std::atomic<uint32_t> g_statRenderPasses{0}, g_statBarriers{0};  // (lists may be recorded on several threads)
     std::atomic<uint64_t> g_statDeviceMemoryAllocs{0}, g_statDeviceMemoryFrees{0}, g_statDeviceMemoryBytes{0};
-    static void VKAPI_PTR countDeviceMemoryAllocate(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize size, void *) {
+    static std::atomic<uint64_t> g_liveMemoryBytes[VK_MAX_MEMORY_TYPES], g_liveMemoryCount[VK_MAX_MEMORY_TYPES];
+    static std::atomic<uint64_t> g_dedicatedBytes[VK_MAX_MEMORY_TYPES], g_dedicatedCount[VK_MAX_MEMORY_TYPES];
+    static void VKAPI_PTR countDeviceMemoryAllocate(VmaAllocator, uint32_t memoryType, VkDeviceMemory, VkDeviceSize size, void *) {
         g_statDeviceMemoryAllocs++;
         g_statDeviceMemoryBytes += size;
+        g_liveMemoryBytes[memoryType] += size;
+        g_liveMemoryCount[memoryType]++;
     }
-    static void VKAPI_PTR countDeviceMemoryFree(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void *) {
+    static void VKAPI_PTR countDeviceMemoryFree(VmaAllocator, uint32_t memoryType, VkDeviceMemory, VkDeviceSize size, void *) {
         g_statDeviceMemoryFrees++;
+        g_liveMemoryBytes[memoryType] -= size;
+        g_liveMemoryCount[memoryType]--;
+    }
+    static bool countDedicated(VmaAllocator allocator, VmaAllocation allocation, int sign) {
+        VmaAllocationInfo2 info = {};
+        vmaGetAllocationInfo2(allocator, allocation, &info);
+        if (!info.dedicatedMemory) {
+            return false;
+        }
+        g_dedicatedBytes[info.allocationInfo.memoryType] += sign * int64_t(info.allocationInfo.size);
+        g_dedicatedCount[info.allocationInfo.memoryType] += sign;
+        return true;
+    }
+
+    uint64_t VulkanMemorySize(const RenderBuffer *buffer) {
+        return static_cast<const VulkanBuffer *>(buffer)->allocationInfo.size;
+    }
+
+    uint64_t VulkanMemorySize(const RenderTexture *texture) {
+        return static_cast<const VulkanTexture *>(texture)->allocationInfo.size;
+    }
+
+    void VulkanPoolStats(RenderPool *pool, uint64_t *blocks, uint64_t *blockBytes, uint64_t *allocationBytes) {
+        VulkanPool *vulkanPool = static_cast<VulkanPool *>(pool);
+        VmaDetailedStatistics stats = {};
+        vmaCalculatePoolStatistics(vulkanPool->device->allocator, vulkanPool->vk, &stats);
+        *blocks = stats.statistics.blockCount;
+        *blockBytes = stats.statistics.blockBytes;
+        *allocationBytes = stats.statistics.allocationBytes;
+    }
+
+    std::string VulkanMemoryReport(RenderDevice *device) {
+        VulkanDevice *vulkanDevice = static_cast<VulkanDevice *>(device);
+        VmaTotalStatistics stats = {};
+        vmaCalculateStatistics(vulkanDevice->allocator, &stats);
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+        vmaGetHeapBudgets(vulkanDevice->allocator, budgets);
+        const VkPhysicalDeviceMemoryProperties *props = nullptr;
+        vmaGetMemoryProperties(vulkanDevice->allocator, &props);
+        constexpr double MB = 1048576.0;
+        std::string report;
+        char line[512];
+        for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+            const VmaDetailedStatistics &s = stats.memoryType[i];
+            if (s.statistics.blockCount == 0) {
+                continue;
+            }
+            const VkMemoryPropertyFlags f = props->memoryTypes[i].propertyFlags;
+            snprintf(line, sizeof(line), "%stype %u (%s%s%s%s): %u VkDeviceMemory %.1f MB (live %llu, %.1f MB), %u allocations %.1f MB, %llu dedicated %.1f MB, largest free range %.1f MB",
+                report.empty() ? "" : "; ", i,
+                (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "L" : "",
+                (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "V" : "",
+                (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "C" : "",
+                (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "H" : "",
+                s.statistics.blockCount, s.statistics.blockBytes / MB,
+                (unsigned long long)g_liveMemoryCount[i].load(), g_liveMemoryBytes[i].load() / MB,
+                s.statistics.allocationCount, s.statistics.allocationBytes / MB,
+                (unsigned long long)g_dedicatedCount[i].load(), g_dedicatedBytes[i].load() / MB,
+                s.unusedRangeSizeMax / MB);
+            report += line;
+        }
+        for (uint32_t i = 0; i < props->memoryHeapCount; i++) {
+            if (budgets[i].statistics.blockCount == 0) {
+                continue;
+            }
+            snprintf(line, sizeof(line), "; heap %u: usage %.1f MB of budget %.1f MB (heap %.1f MB)", i,
+                budgets[i].usage / MB, budgets[i].budget / MB, props->memoryHeaps[i].size / MB);
+            report += line;
+        }
+        return report;
     }
     bool g_exactBarrierStages = true;  // strip TOP_OF_PIPE / BOTTOM_OF_PIPE next to other stages (see barriers)
     // Every render pass also declares its colour attachments as input attachments (same indices,
@@ -951,10 +1025,15 @@ namespace plume {
             fprintf(stderr, "vmaCreateBuffer failed with error code 0x%X.\n", res);
             return;
         }
+
+        dedicated = countDedicated(device->allocator, allocation, 1);
     }
 
     VulkanBuffer::~VulkanBuffer() {
         if (vk != VK_NULL_HANDLE) {
+            if (dedicated) {
+                countDedicated(device->allocator, allocation, -1);
+            }
             vmaDestroyBuffer(device->allocator, vk, allocation);
         }
     }
@@ -1098,6 +1177,7 @@ namespace plume {
             return;
         }
 
+        dedicated = countDedicated(device->allocator, allocation, 1);
         createImageView(imageInfo.format);
     }
 
@@ -1115,6 +1195,9 @@ namespace plume {
         }
 
         if (ownership && (vk != VK_NULL_HANDLE)) {
+            if (dedicated) {
+                countDedicated(device->allocator, allocation, -1);
+            }
             vmaDestroyImage(device->allocator, vk, allocation);
         }
     }
