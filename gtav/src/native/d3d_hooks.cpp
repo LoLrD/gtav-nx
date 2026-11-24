@@ -20,6 +20,10 @@ void ProbeFrame();
 using namespace gtav::native;
 
 REXCVAR_DECLARE(std::string, gtav_native);
+REXCVAR_DEFINE_BOOL(gtav_native_skip_alu_packets, false, "GTAV",
+                    "With --gtav_native=on and --gpu_skip_rendering: the D3D runtime does not write ALU constant "
+                    "packets into the command buffer (only the emulated GPU read them; the native renderer takes "
+                    "constants from the device shadow)");
 
 #define GTAV_COUNT_HOOK(addr, counter) \
   REX_EXTERN(__imp__sub_##addr);       \
@@ -157,7 +161,9 @@ REX_EXTERN(__imp__sub_83818698);
 REX_HOOK_RAW(sub_83818698) {
   StatCount(kStatAlu);
   OnFlushConstants(ctx.r5.u32 == 0x4400 ? 1 : 0, ctx.r4.u64);
-  __imp__sub_83818698(ctx, base);
+  static const bool skip = REXCVAR_GET(gtav_native_skip_alu_packets) && REXCVAR_GET(gtav_native) == "on" &&
+                           rex::cvar::GetFlagByName("gpu_skip_rendering") == "true";
+  if (!skip) __imp__sub_83818698(ctx, base);
 }
 
 // SetVertexShaderConstantF / SetPixelShaderConstantF (dev, start, data, count): shadow writes.
