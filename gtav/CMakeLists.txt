@@ -489,6 +489,12 @@ if(REXGLUE_PLATFORM_SWITCH)
     target_compile_definitions(gtav PRIVATE GTAV_SWITCH=1)
     target_sources(gtav PRIVATE src/switch_compat.cpp)
     target_link_options(gtav PRIVATE -Wl,--wrap=pthread_detach)
+    set(GTAV_SWITCH_SECTION_ORDER "${CMAKE_CURRENT_SOURCE_DIR}/switch_hot_order.ld" CACHE FILEPATH
+        "Linker section ordering file that packs the functions hot in console profiles at the start of .text (empty = off)")
+    if(GTAV_SWITCH_SECTION_ORDER)
+        target_link_options(gtav PRIVATE "LINKER:--section-ordering-file=${GTAV_SWITCH_SECTION_ORDER}")
+        set_property(TARGET gtav APPEND PROPERTY LINK_DEPENDS "${GTAV_SWITCH_SECTION_ORDER}")
+    endif()
     rexglue_switch_add_nro(gtav
         NAME "GTA V"
         AUTHOR "gtav-nx"
