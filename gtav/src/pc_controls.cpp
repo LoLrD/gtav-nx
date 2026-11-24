@@ -110,6 +110,12 @@ REX_EXTERN(sub_82C7E348);
 REXCVAR_DEFINE_BOOL(gtav_trace_cutscene_audio, false, "GTAV",
                     "Diagnostic: log the cutscene audio entity (0x83A320F8) state, its two stream slots and "
                     "their positions whenever they change (cutscene_audio_fix.cpp)");
+REXCVAR_DEFINE_DOUBLE(gtav_density, 1.0, "GTAV", "Ped and vehicle density multiplier applied every frame (1 = game)");
+REXCVAR_DEFINE_DOUBLE(gtav_lod_scale, 0.0, "GTAV", "LOD distance scale applied every frame (0 = game)");
+REXCVAR_DEFINE_DOUBLE(gtav_shadow_scale, 0.0, "GTAV", "Cascade shadow bounds scale (0 = game)");
+REXCVAR_DEFINE_BOOL(gtav_light_shadows, true, "GTAV", "Shadows from local lights");
+REXCVAR_DEFINE_BOOL(gtav_procobj, true, "GTAV", "Procedural objects (grass, rocks, litter)");
+REXCVAR_DEFINE_BOOL(gtav_distant_cars, true, "GTAV", "Distant cars and their lights");
 REXCVAR_DEFINE_BOOL(gtav_debug_commands, false, "GTAV",
                     "Test hook: <exe>/logs/native_cmd is run on the script thread once per second "
                     "('kill' = SET_ENTITY_HEALTH(player, 0)) and deleted");
@@ -125,6 +131,8 @@ std::atomic<float> g_density{1.0f};
 std::atomic<float> g_lodscale{0.0f};
 std::atomic<float> g_timescale{0.0f};
 std::chrono::steady_clock::time_point g_population_at{};
+std::chrono::steady_clock::time_point g_quality_at{};
+bool g_quality_loaded = false;
 constexpr float kDriveX = -1336.0f, kDriveY = -3044.0f, kDriveZ = 13.9f, kDriveHeading = 150.0f;
 
 using rex::input::mnk::InputContext;
@@ -305,6 +313,23 @@ REX_HOOK_RAW(sub_82CE9CA8) {
   const uint32_t call = ctx.r3.u32;
   __imp__sub_82CE9CA8(ctx, base);
   const auto now = std::chrono::steady_clock::now();
+  if (!g_quality_loaded) {
+    g_quality_loaded = true;
+    g_density = float(REXCVAR_GET(gtav_density));
+    g_lodscale = float(REXCVAR_GET(gtav_lod_scale));
+  }
+  if (now >= g_quality_at) {
+    g_quality_at = now + std::chrono::seconds(2);
+    if (const double shadow = REXCVAR_GET(gtav_shadow_scale); shadow > 0.0)
+      Call(ctx, base, sub_82C7D360, {std::bit_cast<uint32_t>(float(shadow))});
+    if (!REXCVAR_GET(gtav_light_shadows)) Call(ctx, base, sub_82C7E370, {1u});
+    if (!REXCVAR_GET(gtav_procobj)) Call(ctx, base, sub_82C6ACD0, {});
+    if (!REXCVAR_GET(gtav_distant_cars)) {
+      Call(ctx, base, sub_82D32968, {0u});
+      Call(ctx, base, sub_82D316A0, {0u});
+      Call(ctx, base, sub_82C7E348, {1u});
+    }
+  }
   const float density = g_density.load(std::memory_order_relaxed);
   const float lodscale = g_lodscale.load(std::memory_order_relaxed);
   const float timescale = g_timescale.load(std::memory_order_relaxed);
