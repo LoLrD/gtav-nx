@@ -8,6 +8,7 @@ LTO="${LTO:-OFF}"
 LTO_JOBS="${LTO_JOBS:-auto}"
 CODE_BLOCKS="${CODE_BLOCKS:-ON}"
 MALLOC_CACHE="${MALLOC_CACHE:-ON}"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct)}"
 case "$PGO" in
   OFF) NRO_OUT="${NRO_OUT:-out/nx}" ;;
   GENERATE) NRO_OUT="${NRO_OUT:-out/nx-pgo-gen}" ;;
@@ -27,7 +28,7 @@ source "$ROOT/tools/switch/docker.sh"
 ensure_image
 
 docker run --rm -v "$ROOT:$ROOT" -v "$MESA_SDK:$MESA_SDK:ro" -w "$ROOT" \
-  -e MESA_SDK="$MESA_SDK" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e PGO="$PGO" -e LTO="$LTO" -e LTO_JOBS="$LTO_JOBS" -e CODE_BLOCKS="$CODE_BLOCKS" -e MALLOC_CACHE="$MALLOC_CACHE" -e ROOT="$ROOT" -e SHADERS="$SHADERS" "$IMAGE" bash -euo pipefail -c '
+  -e MESA_SDK="$MESA_SDK" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e PGO="$PGO" -e LTO="$LTO" -e LTO_JOBS="$LTO_JOBS" -e CODE_BLOCKS="$CODE_BLOCKS" -e MALLOC_CACHE="$MALLOC_CACHE" -e ROOT="$ROOT" -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" -e SHADERS="$SHADERS" "$IMAGE" bash -euo pipefail -c '
     cmake -S gtav -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ROOT/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro -DREXSDK_DIR="$ROOT/sdk" -DREXGLUE_BUILD_TESTS=OFF \
