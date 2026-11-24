@@ -22,6 +22,9 @@ REXCVAR_DEFINE_BOOL(gtav_audio_kill_reverb_buses, false, "GTAV", "Do not feed, p
 REXCVAR_DEFINE_INT32(gtav_audio_quiet_xma, 0, "GTAV",
                      "A wave player whose voices have had zero gain for this many mixer frames (5.3 ms each) "
                      "has its XMA parsed but not decoded (silence, the stream keeps its position); 0 = always decode");
+REXCVAR_DEFINE_INT32(gtav_audio_quiet_loop_every, 0, "GTAV",
+                     "A wave player kept quiet by gtav_audio_quiet_xma whose XMA loops forever runs only once in this "
+                     "many mixer frames (its output stays silent, its loop position advances slower); 0 = every frame");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters; "
                       "all when empty) are ignored (A/B runs)");
@@ -47,9 +50,11 @@ uint32_t g_frame = 0;
 std::array<uint32_t, kBuffers> g_wave_owner{};
 std::array<uint32_t, kBuffers> g_wave_seen{};
 std::array<uint16_t, kBuffers> g_wave_run{};
+std::array<uint32_t, kBuffers> g_wave_called{};
+std::array<bool, kBuffers> g_wave_looping{};
 
 std::atomic<uint64_t> g_synth_run{0}, g_synth_skip{0}, g_mix_run{0}, g_mix_skip{0}, g_resample_skip{0}, g_feed_skip{0},
-    g_wave_loud{0}, g_wave_quiet{0}, g_controller{0}, g_ns_sources{0}, g_ns_loud{0}, g_ns_quiet{0};
+    g_wave_loud{0}, g_wave_quiet{0}, g_wave_skip{0}, g_controller{0}, g_ns_sources{0}, g_ns_loud{0}, g_ns_quiet{0};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
 std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
 constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8;
@@ -127,12 +132,12 @@ void Report() {
   if (s < 10.0) return;
   g_report = now;
   REXLOG_INFO("[audio-cuts] per second: synth {:.0f} run {:.0f} skipped, voices {:.0f} mixed {:.0f} skipped, "
-              "resamples skipped {:.0f}, bus feeds skipped {:.0f}, wave players {:.0f} decoded {:.0f} quiet, "
-              "controller updates {:.1f}; ms per second: sources {:.2f}, loud wave players {:.2f}, "
+              "resamples skipped {:.0f}, bus feeds skipped {:.0f}, wave players {:.0f} decoded {:.0f} quiet "
+              "{:.0f} skipped, controller updates {:.1f}; ms per second: sources {:.2f}, loud wave players {:.2f}, "
               "quiet {:.2f}",
               g_synth_run.exchange(0) / s, g_synth_skip.exchange(0) / s, g_mix_run.exchange(0) / s,
               g_mix_skip.exchange(0) / s, g_resample_skip.exchange(0) / s, g_feed_skip.exchange(0) / s,
-              g_wave_loud.exchange(0) / s, g_wave_quiet.exchange(0) / s,
+              g_wave_loud.exchange(0) / s, g_wave_quiet.exchange(0) / s, g_wave_skip.exchange(0) / s,
               g_controller.exchange(0) / s, g_ns_sources.exchange(0) / s / 1e6, g_ns_loud.exchange(0) / s / 1e6,
               g_ns_quiet.exchange(0) / s / 1e6);
 }
@@ -140,6 +145,7 @@ void Report() {
 bool LongSilent(uint32_t player, uint16_t id, bool silent) {
   const bool same = g_wave_owner[id] == player;
   if (!same || g_wave_seen[id] != g_frame) {
+    if (!same) g_wave_looping[id] = false;
     const uint32_t run = same && g_wave_seen[id] + 1 == g_frame ? g_wave_run[id] : 0u;
     g_wave_run[id] = silent ? uint16_t(std::min<uint32_t>(run + 1u, 0xFFFF)) : 0;
     g_wave_owner[id] = player;
@@ -306,14 +312,26 @@ REX_HOOK_RAW(sub_831C9008) {
   const uint16_t id = L16(base, ctx.r3.u32 + 4);
   const bool silent = id < kBuffers && g_state[id] == 1;
   const bool quiet = id < kBuffers && LongSilent(ctx.r3.u32, id, silent);
+  const int32_t every = REXCVAR_GET(gtav_audio_quiet_loop_every);
+  if (quiet && every > 1 && !AbOff(kAbLoop) && g_wave_looping[id] && g_frame - g_wave_called[id] < uint32_t(every)) {
+    Count(g_wave_skip);
+    std::memset(base + Pool(base) + (uint32_t(id) << 10), 0, 1024);
+    return;
+  }
   g_wave_silent = REXCVAR_GET(gtav_audio_skip_silent) && silent;
   Count(quiet ? g_wave_quiet : g_wave_loud);
   rex::audio::XmaDecoder::SetQuietKicks(quiet);
+  rex::audio::XmaDecoder::ResetKickCount();
   const auto start = Now();
   __imp__sub_831C9008(ctx, base);
   AddTime(quiet ? g_ns_quiet : g_ns_loud, start);
   rex::audio::XmaDecoder::SetQuietKicks(false);
   g_wave_silent = false;
+  if (id < kBuffers) {
+    g_wave_called[id] = g_frame;
+    if (rex::audio::XmaDecoder::kicks())
+      g_wave_looping[id] = rex::audio::XmaDecoder::kicks() == rex::audio::XmaDecoder::kicks_looping();
+  }
 }
 
 REX_EXTERN(__imp__sub_831BB3D8);
