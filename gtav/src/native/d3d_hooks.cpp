@@ -5,6 +5,7 @@
 #include "d3d_map.h"
 #include "renderer.h"
 #include "stats.h"
+#include "../render_cuts.h"
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -59,6 +60,7 @@ REX_HOOK_RAW(sub_832BA500) {
 // DrawIndexedVertices(dev, ...) / DrawVertices(dev, ...)
 REX_EXTERN(__imp__sub_83811030);
 REX_HOOK_RAW(sub_83811030) {
+  gtav::RenderTrace('D', ctx, base);
   StatCount(kStatDrawIndexed);
   OnDrawIndexed(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
   uint32_t device = ctx.r3.u32;
@@ -69,6 +71,7 @@ REX_HOOK_RAW(sub_83811030) {
 
 REX_EXTERN(__imp__sub_83810C18);
 REX_HOOK_RAW(sub_83810C18) {
+  gtav::RenderTrace('d', ctx, base);
   StatCount(kStatDraw);
   OnDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
   __imp__sub_83810C18(ctx, base);
@@ -111,6 +114,7 @@ REX_HOOK_RAW(sub_83806E70) {
 // EndVertices(dev) after the CPU wrote them.
 REX_EXTERN(__imp__sub_83810218);
 REX_HOOK_RAW(sub_83810218) {
+  gtav::RenderTrace('B', ctx, base);
   StatCount(kStatBeginVerts);
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   __imp__sub_83810218(ctx, base);
@@ -121,6 +125,7 @@ REX_HOOK_RAW(sub_83810218) {
 // &indices (r10), &vertices (stack)): the pointers land at dev+13848/13852.
 REX_EXTERN(__imp__sub_838106D8);
 REX_HOOK_RAW(sub_838106D8) {
+  gtav::RenderTrace('I', ctx, base);
   StatCount(kStatDrawOther);
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, vertices = ctx.r6.u32, indices = ctx.r7.u32,
            format = ctx.r8.u32, stride = ctx.r9.u32;
@@ -177,6 +182,7 @@ REX_HOOK_RAW(sub_83806D50) {
 // D3DDevice_Clear(dev, count, rects, flags, color, z (f1), stencil)
 REX_EXTERN(__imp__sub_8380BCD8);
 REX_HOOK_RAW(sub_8380BCD8) {
+  gtav::RenderTrace('C', ctx, base);
   // The register shadow is read after the call: Clear first applies pending render-target state
   // (surface pitch/bases). Read before, a clear of the 640-pitch shadow cascades at EDRAM 000 hit
   // the 1280-pitch scene depth there, and the far-plane fog meshes then covered the whole screen.
@@ -192,6 +198,7 @@ REX_HOOK_RAW(sub_8380BCD8) {
 // clear Z (f1), clear stencil, parameters)
 REX_EXTERN(__imp__sub_838045E0);
 REX_HOOK_RAW(sub_838045E0) {
+  gtav::RenderTrace('R', ctx, base);
   OnResolve(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r10.u32, float(ctx.f1.f64), ctx.r8.u32,
             ctx.r9.u32);
   __imp__sub_838045E0(ctx, base);
