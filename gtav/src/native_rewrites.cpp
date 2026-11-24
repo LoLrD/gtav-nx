@@ -38,6 +38,7 @@ REXCVAR_DEFINE_BOOL(gtav_nr_vm, false, "GTAV", "Native animation expression VM (
 REXCVAR_DEFINE_BOOL(gtav_nr_pack, true, "GTAV", "Native packed-element sphere culling into a bitmask (sub_8358AE80)");
 REXCVAR_DEFINE_BOOL(gtav_nr_gather, true, "GTAV",
                     "Native skeleton local-pose gather and hierarchy transform (sub_83442200)");
+REXCVAR_DEFINE_BOOL(gtav_nr_pow, true, "GTAV", "Native powf that evaluates only the lane it returns (sub_822F4E48)");
 REXCVAR_DEFINE_INT32(gtav_nr_check, 0, "GTAV",
                      "Differential check: every Nth call of a replaced function runs both the native and the "
                      "original version and compares them, with timings, logged every 10 s (0 = off)");
@@ -59,6 +60,7 @@ REX_EXTERN(sub_826B9248);
 REX_EXTERN(__imp__sub_834260A0);
 REX_EXTERN(__imp__sub_8358AE80);
 REX_EXTERN(__imp__sub_83442200);
+REX_EXTERN(__imp__sub_822F4E48);
 REX_EXTERN(sub_822174F8);
 REX_EXTERN(sub_82303FC0);
 REX_EXTERN(sub_824FEFF0);
@@ -128,10 +130,11 @@ Stat g_bound{"bound sub_83585DE8"};
 Stat g_vm{"vm sub_834260A0"};
 Stat g_pack{"pack sub_8358AE80"};
 Stat g_gather{"gather sub_83442200"};
+Stat g_pow{"pow sub_822F4E48"};
 std::atomic<uint64_t> g_vm_unchecked{0};
 
-std::array<Stat*, 14> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack, &g_volume,
-                              &g_quat,   &g_cull,    &g_blend,  &g_bound,     &g_vm,     &g_pack,   &g_gather};
+std::array<Stat*, 15> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack, &g_volume, &g_quat,
+                              &g_cull,   &g_blend,   &g_bound,  &g_vm,        &g_pack,   &g_gather, &g_pow};
 
 std::mutex g_report_mutex;
 Clock::time_point g_report_at = Clock::now();
@@ -2773,3 +2776,88 @@ REX_HOOK_RAW(sub_83442200) {
   __imp__sub_83442200(ctx, base);
 }
 
+namespace {
+
+#if defined(__aarch64__)
+
+inline simde__m128 PowSel(simde__m128 a, simde__m128 b, simde__m128 m) {
+  return simde_mm_castsi128_ps(simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_castps_si128(m), simde_mm_castps_si128(a)),
+                                                 simde_mm_and_si128(simde_mm_castps_si128(m), simde_mm_castps_si128(b))));
+}
+
+inline simde__m128 PowExp2(simde__m128 x) {
+  simde__m128 n = simde_mm_round_ps(x, SIMDE_MM_FROUND_TO_NEG_INF | SIMDE_MM_FROUND_NO_EXC);
+  simde__m128 f = simde_mm_sub_ps(x, n);
+  simde__m128 p = simde_mm_set1_ps(1.8775767e-3f);
+  p = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(8.9893397e-3f));
+  p = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(5.5826318e-2f));
+  p = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(2.4015361e-1f));
+  p = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(6.9315308e-1f));
+  p = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(1.0f));
+  simde__m128i exp_bits = simde_mm_slli_epi32(simde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);
+  simde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));
+  r = simde_mm_andnot_ps(simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)), r);
+  r = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)),
+                         simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));
+  return simde_mm_blendv_ps(r, x, simde_mm_cmpunord_ps(x, x));
+}
+
+void Pow822F4E48(PPCContext& ctx, uint8_t* base) {
+  const float fx = float(ctx.f1.f64), fy = float(ctx.f2.f64);
+  uint32_t xb, yb;
+  std::memcpy(&xb, &fx, 4);
+  std::memcpy(&yb, &fy, 4);
+  VmS32(base, ctx.r1.u32 + 28, yb);
+  VmS32(base, ctx.r1.u32 + 20, xb);
+  const simde__m128 x = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(xb)));
+  const simde__m128 y = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(yb)));
+  const simde__m128 zero = simde_mm_setzero_ps();
+  const simde__m128 sign = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000u)));
+  const simde__m128 x_zero = simde_mm_cmpeq_ps(x, zero);
+  const simde__m128 ax = simde_mm_andnot_ps(sign, x);
+  const simde__m128i yi = rex::ppc::simde_mm_vctsxs(y);
+  const simde__m128 yt = simde_mm_round_ps(y, SIMDE_MM_FROUND_TO_ZERO | SIMDE_MM_FROUND_NO_EXC);
+  const simde__m128 xs = simde_mm_and_ps(x, sign);
+  const simde__m128 y_neg = simde_mm_cmpgt_ps(zero, y);
+  const simde__m128 y_zero = simde_mm_cmpeq_ps(y, zero);
+  const simde__m128 l = simde_mm_set1_ps(log2f(simde_mm_cvtss_f32(ax)));
+  const simde__m128 x_neg = simde_mm_cmpgt_ps(zero, x);
+  const simde__m128 qnan = simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000));
+  const simde__m128i odd = simde_mm_and_si128(yi, simde_mm_set1_epi32(1));
+  const simde__m128 y_int = simde_mm_cmpeq_ps(y, yt);
+  const simde__m128 zero_case = simde_mm_andnot_ps(y_neg, x_zero);
+  const simde__m128 trivial = simde_mm_or_ps(x_zero, y_zero);
+  const simde__m128 e = simde_mm_mul_ps(l, y);
+  const simde__m128 odd_sign = simde_mm_and_ps(xs, simde_mm_castsi128_ps(simde_mm_slli_epi32(odd, 31)));
+  const simde__m128 bad = simde_mm_andnot_ps(y_int, x_neg);
+  const simde__m128 p = PowExp2(e);
+  const simde__m128 special0 = PowSel(qnan, odd_sign, zero_case);
+  const simde__m128 special = PowSel(special0, simde_mm_set1_ps(1.0f), y_zero);
+  const simde__m128 r = PowSel(simde_mm_or_ps(p, odd_sign), special, simde_mm_or_ps(bad, trivial));
+  ctx.f1.f64 = double(simde_mm_cvtss_f32(r));
+}
+
+bool PowSame(const PPCContext& a, const PPCContext& b) {
+  const uint64_t x = a.f1.u64, y = b.f1.u64;
+  const bool nan = (x & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (x & 0xFFFFFFFFFFFFFull) &&
+                   (y & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (y & 0xFFFFFFFFFFFFFull);
+  return a.r1.u64 == b.r1.u64 && (x == y || nan);
+}
+
+#endif
+
+}  // namespace
+
+REX_HOOK_RAW(sub_822F4E48) {
+#if defined(__aarch64__)
+  if (Enabled(REXCVAR_GET(gtav_nr_pow)) && !(ctx.r1.u32 & 15)) {
+    if (CheckNow()) [[unlikely]] {
+      Differential(g_pow, ctx, base, __imp__sub_822F4E48, {{ctx.r1.u32 + 20, 12}}, PowSame, Pow822F4E48);
+      return;
+    }
+    Pow822F4E48(ctx, base);
+    return;
+  }
+#endif
+  __imp__sub_822F4E48(ctx, base);
+}
