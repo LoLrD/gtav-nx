@@ -53,3 +53,4 @@ gtav_native_depth_zcull = true
 gtav_native_early_depth_tests = 1
 gtav_native_skip_silent_draws = true
 gtav_native_skip_depth_restore_strips = true
+gtav_native_light_fill_reuse = true

@@ -52,6 +52,7 @@
 #include <unordered_set>
 #include <bit>
 #include <set>
+#include <utility>
 // Phones (Android, iOS): the settings and paths measured on the Android port.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -250,6 +251,10 @@ REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
+REXCVAR_DEFINE_BOOL(gtav_native_light_fill_reuse, false, "GTAV",
+                    "Native renderer, with --gtav_light_shadow_draws=false: a local light shadow face that is only "
+                    "its fill quad and a resolve into a texture that already holds that fill keeps the texture "
+                    "(no draw, no copy)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -1476,6 +1481,8 @@ struct ResolvedTexture {
   uint32_t width, height, descriptor;
   bool render_target = false;
   bool depth_copy = false;  // R32F copy of a depth resolve (only for depth-format fetches)
+  bool light_fill = false;
+  uint32_t fill_rect[6] = {};
   float scale = 1.0f;       // of the source target: the texture is width * scale by height * scale
   uint64_t serial = 0;  // last write order
   // Cube faces and mip levels (resolves with a destination level/face): 6 layers for cubes,
@@ -2246,7 +2253,9 @@ struct Backend::Impl {
 
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
-  uint32_t stat_early = 0, stat_silent = 0;
+  uint32_t stat_early = 0, stat_silent = 0, stat_fills_reused = 0;
+  bool fill_resolve_next = false;
+  const DrawCommand* skipped_fill = nullptr;
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -4665,6 +4674,10 @@ struct Backend::Impl {
     // colour targets alias the depth surface (bases 000, 020, ... with depth at the base before).
     // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
     // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
+    if (d.light_fill && d.is_inline && fill_resolve_next && !dumping && REXCVAR_GET(gtav_native_light_fill_reuse)) {
+      skipped_fill = &d;
+      return false;
+    }
     if (d.vs_hash == 0x5A4385B7FE6CD154ull &&
         ((d.ps_hash == 0xF1490AFF1455E54Full && REXCVAR_GET(gtav_native_skip_depth_restore)) ||
          REXCVAR_GET(gtav_native_skip_depth_restore_strips)))
@@ -6552,6 +6565,20 @@ struct Backend::Impl {
         tile_split = y1;
       }
     }
+    const uint32_t fill_rect[6] = {x1, y1, x2, y2, px, py};
+    const bool fill = rc.light_fill && !depth_resolve && !(rc.flags & 0x300) && !src->msaa;
+    if (const DrawCommand* skipped = std::exchange(skipped_fill, nullptr)) {
+      if (fill && dst.light_fill && std::equal(fill_rect, fill_rect + 6, dst.fill_rect)) {
+        stat_fills_reused++;
+        Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
+        if (writeback_resolves) QueueWriteback(list, dst, base);
+        return;
+      }
+      fill_resolve_next = false;
+      Draw(list, f, *skipped);
+    }
+    dst.light_fill = fill;
+    std::copy(fill_rect, fill_rect + 6, dst.fill_rect);
     if (dumping && !depth_resolve) DumpTarget(list, src, 8 + source);  // the source as the copy sees it
     if (seqdiag)
       seq_note = fmt::format("resolve src {} {} ({}x{} fmt {}{}) rect {},{}-{},{} -> {:08X} {}x{} fmt {} at {},{} L{} F{} flags {:X}{}",
@@ -6737,7 +6764,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
-  s.stat_early = s.stat_silent = 0;
+  s.stat_early = s.stat_silent = s.stat_fills_reused = 0;
+  s.skipped_fill = nullptr;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
@@ -6846,6 +6874,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
         if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
         s.cur_draw = c.index;
+        s.fill_resolve_next = ci + 1 < f.commands.size() && f.commands[ci + 1].kind == CommandKind::kResolve &&
+                              f.resolves[f.commands[ci + 1].index].light_fill &&
+                              !(f.resolves[f.commands[ci + 1].index].flags & 0x300);
         if (!s.stream && !s.dumping && !s.take_notes) FenceReleaseBefore(f.draws[c.index].fence);
         s.Draw(list, f, f.draws[c.index]);
         s.cur_draw = c.index + 1;
@@ -6989,10 +7020,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached, {} early-test "
-                "draws, {} silent draws skipped",
+                "draws, {} silent draws skipped, {} light fills reused",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
                 s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size(),
-                s.stat_early, s.stat_silent);
+                s.stat_early, s.stat_silent, s.stat_fills_reused);
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;

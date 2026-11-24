@@ -194,6 +194,11 @@ bool SkipDraw(const uint8_t* base, uint32_t device) {
   return g_current_dl == kDlParaboloidReflection && !REXCVAR_GET(gtav_reflection_draws);
 }
 
+bool LightShadowPass(const uint8_t* device) {
+  return Cut() && g_current_dl == kDlShadows && !REXCVAR_GET(gtav_light_shadow_draws) &&
+         std::bit_cast<float>(Be32(device + native::d3d::kDevViewport + 8)) <= kLightShadowMaxWidth;
+}
+
 void RenderTrace(char kind, PPCContext& ctx, uint8_t* base) {
   if (kind != 'C' && kind != 'R') g_draw_calls++;
   const int32_t at = REXCVAR_GET(gtav_render_trace);

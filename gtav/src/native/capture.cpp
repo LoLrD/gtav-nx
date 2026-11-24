@@ -28,6 +28,7 @@
 
 #include "safe_read.h"
 #include "../linux_threads.h"
+#include "../render_cuts.h"
 #ifndef _WIN32
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -755,6 +756,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   const uint32_t index = uint32_t(g_packet.draws.size());
   if (!index) TimelineMark(kTlGameDraw, GuestFrame());
   DrawCommand& d = g_packet.draws.emplace_back();
+  d.light_fill = gtav::LightShadowPass(dev);
   d.indexed = indexed;
   d.primitive = primitive;
   d.base_vertex = base_vertex;
@@ -1043,6 +1045,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_tex
   FlushIndexedVertices();
   if (!Active()) return;
   ResolveCommand r;
+  r.light_fill = gtav::LightShadowPass(Guest(device));
   r.flags = flags;
   r.dest_texture = dest_texture;
   r.dest_level = level;

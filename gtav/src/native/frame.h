@@ -72,6 +72,7 @@ struct DrawCommand {
   uint32_t snap_stream[kMaxStreams] = {};
   uint32_t snap_index = 0, snap_index_size = 0;
   uint32_t fence = 0;  // the device's next GPU fence value when the draw was issued (or its command buffer ran)
+  bool light_fill = false;
 };
 
 // Hash of the exact guest bytes a draw reads (its index slice and the vertex range those indices
@@ -135,6 +136,7 @@ struct ResolveCommand {
   float clear_z = 0.0f;       // for D3DRESOLVE_CLEARDEPTHSTENCIL
   uint32_t dest_level = 0, dest_face = 0;  // mip level and cube face / array slice
   uint32_t dest_words[13] = {};  // dest texture object header + fetch constant (layout check)
+  bool light_fill = false;
 };
 
 // D3D occlusion query Issue(BEGIN / END). The native renderer counts the samples the draws between
