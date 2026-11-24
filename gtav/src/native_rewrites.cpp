@@ -35,6 +35,9 @@ REXCVAR_DEFINE_BOOL(gtav_nr_cull, false, "GTAV", "Native triangle binning into t
 REXCVAR_DEFINE_BOOL(gtav_nr_blend, true, "GTAV", "Native animation frame blending (sub_83441C48)");
 REXCVAR_DEFINE_BOOL(gtav_nr_bound, false, "GTAV", "Native sphere against box overlap test (sub_83585DE8)");
 REXCVAR_DEFINE_BOOL(gtav_nr_vm, false, "GTAV", "Native animation expression VM (sub_834260A0)");
+REXCVAR_DEFINE_BOOL(gtav_nr_pack, false, "GTAV", "Native packed-element sphere culling into a bitmask (sub_8358AE80)");
+REXCVAR_DEFINE_BOOL(gtav_nr_gather, false, "GTAV",
+                    "Native skeleton local-pose gather and hierarchy transform (sub_83442200)");
 REXCVAR_DEFINE_INT32(gtav_nr_check, 0, "GTAV",
                      "Differential check: every Nth call of a replaced function runs both the native and the "
                      "original version and compares them, with timings, logged every 10 s (0 = off)");
@@ -54,6 +57,8 @@ REX_EXTERN(__imp__sub_83441C48);
 REX_EXTERN(__imp__sub_83585DE8);
 REX_EXTERN(sub_826B9248);
 REX_EXTERN(__imp__sub_834260A0);
+REX_EXTERN(__imp__sub_8358AE80);
+REX_EXTERN(__imp__sub_83442200);
 REX_EXTERN(sub_822174F8);
 REX_EXTERN(sub_82303FC0);
 REX_EXTERN(sub_824FEFF0);
@@ -121,9 +126,11 @@ Stat g_cull{"cull sub_831665D8"};
 Stat g_blend{"blend sub_83441C48"};
 Stat g_bound{"bound sub_83585DE8"};
 Stat g_vm{"vm sub_834260A0"};
+Stat g_pack{"pack sub_8358AE80"};
+Stat g_gather{"gather sub_83442200"};
 
-std::array<Stat*, 12> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack,
-                              &g_volume, &g_quat,    &g_cull,   &g_blend,     &g_bound,  &g_vm};
+std::array<Stat*, 14> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack, &g_volume,
+                              &g_quat,   &g_cull,    &g_blend,  &g_bound,     &g_vm,     &g_pack,   &g_gather};
 
 std::mutex g_report_mutex;
 Clock::time_point g_report_at = Clock::now();
@@ -173,6 +180,8 @@ void Record(Stat& s, bool ok, bool guard_ok, uint64_t native_ns, uint64_t origin
   Report();
 }
 
+uint32_t Writable(uint32_t a, uint32_t n);
+
 struct Guards {
   uint32_t lo_addr = 0, lo_n = 0, hi_addr = 0, hi_n = 0;
   std::array<uint8_t, kGuard> lo{}, hi{};
@@ -180,10 +189,11 @@ struct Guards {
   void Take(uint8_t* base, uint32_t a, uint32_t n) {
     lo_n = std::min(a, kGuard);
     lo_addr = a - lo_n;
-    if (!Flat(lo_addr, lo_n)) lo_n = 0;
+    if (!Flat(lo_addr, lo_n) || Writable(lo_addr, lo_n) != lo_n) lo_n = 0;
     hi_addr = a + n;
     hi_n = uint64_t(hi_addr) + kGuard <= 0x100000000ull && hi_addr >= a ? kGuard : 0;
     if (!Flat(hi_addr, hi_n)) hi_n = 0;
+    hi_n = Writable(hi_addr, hi_n);
     std::memcpy(lo.data(), Host(base, lo_addr), lo_n);
     std::memcpy(hi.data(), Host(base, hi_addr), hi_n);
   }
@@ -1838,4 +1848,801 @@ REX_HOOK_RAW(sub_834260A0) {
   }
 #endif
   __imp__sub_834260A0(ctx, base);
+}
+
+namespace {
+
+#if defined(__aarch64__)
+
+constexpr uint32_t kPackMaskTable = 0x83E2BBD0u;
+constexpr uint32_t kPackConstA = 0x8206F5F4u;
+constexpr uint32_t kPackConstB = 0x8206F5F0u;
+constexpr uint32_t kPackDefaultBias = 0x82000E44u;
+
+inline float PackBits(uint32_t bits) {
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+inline uint32_t PackRound(uint32_t bits) {
+  const double d = double(PackBits(bits));
+  const float f = float(d);
+  uint32_t out;
+  std::memcpy(&out, &f, 4);
+  return out;
+}
+
+inline uint32x4_t PackHalf(uint16x4_t h16) {
+  const uint32x4_t h = vmovl_u16(h16);
+  const uint32x4_t e = vandq_u32(h, vdupq_n_u32(0x7C00u));
+  const uint32x4_t sign = vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x8000u)), 16);
+  const uint32x4_t full = vorrq_u32(vorrq_u32(sign, vshlq_n_u32(vaddq_u32(e, vdupq_n_u32(0x1C000u)), 13)),
+                                    vshlq_n_u32(vandq_u32(h, vdupq_n_u32(0x3FFu)), 13));
+  return vbslq_u32(vceqq_u32(e, vdupq_n_u32(0)), sign, full);
+}
+
+inline uint16x8_t PackHalves(uint8_t* base, uint32_t a) {
+  return vreinterpretq_u16_u8(vrev16q_u8(vld1q_u8(Host(base, a & ~15u))));
+}
+
+inline uint16x4_t PackLvlxHalves(uint8_t* base, uint32_t ea) {
+  static const uint8_t kIota[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  const uint8x16_t block = vld1q_u8(Host(base, ea & ~15u));
+  const uint8x16_t shifted = vqtbl1q_u8(block, vaddq_u8(vld1q_u8(kIota), vdupq_n_u8(uint8_t(ea & 15))));
+  return vget_low_u16(vreinterpretq_u16_u8(vrev16q_u8(shifted)));
+}
+
+inline float32x4_t PackRaw(uint8_t* base, uint32_t a) {
+  return vreinterpretq_f32_u8(vrev32q_u8(vld1q_u8(Host(base, a & ~15u))));
+}
+
+struct PackLoop {
+  uint32_t us, gs, qs, ps, rs, hs, ks;
+  uint8x16x2_t table;
+  float32x4_t vx, vy, vz, ca, cb, bias, near2, far2;
+};
+
+__attribute__((always_inline)) inline uint32x4_t PackCull(uint8_t* base, const PackLoop& l, uint32_t step) {
+  const uint16x8_t h = PackHalves(base, l.hs + 16 * step);
+  const uint16x4_t u = PackLvlxHalves(base, l.us + 8 * step);
+  const float32x4_t p = PackRaw(base, l.ps + 16 * step);
+  const uint16x4_t g = PackLvlxHalves(base, l.gs + 8 * step);
+  const uint16x8_t k = PackHalves(base, l.ks + 16 * step);
+  const float32x4_t q = PackRaw(base, l.qs + 16 * step);
+  const float32x4_t r = PackRaw(base, l.rs + 16 * step);
+  const float32x4_t x = vreinterpretq_f32_u32(PackHalf(vget_low_u16(vuzp1q_u16(h, h))));
+  const float32x4_t y = vreinterpretq_f32_u32(PackHalf(vget_low_u16(vuzp2q_u16(h, h))));
+  const float32x4_t z = vreinterpretq_f32_u32(PackHalf(vget_low_u16(vuzp1q_u16(k, k))));
+  const float32x4_t dx = vsubq_f32(vaddq_f32(q, x), l.vx);
+  const float32x4_t dy = vsubq_f32(vaddq_f32(p, y), l.vy);
+  const float32x4_t dz = vsubq_f32(vaddq_f32(r, z), l.vz);
+  const float32x4_t dist = vaddq_f32(vmulq_f32(dz, dz), vaddq_f32(vmulq_f32(dx, dx), vmulq_f32(dy, dy)));
+  const float32x4_t uf = vcvtq_f32_u32(vmovl_u16(u));
+  const uint32x4_t kind = vmovl_u16(vshr_n_u16(vand_u16(g, vdup_n_u16(0x70)), 4));
+  const uint32x4_t pick = vmlaq_u32(vdupq_n_u32(0x03020100u), kind, vdupq_n_u32(0x04040404u));
+  const float32x4_t scale = vreinterpretq_f32_u8(vqtbl2q_u8(l.table, vreinterpretq_u8_u32(pick)));
+  const uint32x4_t special = vandq_u32(vceqq_u32(kind, vdupq_n_u32(5)), vcgeq_f32(l.ca, uf));
+  const float32x4_t offset = vbslq_f32(special, l.cb, l.ca);
+  const float32x4_t radius = vaddq_f32(vaddq_f32(vmulq_f32(uf, scale), offset), l.bias);
+  return vorrq_u32(vcgtq_f32(dist, vmulq_f32(radius, radius)),
+                   vorrq_u32(vcgtq_f32(dist, l.far2), vcgtq_f32(l.near2, dist)));
+}
+
+inline bool PackDisjoint(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1) { return a1 <= b0 || b1 <= a0; }
+
+inline bool PackApart(const PackLoop& l, uint32_t out, uint32_t n) {
+  const uint64_t o0 = out & ~15u;
+  const uint64_t o1 = o0 + (n > 128 ? uint64_t(((n - 1) >> 5) + 1) * 16 : 64);
+  const uint64_t narrow = 8ull * n + 16, wide = 16ull * n + 16;
+  const uint32_t small[2] = {l.us, l.gs};
+  for (uint32_t a : small)
+    if (!PackDisjoint(o0, o1, uint64_t(a & ~15u), uint64_t(a) + narrow)) return false;
+  const uint32_t big[5] = {l.qs, l.ps, l.rs, l.hs, l.ks};
+  for (uint32_t a : big)
+    if (!PackDisjoint(o0, o1, uint64_t(a & ~15u), uint64_t(a) + wide)) return false;
+  return PackDisjoint(o0, o1, kPackMaskTable, uint64_t(kPackMaskTable) + 512);
+}
+
+inline bool PackRunnable(const PPCContext& ctx, uint8_t* base) {
+  if (ctx.r1.u32 & 15) return false;
+  const uint32_t out = ctx.r3.u32 & ~15u, list = ctx.r5.u32;
+  const int32_t n = int32_t(Load32(base, list + 4));
+  const uint32_t size = n > 128 ? uint32_t(((n - 1) >> 5) + 1) * 16u : 64u;
+  if (n > (1 << 24) || !Flat(out, size)) return false;
+  return uint64_t(out) + size <= list || uint64_t(list) + 56 <= out;
+}
+
+inline uint32_t PackRegionSize(const PPCContext& ctx, uint8_t* base) {
+  const int32_t n = int32_t(Load32(base, ctx.r5.u32 + 4));
+  return n > 128 ? uint32_t(((n - 1) >> 5) + 1) * 16u : 64u;
+}
+
+void Pack8358AE80(PPCContext& ctx, uint8_t* base) {
+  const uint32_t out = ctx.r3.u32, holder = ctx.r4.u32, list = ctx.r5.u32;
+  const bool own = (ctx.r7.u32 & 0xFF) != 0;
+  const uint32_t obj = Load32(base, holder);
+  const uint32_t fill = PackRound(Load32(base, obj + 9704));
+  uint32x4_t lo, hi;
+  if (own) {
+    uint32_t w[8];
+    for (uint32_t k = 0; k < 8; ++k) w[k] = Load32(base, obj + 9616 + 4 * k);
+    lo = vld1q_u32(w);
+    hi = vld1q_u32(w + 4);
+  } else {
+    lo = vdupq_n_u32(fill);
+    hi = lo;
+  }
+  const uint8x16x2_t table = {{vreinterpretq_u8_u32(lo), vreinterpretq_u8_u32(hi)}};
+  std::memset(Host(base, out & ~15u), 0, 16);
+  std::memset(Host(base, (out + 16) & ~15u), 0, 16);
+  std::memset(Host(base, (out + 32) & ~15u), 0, 16);
+  std::memset(Host(base, (out + 48) & ~15u), 0, 16);
+  const float32x4_t ca = vdupq_n_f32(PackBits(LvlxWord0(base, kPackConstA)));
+  const float32x4_t cb = vdupq_n_f32(PackBits(LvlxWord0(base, kPackConstB)));
+  const uint32_t bias_src = own ? Load32(base, Load32(base, holder) + 9568) : Load32(base, kPackDefaultBias);
+  const float32x4_t bias = vdupq_n_f32(PackBits(PackRound(bias_src)));
+  const uint32_t obj2 = Load32(base, holder);
+  const int32_t first = int32_t(Load32(base, list + 4));
+  const float32x4_t vx = vdupq_n_f32(PackBits(ctx.v1.u32[3]));
+  const float32x4_t vy = vdupq_n_f32(PackBits(ctx.v1.u32[2]));
+  const float32x4_t vz = vdupq_n_f32(PackBits(ctx.v1.u32[1]));
+  const float32x4_t near_v = vdupq_n_f32(PackBits(LvlxWord0(base, obj2 + 9604)));
+  const float32x4_t far_v = vdupq_n_f32(PackBits(LvlxWord0(base, obj2 + 9608)));
+  const float32x4_t near2 = vmulq_f32(near_v, near_v);
+  const float32x4_t far2 = vmulq_f32(far_v, far_v);
+  ctx.lr = 0x8358AE88;
+  if (first <= 0) return;
+  PackLoop loop;
+  loop.us = Load32(base, list + 20);
+  loop.gs = Load32(base, list + 24);
+  loop.qs = Load32(base, list + 28);
+  loop.ps = Load32(base, list + 32);
+  loop.rs = Load32(base, list + 36);
+  loop.hs = Load32(base, list + 48);
+  loop.ks = Load32(base, list + 52);
+  loop.table = table;
+  loop.vx = vx;
+  loop.vy = vy;
+  loop.vz = vz;
+  loop.ca = ca;
+  loop.cb = cb;
+  loop.bias = bias;
+  loop.near2 = near2;
+  loop.far2 = far2;
+  const int32_t n = first;
+  if (PackApart(loop, out, uint32_t(n))) {
+    uint32_t group = 0;
+    uint8_t* dst = Host(base, out & ~15u);
+    uint8x16_t acc = vld1q_u8(dst);
+    for (int32_t i = 0; i < n; ++i) {
+      const uint32_t step = uint32_t(i);
+      if ((step >> 5) != group) {
+        vst1q_u8(dst, acc);
+        group = step >> 5;
+        dst = Host(base, (out + (group << 4)) & ~15u);
+        acc = vld1q_u8(dst);
+      }
+      const uint8x16_t mask = vld1q_u8(Host(base, (kPackMaskTable + ((step & 31) << 4)) & ~15u));
+      acc = vbslq_u8(mask, vreinterpretq_u8_u32(PackCull(base, loop, step)), acc);
+    }
+    vst1q_u8(dst, acc);
+    return;
+  }
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t step = uint32_t(i);
+    const uint32x4_t cull = PackCull(base, loop, step);
+    const uint8x16_t mask = vld1q_u8(Host(base, (kPackMaskTable + ((step & 31) << 4)) & ~15u));
+    uint8_t* dst = Host(base, (out + ((step >> 5) << 4)) & ~15u);
+    vst1q_u8(dst, vbslq_u8(mask, vreinterpretq_u8_u32(cull), vld1q_u8(dst)));
+  }
+}
+
+bool PackSameRegs(const PPCContext& a, const PPCContext& b) {
+  return a.r3.u64 == b.r3.u64 && a.r1.u64 == b.r1.u64 && a.lr == b.lr;
+}
+
+#endif
+
+}  // namespace
+
+REX_HOOK_RAW(sub_8358AE80) {
+#if defined(__aarch64__)
+  if (Enabled(REXCVAR_GET(gtav_nr_pack)) && PackRunnable(ctx, base)) {
+    if (CheckNow()) [[unlikely]] {
+      const uint32_t size = PackRegionSize(ctx, base);
+      if (size <= (1u << 20)) {
+        Differential(g_pack, ctx, base, __imp__sub_8358AE80, {{ctx.r3.u32 & ~15u, size}}, PackSameRegs,
+                     Pack8358AE80);
+        return;
+      }
+    }
+    Pack8358AE80(ctx, base);
+    return;
+  }
+#endif
+  __imp__sub_8358AE80(ctx, base);
+}
+
+namespace {
+
+#if defined(__aarch64__)
+
+inline uint32x4_t GatherLd(uint8_t* base, uint32_t a) {
+  return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(Host(base, a & ~15u))));
+}
+
+inline void GatherSt(uint8_t* base, uint32_t a, uint32x4_t v) {
+  vst1q_u8(Host(base, a & ~15u), vrev32q_u8(vreinterpretq_u8_u32(v)));
+}
+
+inline uint32_t GatherRotl(uint32_t v, int n) { return (v << n) | (v >> ((32 - n) & 31)); }
+
+inline float32x4_t GatherF(uint32x4_t v) { return vreinterpretq_f32_u32(v); }
+
+inline uint32x4_t GatherU(float32x4_t v) { return vreinterpretq_u32_f32(v); }
+
+inline uint32x4_t GatherMul(uint32x4_t a, uint32x4_t b) { return GatherU(vmulq_f32(GatherF(a), GatherF(b))); }
+
+inline uint32x4_t GatherAdd(uint32x4_t a, uint32x4_t b) { return GatherU(vaddq_f32(GatherF(a), GatherF(b))); }
+
+inline uint32x4_t GatherMadd(uint32x4_t a, uint32x4_t b, uint32x4_t c) {
+  return GatherU(vaddq_f32(vmulq_f32(GatherF(a), GatherF(b)), GatherF(c)));
+}
+
+inline uint32x4_t GatherNmsub(uint32x4_t a, uint32x4_t b, uint32x4_t c) {
+  return veorq_u32(GatherU(vsubq_f32(vmulq_f32(GatherF(a), GatherF(b)), GatherF(c))), vdupq_n_u32(0x80000000u));
+}
+
+template <int L>
+inline uint32x4_t GatherMulLane(uint32x4_t a, uint32x4_t s) {
+  return GatherU(vmulq_laneq_f32(GatherF(a), GatherF(s), L));
+}
+
+template <int L>
+inline uint32x4_t GatherMaddLane(uint32x4_t a, uint32x4_t s, uint32x4_t c) {
+  return GatherU(vaddq_f32(vmulq_laneq_f32(GatherF(a), GatherF(s), L), GatherF(c)));
+}
+
+template <int A, int B, int C, int D>
+inline uint32x4_t GatherPerm(uint32x4_t v) {
+  return __builtin_shufflevector(v, v, A, B, C, D);
+}
+
+inline void GatherStore32(uint8_t* base, uint32_t a, uint32_t v) {
+  v = __builtin_bswap32(v);
+  std::memcpy(Host(base, a), &v, 4);
+}
+
+struct GatherHeader {
+  uint32_t poses, lists, parents, source, out, world, bytes, pairs;
+  uint8_t skip, copied;
+};
+
+inline GatherHeader GatherRead(const PPCContext& ctx, uint8_t* base) {
+  const uint32_t h = ctx.r3.u32;
+  GatherHeader g;
+  g.out = Load32(base, h + 16);
+  g.bytes = Load32(base, h + 20) << 6;
+  g.poses = Load32(base, h + 0);
+  g.lists = Load32(base, h + 4);
+  g.world = g.bytes + g.out;
+  g.parents = Load32(base, h + 8);
+  g.source = Load32(base, h + 12);
+  g.pairs = Load32(base, h + 24);
+  g.skip = *Host(base, h + 28);
+  g.copied = *Host(base, h + 32);
+  return g;
+}
+
+__attribute__((noinline)) uint32_t GatherTranslations(uint8_t* base, uint32_t r11, uint32_t n, uint32_t r29,
+                                                      uint32_t r31) {
+  r31 &= ~15u;
+  const uint32x4_t kGatherOnes = vdupq_n_u32(0xFFFFFFFFu);
+  for (uint32_t k = 0; k < n; ++k) {
+    const uint32_t gP1_1 = uint32_t(Load16(base, r11 + 2u));
+    const uint32_t gP1_2 = uint32_t(Load16(base, r11 + 6u));
+    const uint32_t gP1_3 = uint32_t(Load16(base, r11 + 10u));
+    const uint32_t gP1_4 = GatherRotl(gP1_1, 6);
+    const uint32_t gP1_5 = uint32_t(Load16(base, r11 + 14u));
+    const uint32_t gP1_6 = GatherRotl(gP1_2, 6);
+    const uint32_t gP1_7 = uint32_t(Load16(base, r11 + 0u));
+    const uint32_t gP1_8 = gP1_4 + r31;
+    const uint32_t gP1_9 = uint32_t(Load16(base, r11 + 4u));
+    const uint32_t gP1_10 = GatherRotl(gP1_3, 6);
+    const uint32_t gP1_11 = uint32_t(Load16(base, r11 + 8u));
+    const uint32_t gP1_12 = GatherRotl(gP1_5, 6);
+    const uint32_t gP1_13 = uint32_t(Load16(base, r11 + 12u));
+    const uint32_t gP1_14 = gP1_6 + r31;
+    const uint32_t gP1_15 = gP1_8 + uint32_t(48);
+    const uint32_t gP1_16 = gP1_10 + r31;
+    const uint32x4_t vP1_17 = GatherLd(base, gP1_7 + r29);
+    const uint32_t gP1_18 = gP1_12 + r31;
+    const uint32x4_t vP1_19 = GatherLd(base, gP1_9 + r29);
+    const uint32_t gP1_20 = gP1_14 + uint32_t(48);
+    const uint32x4_t vP1_21 = GatherLd(base, gP1_11 + r29);
+    const uint32_t gP1_22 = gP1_16 + uint32_t(48);
+    const uint32x4_t vP1_23 = vceqq_u32(vP1_17, kGatherOnes);
+    const uint32_t gP1_24 = gP1_18 + uint32_t(48);
+    const uint32x4_t vP1_25 = GatherLd(base, gP1_13 + r29);
+    const uint32x4_t vP1_26 = vceqq_u32(vP1_19, kGatherOnes);
+    const uint32x4_t vP1_27 = GatherLd(base, 0u + gP1_15);
+    const uint32x4_t vP1_28 = vceqq_u32(vP1_21, kGatherOnes);
+    const uint32_t gP1_29 = r11 + uint32_t(16);
+    const uint32x4_t vP1_30 = vceqq_u32(vP1_25, kGatherOnes);
+    const uint32x4_t vP1_31 = GatherLd(base, 0u + gP1_20);
+    const uint32x4_t vP1_32 = GatherLd(base, 0u + gP1_22);
+    const uint32x4_t vP1_33 = vbslq_u32(vP1_23, vP1_27, vP1_17);
+    const uint32x4_t vP1_34 = GatherLd(base, 0u + gP1_24);
+    const uint32x4_t vP1_35 = vbslq_u32(vP1_26, vP1_31, vP1_19);
+    const uint32x4_t vP1_36 = vbslq_u32(vP1_28, vP1_32, vP1_21);
+    const uint32x4_t vP1_37 = vbslq_u32(vP1_30, vP1_34, vP1_25);
+    GatherSt(base, 0u + gP1_15, vP1_33);
+    GatherSt(base, 0u + gP1_20, vP1_35);
+    GatherSt(base, 0u + gP1_22, vP1_36);
+    GatherSt(base, 0u + gP1_24, vP1_37);
+    r11 = gP1_29;
+  }
+  return r11;
+}
+
+__attribute__((noinline)) uint32_t GatherRotations(uint8_t* base, uint32_t r11, uint32_t n, uint32_t r29,
+                                                   uint32_t r31) {
+  r31 &= ~15u;
+  const uint32x4_t kGatherOnes = vdupq_n_u32(0xFFFFFFFFu);
+  const uint32x4_t kGatherOne = vdupq_n_u32(0x3F800000u);
+  const uint32x4_t kGatherPacked = vcombine_u32(vdup_n_u32(0), vdup_n_u32(0xFFFFFFFFu));
+  const uint32x4_t kGatherLane0 = vsetq_lane_u32(0xFFFFFFFFu, vdupq_n_u32(0), 0);
+  for (uint32_t k = 0; k < n; ++k) {
+    const uint32_t gP2_1 = uint32_t(Load16(base, r11 + 0u));
+    const uint32_t gP2_2 = uint32_t(Load16(base, r11 + 4u));
+    const uint32_t gP2_3 = uint32_t(Load16(base, r11 + 2u));
+    const uint32_t gP2_4 = uint32_t(Load16(base, r11 + 6u));
+    const uint32_t gP2_5 = uint32_t(Load16(base, r11 + 10u));
+    const uint32_t gP2_6 = GatherRotl(gP2_3, 6);
+    const uint32x4_t vP2_7 = GatherLd(base, gP2_1 + r29);
+    const uint32_t gP2_8 = uint32_t(Load16(base, r11 + 14u));
+    const uint32x4_t vP2_9 = GatherAdd(vP2_7, vP2_7);
+    const uint32x4_t vP2_10 = GatherLd(base, gP2_2 + r29);
+    const uint32x4_t vP2_11 = GatherPerm<1, 2, 0, 3>(vP2_7);
+    const uint32x4_t vP2_12 = GatherAdd(vP2_10, vP2_10);
+    const uint32x4_t vP2_13 = vdupq_laneq_u32(vP2_7, 3);
+    const uint32_t gP2_14 = uint32_t(Load16(base, r11 + 8u));
+    const uint32x4_t vP2_15 = GatherPerm<2, 0, 1, 3>(vP2_7);
+    const uint32_t gP2_16 = GatherRotl(gP2_4, 6);
+    const uint32_t gP2_17 = GatherRotl(gP2_5, 6);
+    const uint32_t gP2_18 = GatherRotl(gP2_8, 6);
+    const uint32_t gP2_19 = gP2_6 + r31;
+    const uint32_t gP2_20 = gP2_16 + r31;
+    const uint32x4_t vP2_21 = GatherLd(base, gP2_14 + r29);
+    const uint32_t gP2_22 = gP2_17 + r31;
+    const uint32_t gP2_23 = uint32_t(Load16(base, r11 + 12u));
+    const uint32_t gP2_24 = gP2_18 + r31;
+    const uint32_t gP2_25 = gP2_19 + uint32_t(16);
+    const uint32x4_t vP2_26 = GatherPerm<1, 2, 0, 3>(vP2_10);
+    const uint32_t gP2_27 = gP2_19 + uint32_t(32);
+    const uint32x4_t vP2_28 = vdupq_laneq_u32(vP2_10, 3);
+    const uint32x4_t vP2_29 = GatherPerm<1, 2, 0, 3>(vP2_9);
+    const uint32x4_t vP2_30 = GatherMul(vP2_11, vP2_9);
+    const uint32x4_t vP2_31 = GatherPerm<2, 0, 1, 3>(vP2_9);
+    const uint32_t gP2_32 = gP2_20 + uint32_t(16);
+    const uint32_t gP2_33 = gP2_20 + uint32_t(32);
+    const uint32x4_t vP2_34 = GatherPerm<1, 2, 0, 3>(vP2_12);
+    const uint32_t gP2_35 = gP2_22 + uint32_t(16);
+    const uint32x4_t vP2_36 = GatherLd(base, 0u + gP2_19);
+    const uint32x4_t vP2_37 = GatherMulLane<3>(vP2_29, vP2_7);
+    const uint32_t gP2_38 = gP2_22 + uint32_t(32);
+    const uint32_t gP2_39 = gP2_24 + uint32_t(16);
+    const uint32x4_t vP2_40 = GatherLd(base, 0u + gP2_20);
+    const uint32_t gP2_41 = gP2_24 + uint32_t(32);
+    const uint32x4_t vP2_42 = GatherLd(base, gP2_23 + r29);
+    const uint32x4_t vP2_43 = GatherNmsub(vP2_29, vP2_11, kGatherOne);
+    const uint32x4_t vP2_44 = GatherLd(base, 0u + gP2_25);
+    const uint32x4_t vP2_45 = GatherLd(base, 0u + gP2_27);
+    const uint32x4_t vP2_46 = GatherMul(vP2_26, vP2_12);
+    const uint32x4_t vP2_47 = GatherLd(base, 0u + gP2_32);
+    const uint32x4_t vP2_48 = GatherPerm<2, 0, 1, 3>(vP2_12);
+    const uint32x4_t vP2_49 = GatherLd(base, 0u + gP2_33);
+    const uint32x4_t vP2_50 = GatherMulLane<3>(vP2_34, vP2_10);
+    const uint32x4_t vP2_51 = GatherNmsub(vP2_13, vP2_31, vP2_30);
+    const uint32x4_t vP2_52 = GatherLd(base, 0u + gP2_22);
+    const uint32x4_t vP2_53 = GatherLd(base, 0u + gP2_35);
+    const uint32x4_t vP2_54 = GatherLd(base, 0u + gP2_38);
+    const uint32x4_t vP2_55 = GatherLd(base, 0u + gP2_24);
+    const uint32x4_t vP2_56 = GatherMadd(vP2_15, vP2_9, vP2_37);
+    const uint32x4_t vP2_57 = GatherLd(base, 0u + gP2_39);
+    const uint32x4_t vP2_58 = GatherLd(base, 0u + gP2_41);
+    const uint32x4_t vP2_59 = GatherNmsub(vP2_31, vP2_15, vP2_43);
+    const uint32x4_t vP2_60 = vbslq_u32(kGatherLane0, vP2_59, vP2_56);
+    const uint32x4_t vP2_61 = vbslq_u32(kGatherPacked, vP2_51, vP2_60);
+    const uint32x4_t vP2_62 = GatherAdd(vP2_21, vP2_21);
+    const uint32x4_t vP2_63 = GatherNmsub(vP2_34, vP2_26, kGatherOne);
+    const uint32x4_t vP2_64 = GatherPerm<2, 0, 1, 3>(vP2_10);
+    const uint32x4_t vP2_65 = vbslq_u32(kGatherLane0, vP2_51, vP2_59);
+    const uint32x4_t vP2_66 = GatherNmsub(vP2_28, vP2_48, vP2_46);
+    const uint32x4_t vP2_67 = GatherPerm<1, 2, 0, 3>(vP2_62);
+    const uint32x4_t vP2_68 = vdupq_laneq_u32(vP2_21, 3);
+    const uint32x4_t vP2_69 = vbslq_u32(kGatherLane0, vP2_56, vP2_51);
+    const uint32x4_t vP2_70 = GatherPerm<1, 2, 0, 3>(vP2_21);
+    const uint32x4_t vP2_71 = GatherPerm<2, 0, 1, 3>(vP2_21);
+    const uint32x4_t vP2_72 = GatherPerm<2, 0, 1, 3>(vP2_62);
+    const uint32x4_t vP2_73 = GatherMulLane<3>(vP2_67, vP2_21);
+    const uint32x4_t vP2_74 = vbslq_u32(kGatherPacked, vP2_59, vP2_69);
+    const uint32x4_t vP2_75 = GatherMul(vP2_70, vP2_62);
+    const uint32x4_t vP2_76 = GatherMadd(vP2_64, vP2_12, vP2_50);
+    const uint32x4_t vP2_77 = GatherAdd(vP2_42, vP2_42);
+    const uint32x4_t vP2_78 = GatherNmsub(vP2_48, vP2_64, vP2_63);
+    const uint32x4_t vP2_79 = GatherPerm<1, 2, 0, 3>(vP2_42);
+    const uint32x4_t vP2_80 = GatherNmsub(vP2_67, vP2_70, kGatherOne);
+    const uint32x4_t vP2_81 = vdupq_laneq_u32(vP2_42, 3);
+    const uint32x4_t vP2_82 = vbslq_u32(kGatherPacked, vP2_56, vP2_65);
+    const uint32x4_t vP2_83 = GatherPerm<2, 0, 1, 3>(vP2_42);
+    const uint32_t gP2_84 = r11 + uint32_t(16);
+    const uint32x4_t vP2_85 = GatherMadd(vP2_71, vP2_62, vP2_73);
+    const uint32x4_t vP2_86 = GatherMul(vP2_79, vP2_77);
+    const uint32x4_t vP2_87 = GatherPerm<1, 2, 0, 3>(vP2_77);
+    const uint32x4_t vP2_88 = GatherPerm<2, 0, 1, 3>(vP2_77);
+    const uint32x4_t vP2_89 = vbslq_u32(kGatherLane0, vP2_76, vP2_66);
+    const uint32x4_t vP2_90 = vbslq_u32(kGatherLane0, vP2_66, vP2_78);
+    const uint32x4_t vP2_91 = vbslq_u32(kGatherLane0, vP2_78, vP2_76);
+    const uint32x4_t vP2_92 = vbslq_u32(kGatherPacked, vP2_76, vP2_90);
+    const uint32x4_t vP2_93 = GatherMulLane<3>(vP2_87, vP2_42);
+    const uint32x4_t vP2_94 = vbslq_u32(kGatherPacked, vP2_66, vP2_91);
+    const uint32x4_t vP2_95 = vbslq_u32(kGatherPacked, vP2_78, vP2_89);
+    const uint32x4_t vP2_96 = GatherNmsub(vP2_72, vP2_71, vP2_80);
+    const uint32x4_t vP2_97 = GatherNmsub(vP2_68, vP2_72, vP2_75);
+    const uint32x4_t vP2_98 = GatherNmsub(vP2_81, vP2_88, vP2_86);
+    const uint32x4_t vP2_99 = GatherNmsub(vP2_87, vP2_79, kGatherOne);
+    const uint32x4_t vP2_100 = GatherMadd(vP2_83, vP2_77, vP2_93);
+    const uint32x4_t vP2_101 = GatherNmsub(vP2_88, vP2_83, vP2_99);
+    const uint32x4_t vP2_102 = vbslq_u32(kGatherLane0, vP2_96, vP2_85);
+    const uint32x4_t vP2_103 = vbslq_u32(kGatherLane0, vP2_97, vP2_96);
+    const uint32x4_t vP2_104 = vbslq_u32(kGatherLane0, vP2_85, vP2_97);
+    const uint32x4_t vP2_105 = vbslq_u32(kGatherLane0, vP2_100, vP2_98);
+    const uint32x4_t vP2_106 = vceqq_u32(vP2_7, kGatherOnes);
+    const uint32x4_t vP2_107 = vbslq_u32(kGatherPacked, vP2_85, vP2_103);
+    const uint32x4_t vP2_108 = vbslq_u32(kGatherLane0, vP2_101, vP2_100);
+    const uint32x4_t vP2_109 = vbslq_u32(kGatherPacked, vP2_97, vP2_102);
+    const uint32x4_t vP2_110 = vbslq_u32(kGatherLane0, vP2_98, vP2_101);
+    const uint32x4_t vP2_111 = vbslq_u32(kGatherPacked, vP2_101, vP2_105);
+    const uint32x4_t vP2_112 = vceqq_u32(vP2_10, kGatherOnes);
+    const uint32x4_t vP2_113 = vbslq_u32(kGatherPacked, vP2_96, vP2_104);
+    const uint32x4_t vP2_114 = vbslq_u32(kGatherPacked, vP2_100, vP2_110);
+    const uint32x4_t vP2_115 = vceqq_u32(vP2_21, kGatherOnes);
+    const uint32x4_t vP2_116 = vbslq_u32(vP2_106, vP2_44, vP2_82);
+    const uint32x4_t vP2_117 = vbslq_u32(vP2_106, vP2_45, vP2_74);
+    const uint32x4_t vP2_118 = vbslq_u32(vP2_106, vP2_36, vP2_61);
+    const uint32x4_t vP2_119 = vbslq_u32(vP2_112, vP2_49, vP2_95);
+    const uint32x4_t vP2_120 = vceqq_u32(vP2_42, kGatherOnes);
+    GatherSt(base, 0u + gP2_25, vP2_116);
+    const uint32x4_t vP2_121 = vbslq_u32(kGatherPacked, vP2_98, vP2_108);
+    GatherSt(base, 0u + gP2_27, vP2_117);
+    const uint32x4_t vP2_122 = vbslq_u32(vP2_112, vP2_40, vP2_94);
+    GatherSt(base, 0u + gP2_19, vP2_118);
+    const uint32x4_t vP2_123 = vbslq_u32(vP2_115, vP2_52, vP2_109);
+    GatherSt(base, 0u + gP2_33, vP2_119);
+    const uint32x4_t vP2_124 = vbslq_u32(vP2_115, vP2_53, vP2_107);
+    const uint32x4_t vP2_125 = vbslq_u32(vP2_112, vP2_47, vP2_92);
+    const uint32x4_t vP2_126 = vbslq_u32(vP2_115, vP2_54, vP2_113);
+    GatherSt(base, 0u + gP2_20, vP2_122);
+    const uint32x4_t vP2_127 = vbslq_u32(vP2_120, vP2_55, vP2_121);
+    const uint32x4_t vP2_128 = vbslq_u32(vP2_120, vP2_57, vP2_114);
+    const uint32x4_t vP2_129 = vbslq_u32(vP2_120, vP2_58, vP2_111);
+    GatherSt(base, 0u + gP2_32, vP2_125);
+    GatherSt(base, 0u + gP2_22, vP2_123);
+    GatherSt(base, 0u + gP2_35, vP2_124);
+    GatherSt(base, 0u + gP2_38, vP2_126);
+    GatherSt(base, 0u + gP2_24, vP2_127);
+    GatherSt(base, 0u + gP2_39, vP2_128);
+    GatherSt(base, 0u + gP2_41, vP2_129);
+    r11 = gP2_84;
+  }
+  return r11;
+}
+
+__attribute__((noinline)) void GatherScales(uint8_t* base, uint32_t r11, uint32_t n, uint32_t r29, uint32_t r31) {
+  r31 &= ~15u;
+  const uint32x4_t kGatherOnes = vdupq_n_u32(0xFFFFFFFFu);
+  for (uint32_t k = 0; k < n; ++k) {
+    const uint32_t gP3_1 = uint32_t(Load16(base, r11 + 4u));
+    const uint32_t gP3_2 = uint32_t(Load16(base, r11 + 2u));
+    const uint32_t gP3_3 = GatherRotl(gP3_1, 6);
+    const uint32_t gP3_4 = uint32_t(Load16(base, r11 + 8u));
+    const uint32_t gP3_5 = uint32_t(Load16(base, r11 + 6u));
+    const uint32_t gP3_6 = uint32_t(Load16(base, r11 + 10u));
+    const uint32_t gP3_7 = gP3_3 + r31;
+    const uint32_t gP3_8 = uint32_t(Load16(base, r11 + 14u));
+    const uint32_t gP3_9 = GatherRotl(gP3_4, 6);
+    const uint32_t gP3_10 = uint32_t(Load16(base, r11 + 12u));
+    const uint32x4_t vP3_11 = GatherLd(base, gP3_2 + r29);
+    const uint32_t gP3_12 = r11 + 16u;
+    const uint32_t gP3_13 = uint32_t(Load16(base, gP3_12));
+    const uint32_t gP3_14 = gP3_7 + uint32_t(16);
+    const uint32_t gP3_15 = GatherRotl(gP3_10, 6);
+    const uint32_t gP3_17 = GatherRotl(gP3_13, 6);
+    const uint32_t gP3_19 = gP3_9 + r31;
+    const uint32x4_t vP3_20 = GatherLd(base, 0u + gP3_7);
+    const uint32_t gP3_21 = gP3_15 + r31;
+    const uint32x4_t vP3_22 = GatherLd(base, gP3_5 + r29);
+    const uint32_t gP3_23 = gP3_17 + r31;
+    const uint32x4_t vP3_24 = GatherLd(base, 0u + gP3_14);
+    const uint32_t gP3_25 = gP3_7 + uint32_t(32);
+    const uint32x4_t vP3_26 = GatherLd(base, gP3_6 + r29);
+    const uint32x4_t vP3_27 = GatherLd(base, gP3_8 + r29);
+    const uint32x4_t vP3_28 = GatherMulLane<0>(vP3_20, vP3_11);
+    const uint32_t gP3_29 = gP3_19 + uint32_t(16);
+    const uint32x4_t vP3_30 = GatherMulLane<1>(vP3_24, vP3_11);
+    const uint32_t gP3_31 = gP3_19 + uint32_t(32);
+    const uint32x4_t vP3_34 = GatherLd(base, 0u + gP3_19);
+    const uint32x4_t vP3_36 = GatherLd(base, 0u + gP3_25);
+    const uint32x4_t vP3_38 = vceqq_u32(vP3_11, kGatherOnes);
+    const uint32x4_t vP3_39 = GatherLd(base, 0u + gP3_29);
+    const uint32x4_t vP3_40 = GatherMulLane<2>(vP3_36, vP3_11);
+    const uint32x4_t vP3_41 = GatherLd(base, 0u + gP3_31);
+    const uint32x4_t vP3_42 = GatherMulLane<0>(vP3_34, vP3_22);
+    const uint32x4_t vP3_43 = GatherMulLane<1>(vP3_39, vP3_22);
+    const uint32x4_t vP3_45 = GatherMulLane<2>(vP3_41, vP3_22);
+    const uint32x4_t vP3_46 = GatherLd(base, 0u + gP3_21);
+    const uint32_t gP3_47 = gP3_21 + uint32_t(16);
+    const uint32_t gP3_49 = gP3_21 + uint32_t(32);
+    const uint32x4_t vP3_51 = vbslq_u32(vP3_38, vP3_20, vP3_28);
+    const uint32x4_t vP3_52 = GatherMulLane<0>(vP3_46, vP3_26);
+    const uint32x4_t vP3_53 = vbslq_u32(vP3_38, vP3_24, vP3_30);
+    const uint32_t gP3_54 = gP3_23 + uint32_t(16);
+    const uint32x4_t vP3_55 = vceqq_u32(vP3_22, kGatherOnes);
+    const uint32_t gP3_56 = gP3_23 + uint32_t(32);
+    const uint32x4_t vP3_58 = vceqq_u32(vP3_26, kGatherOnes);
+    const uint32x4_t vP3_60 = GatherLd(base, 0u + gP3_23);
+    const uint32x4_t vP3_62 = GatherLd(base, 0u + gP3_47);
+    const uint32x4_t vP3_63 = vbslq_u32(vP3_38, vP3_36, vP3_40);
+    const uint32x4_t vP3_64 = GatherLd(base, 0u + gP3_49);
+    const uint32x4_t vP3_65 = vbslq_u32(vP3_55, vP3_34, vP3_42);
+    const uint32x4_t vP3_66 = GatherLd(base, 0u + gP3_54);
+    const uint32x4_t vP3_67 = vbslq_u32(vP3_55, vP3_39, vP3_43);
+    const uint32x4_t vP3_68 = GatherLd(base, 0u + gP3_56);
+    const uint32x4_t vP3_69 = vbslq_u32(vP3_55, vP3_41, vP3_45);
+    GatherSt(base, 0u + gP3_14, vP3_53);
+    GatherSt(base, 0u + gP3_7, vP3_51);
+    const uint32x4_t vP3_70 = GatherMulLane<0>(vP3_60, vP3_27);
+    GatherSt(base, 0u + gP3_25, vP3_63);
+    const uint32x4_t vP3_71 = GatherMulLane<1>(vP3_62, vP3_26);
+    const uint32x4_t vP3_72 = GatherMulLane<2>(vP3_64, vP3_26);
+    const uint32x4_t vP3_73 = vbslq_u32(vP3_58, vP3_46, vP3_52);
+    const uint32x4_t vP3_74 = GatherMulLane<1>(vP3_66, vP3_27);
+    GatherSt(base, 0u + gP3_19, vP3_65);
+    const uint32x4_t vP3_75 = GatherMulLane<2>(vP3_68, vP3_27);
+    GatherSt(base, 0u + gP3_29, vP3_67);
+    const uint32x4_t vP3_76 = vceqq_u32(vP3_27, kGatherOnes);
+    GatherSt(base, 0u + gP3_31, vP3_69);
+    GatherSt(base, 0u + gP3_21, vP3_73);
+    const uint32x4_t vP3_77 = vbslq_u32(vP3_58, vP3_62, vP3_71);
+    const uint32x4_t vP3_78 = vbslq_u32(vP3_58, vP3_64, vP3_72);
+    const uint32x4_t vP3_79 = vbslq_u32(vP3_76, vP3_60, vP3_70);
+    const uint32x4_t vP3_80 = vbslq_u32(vP3_76, vP3_66, vP3_74);
+    const uint32x4_t vP3_81 = vbslq_u32(vP3_76, vP3_68, vP3_75);
+    GatherSt(base, 0u + gP3_47, vP3_77);
+    GatherSt(base, 0u + gP3_49, vP3_78);
+    GatherSt(base, 0u + gP3_23, vP3_79);
+    GatherSt(base, 0u + gP3_54, vP3_80);
+    GatherSt(base, 0u + gP3_56, vP3_81);
+    r11 = gP3_12;
+  }
+}
+
+__attribute__((noinline)) void GatherHierarchy(uint8_t* base, uint32_t r8, uint32_t n, uint32_t r31, uint32_t r30) {
+  r31 &= ~15u;
+  r30 &= ~15u;
+  const uint32_t r9 = 16, r10 = 32, r11 = 48;
+  for (uint32_t k = 0; k < n; ++k) {
+    const uint32_t gP4_1 = uint32_t(Load16(base, r8 + 6u));
+    const uint32_t gP4_2 = uint32_t(Load16(base, r8 + 2u));
+    const uint32_t gP4_3 = uint32_t(Load16(base, r8 + 4u));
+    const uint32_t gP4_4 = GatherRotl(gP4_1, 6);
+    const uint32_t gP4_5 = GatherRotl(gP4_2, 6);
+    const uint32_t gP4_6 = uint32_t(Load16(base, r8 + 10u));
+    const uint32_t gP4_7 = uint32_t(Load16(base, r8 + 12u));
+    const uint32_t gP4_8 = GatherRotl(gP4_3, 6);
+    const uint32_t gP4_9 = uint32_t(Load16(base, r8 + 14u));
+    const uint32_t gP4_10 = gP4_5 + r31;
+    const uint32_t gP4_11 = uint32_t(Load16(base, r8 + 8u));
+    const uint32_t gP4_12 = gP4_4 + r31;
+    const uint32_t gP4_13 = r8 + 16u;
+    const uint32_t gP4_14 = uint32_t(Load16(base, gP4_13));
+    const uint32_t gP4_15 = GatherRotl(gP4_6, 6);
+    const uint32x4_t vP4_16 = GatherLd(base, gP4_5 + r31);
+    const uint32_t gP4_17 = GatherRotl(gP4_11, 6);
+    const uint32_t gP4_18 = GatherRotl(gP4_14, 6);
+    const uint32x4_t vP4_19 = GatherLd(base, gP4_4 + r31);
+    const uint32_t gP4_20 = gP4_8 + r30;
+    const uint32_t gP4_22 = GatherRotl(gP4_7, 6);
+    const uint32x4_t vP4_23 = GatherLd(base, gP4_10 + r9);
+    const uint32x4_t vP4_24 = GatherLd(base, gP4_10 + r10);
+    const uint32_t gP4_25 = gP4_17 + r30;
+    const uint32x4_t vP4_26 = GatherLd(base, gP4_10 + r11);
+    const uint32_t gP4_27 = GatherRotl(gP4_9, 6);
+    const uint32x4_t vP4_28 = GatherLd(base, gP4_12 + r9);
+    const uint32_t gP4_29 = gP4_22 + r30;
+    const uint32x4_t vP4_30 = GatherLd(base, 0u + gP4_20);
+    const uint32x4_t vP4_32 = GatherMulLane<0>(vP4_30, vP4_16);
+    const uint32x4_t vP4_33 = GatherLd(base, gP4_12 + r10);
+    const uint32x4_t vP4_34 = GatherLd(base, gP4_12 + r11);
+    const uint32x4_t vP4_36 = GatherLd(base, gP4_15 + r31);
+    const uint32_t gP4_38 = gP4_15 + r31;
+    const uint32_t gP4_40 = gP4_27 + r31;
+    const uint32_t gP4_42 = gP4_18 + r30;
+    const uint32x4_t vP4_45 = GatherLd(base, gP4_20 + r11);
+    const uint32x4_t vP4_47 = GatherLd(base, 0u + gP4_25);
+    const uint32x4_t vP4_49 = GatherLd(base, gP4_25 + r11);
+    const uint32x4_t vP4_50 = GatherLd(base, gP4_20 + r9);
+    const uint32x4_t vP4_51 = GatherMaddLane<0>(vP4_30, vP4_26, vP4_45);
+    const uint32x4_t vP4_52 = GatherLd(base, 0u + gP4_29);
+    const uint32x4_t vP4_53 = GatherMulLane<0>(vP4_30, vP4_23);
+    const uint32x4_t vP4_54 = GatherMulLane<0>(vP4_30, vP4_24);
+    const uint32x4_t vP4_55 = GatherLd(base, gP4_20 + r10);
+    const uint32x4_t vP4_56 = GatherMaddLane<0>(vP4_47, vP4_34, vP4_49);
+    const uint32x4_t vP4_57 = GatherLd(base, gP4_27 + r31);
+    const uint32x4_t vP4_58 = GatherMulLane<0>(vP4_47, vP4_19);
+    const uint32x4_t vP4_59 = GatherLd(base, gP4_18 + r30);
+    const uint32x4_t vP4_60 = GatherMulLane<0>(vP4_47, vP4_28);
+    const uint32x4_t vP4_61 = GatherLd(base, gP4_38 + r9);
+    const uint32x4_t vP4_62 = GatherMulLane<0>(vP4_47, vP4_33);
+    const uint32x4_t vP4_63 = GatherLd(base, gP4_38 + r10);
+    const uint32x4_t vP4_64 = GatherLd(base, gP4_38 + r11);
+    const uint32_t gP4_65 = gP4_5 + r30;
+    const uint32x4_t vP4_66 = GatherLd(base, gP4_40 + r9);
+    const uint32x4_t vP4_68 = GatherLd(base, gP4_40 + r10);
+    const uint32x4_t vP4_70 = GatherLd(base, gP4_40 + r11);
+    const uint32x4_t vP4_71 = GatherMulLane<0>(vP4_52, vP4_36);
+    const uint32x4_t vP4_72 = GatherLd(base, gP4_25 + r9);
+    const uint32x4_t vP4_74 = GatherLd(base, gP4_25 + r10);
+    const uint32x4_t vP4_76 = GatherLd(base, gP4_29 + r9);
+    const uint32x4_t vP4_78 = GatherLd(base, gP4_29 + r10);
+    const uint32x4_t vP4_79 = GatherMaddLane<1>(vP4_50, vP4_16, vP4_32);
+    const uint32x4_t vP4_80 = GatherLd(base, gP4_29 + r11);
+    const uint32x4_t vP4_82 = GatherLd(base, gP4_42 + r9);
+    const uint32x4_t vP4_83 = GatherMaddLane<1>(vP4_50, vP4_23, vP4_53);
+    const uint32x4_t vP4_86 = GatherMaddLane<1>(vP4_50, vP4_26, vP4_51);
+    const uint32x4_t vP4_87 = GatherMaddLane<1>(vP4_72, vP4_28, vP4_60);
+    const uint32x4_t vP4_89 = GatherMaddLane<1>(vP4_72, vP4_33, vP4_62);
+    const uint32x4_t vP4_91 = GatherMaddLane<1>(vP4_72, vP4_19, vP4_58);
+    const uint32x4_t vP4_93 = GatherMaddLane<1>(vP4_72, vP4_34, vP4_56);
+    const uint32x4_t vP4_95 = GatherMulLane<0>(vP4_52, vP4_61);
+    const uint32x4_t vP4_97 = GatherMaddLane<1>(vP4_50, vP4_24, vP4_54);
+    const uint32x4_t vP4_99 = GatherMaddLane<2>(vP4_55, vP4_16, vP4_79);
+    const uint32x4_t vP4_101 = GatherMaddLane<1>(vP4_76, vP4_36, vP4_71);
+    const uint32_t gP4_104 = gP4_4 + r30;
+    const uint32_t gP4_106 = gP4_15 + r30;
+    const uint32x4_t vP4_107 = GatherMaddLane<2>(vP4_55, vP4_23, vP4_83);
+    const uint32x4_t vP4_109 = GatherMaddLane<2>(vP4_55, vP4_26, vP4_86);
+    const uint32x4_t vP4_111 = GatherLd(base, gP4_42 + r11);
+    const uint32x4_t vP4_112 = GatherMaddLane<2>(vP4_74, vP4_28, vP4_87);
+    const uint32x4_t vP4_113 = GatherMaddLane<2>(vP4_74, vP4_33, vP4_89);
+    const uint32x4_t vP4_115 = GatherMaddLane<2>(vP4_74, vP4_19, vP4_91);
+    const uint32x4_t vP4_117 = GatherMaddLane<2>(vP4_74, vP4_34, vP4_93);
+    const uint32x4_t vP4_119 = GatherMaddLane<1>(vP4_76, vP4_61, vP4_95);
+    const uint32x4_t vP4_121 = GatherMaddLane<2>(vP4_55, vP4_24, vP4_97);
+    const uint32x4_t vP4_123 = GatherLd(base, gP4_42 + r10);
+    const uint32_t gP4_124 = gP4_27 + r30;
+    GatherSt(base, gP4_5 + r30, vP4_99);
+    const uint32x4_t vP4_125 = GatherMaddLane<2>(vP4_78, vP4_36, vP4_101);
+    const uint32x4_t vP4_126 = GatherMulLane<0>(vP4_59, vP4_68);
+    GatherSt(base, gP4_65 + r9, vP4_107);
+    const uint32x4_t vP4_128 = GatherMaddLane<0>(vP4_52, vP4_64, vP4_80);
+    GatherSt(base, gP4_65 + r11, vP4_109);
+    const uint32x4_t vP4_130 = GatherMulLane<0>(vP4_59, vP4_66);
+    const uint32x4_t vP4_131 = GatherMaddLane<2>(vP4_78, vP4_61, vP4_119);
+    const uint32x4_t vP4_133 = GatherMulLane<0>(vP4_52, vP4_63);
+    GatherSt(base, gP4_65 + r10, vP4_121);
+    GatherSt(base, gP4_4 + r30, vP4_115);
+    GatherSt(base, gP4_104 + r10, vP4_113);
+    GatherSt(base, gP4_104 + r9, vP4_112);
+    const uint32x4_t vP4_136 = GatherMaddLane<0>(vP4_59, vP4_70, vP4_111);
+    GatherSt(base, gP4_104 + r11, vP4_117);
+    const uint32x4_t vP4_137 = GatherMulLane<0>(vP4_59, vP4_57);
+    GatherSt(base, gP4_15 + r30, vP4_125);
+    const uint32x4_t vP4_144 = GatherMaddLane<1>(vP4_82, vP4_66, vP4_130);
+    GatherSt(base, gP4_106 + r9, vP4_131);
+    const uint32x4_t vP4_145 = GatherMaddLane<1>(vP4_76, vP4_63, vP4_133);
+    const uint32x4_t vP4_147 = GatherMaddLane<1>(vP4_76, vP4_64, vP4_128);
+    const uint32x4_t vP4_149 = GatherMaddLane<1>(vP4_82, vP4_68, vP4_126);
+    const uint32x4_t vP4_150 = GatherMaddLane<1>(vP4_82, vP4_70, vP4_136);
+    const uint32x4_t vP4_151 = GatherMaddLane<1>(vP4_82, vP4_57, vP4_137);
+    const uint32x4_t vP4_152 = GatherMaddLane<2>(vP4_78, vP4_63, vP4_145);
+    const uint32x4_t vP4_153 = GatherMaddLane<2>(vP4_78, vP4_64, vP4_147);
+    const uint32x4_t vP4_154 = GatherMaddLane<2>(vP4_123, vP4_57, vP4_151);
+    GatherSt(base, gP4_106 + r10, vP4_152);
+    const uint32x4_t vP4_155 = GatherMaddLane<2>(vP4_123, vP4_66, vP4_144);
+    GatherSt(base, gP4_106 + r11, vP4_153);
+    const uint32x4_t vP4_156 = GatherMaddLane<2>(vP4_123, vP4_68, vP4_149);
+    const uint32x4_t vP4_157 = GatherMaddLane<2>(vP4_123, vP4_70, vP4_150);
+    GatherSt(base, gP4_27 + r30, vP4_154);
+    GatherSt(base, gP4_124 + r9, vP4_155);
+    GatherSt(base, gP4_124 + r10, vP4_156);
+    GatherSt(base, gP4_124 + r11, vP4_157);
+    r8 = gP4_13;
+  }
+}
+
+void Gather83442200(PPCContext& ctx, uint8_t* base) {
+  const GatherHeader g = GatherRead(ctx, base);
+  if (!g.copied) {
+    const PPCRegister sp = ctx.r1;
+    GatherStore32(base, sp.u32 - 192, sp.u32);
+    ctx.r1.u32 = sp.u32 - 192;
+    ctx.r3.u64 = g.out;
+    ctx.r4.u64 = g.source;
+    ctx.r5.u64 = g.bytes;
+    ctx.lr = 0x8344224C;
+    sub_8378DEF8(ctx, base);
+    ctx.r1 = sp;
+  }
+  const uint32_t n0 = uint32_t(int32_t(Load16(base, g.lists) + 3u) >> 2);
+  const uint32_t n1 = uint32_t(int32_t(Load16(base, g.lists + 2) + 3u) >> 2);
+  const uint32_t n2 = uint32_t(int32_t(Load16(base, g.lists + 4) + 3u) >> 2);
+  uint32_t r11 = GatherTranslations(base, g.lists + 16, n0, g.poses, g.out);
+  r11 = GatherRotations(base, r11, n1, g.poses, g.out);
+  GatherScales(base, r11 - 2, n2, g.poses, g.out);
+  if (!g.skip) {
+    GatherSt(base, g.world, GatherLd(base, g.out));
+    const uint32x4_t a = GatherLd(base, g.out + 16), b = GatherLd(base, g.out + 32), c = GatherLd(base, g.out + 48);
+    GatherSt(base, g.world + 16, a);
+    GatherSt(base, g.world + 32, b);
+    GatherSt(base, g.world + 48, c);
+    const uint32_t n4 = (g.pairs + 7u) >> 3;
+    GatherHierarchy(base, g.parents - 2, n4, g.out, g.world);
+  }
+  ctx.r3.u64 = 1;
+}
+
+#endif
+
+#if defined(__aarch64__)
+
+bool GatherRegions(const PPCContext& ctx, uint8_t* base, uint32_t& a0, uint32_t& n0, uint32_t& a1, uint32_t& n1,
+                   uint32_t& a2, uint32_t& n2) {
+  const GatherHeader g = GatherRead(ctx, base);
+  const uint32_t entries = 4u * ((uint32_t(Load16(base, g.lists)) + 3u) >> 2) +
+                           4u * ((uint32_t(Load16(base, g.lists + 2)) + 3u) >> 2) +
+                           4u * ((uint32_t(Load16(base, g.lists + 4)) + 3u) >> 2);
+  const uint32_t pairs = 4u * ((g.pairs + 7u) >> 3);
+  if (pairs > 65536u || g.bytes > (1u << 20)) return false;
+  if (!g.copied) {
+    const uint64_t lo = g.out, hi = uint64_t(g.out) + g.bytes;
+    if ((g.lists < hi && uint64_t(g.lists) + 16u + 4u * entries > lo) ||
+        (g.parents < hi && uint64_t(g.parents) + 4u * pairs > lo))
+      return false;
+  }
+  uint32_t top = 0;
+  for (uint32_t i = 0; i < entries; ++i) top = std::max<uint32_t>(top, Load16(base, g.lists + 16 + 4 * i + 2));
+  uint32_t child = 0;
+  for (uint32_t i = 0; i < (g.skip ? 0u : pairs); ++i) child = std::max<uint32_t>(child, Load16(base, g.parents + 4 * i));
+  a0 = g.out;
+  n0 = g.copied ? 0u : g.bytes;
+  a1 = g.out & ~15u;
+  n1 = entries ? 64u * top + 80u : 0u;
+  a2 = g.world & ~15u;
+  n2 = g.skip ? 0u : 64u * child + 80u;
+  return n1 <= (1u << 20) && n2 <= (1u << 20) && Flat(a0, n0) && Flat(a1, n1) && Flat(a2, n2);
+}
+
+#endif
+
+}  // namespace
+
+REX_HOOK_RAW(sub_83442200) {
+#if defined(__aarch64__)
+  if (Enabled(REXCVAR_GET(gtav_nr_gather))) {
+    if (CheckNow()) [[unlikely]] {
+      uint32_t a0 = 0, n0 = 0, a1 = 0, n1 = 0, a2 = 0, n2 = 0;
+      if (GatherRegions(ctx, base, a0, n0, a1, n1, a2, n2)) {
+        Differential(g_gather, ctx, base, __imp__sub_83442200, {{a0, n0}, {a1, n1}, {a2, n2}}, SameResult,
+                     Gather83442200);
+        return;
+      }
+    }
+    Gather83442200(ctx, base);
+    return;
+  }
+#endif
+  __imp__sub_83442200(ctx, base);
 }
