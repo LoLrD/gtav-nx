@@ -259,6 +259,10 @@ REXCVAR_DEFINE_INT32(gtav_native_cube_every, 1, "GTAV",
                      "Native renderer: the game redraws its reflection cube map (six multisampled faces) every "
                      "frame. N > 1 redraws it every Nth frame and passes over its draws, clears and resolves on "
                      "the others: reflections on cars and windows then move at 1/N of the frame rate (live)");
+REXCVAR_DEFINE_BOOL(gtav_native_keep_targets, false, "GTAV",
+                    "Native renderer: draws into some of the bound pass's attachments (fewer colour targets, or no "
+                    "depth) keep the pass and leave the others unwritten, instead of starting a pass with the "
+                    "smaller set (live)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -2605,7 +2609,7 @@ struct Backend::Impl {
   }
 
   std::vector<uint8_t> skip_commands;
-  uint32_t cube_skipped = 0;
+  uint32_t cube_skipped = 0, kept_targets = 0;
   void MarkCubeSkips(const FramePacket& f) {
     skip_commands.clear();
     const int every = REXCVAR_GET(gtav_native_cube_every);
@@ -5055,6 +5059,19 @@ struct Backend::Impl {
 
     uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    if (!colorless && count && bound_fb && REXCVAR_GET(gtav_native_keep_targets)) {
+      uint32_t bound_count = 0;
+      while (bound_count < 4 && bound_color[bound_count]) bound_count++;
+      bool subset =
+          bound_count >= count && (depth ? depth == bound_depth : bound_depth != nullptr || bound_count > count);
+      for (uint32_t i = 0; subset && i < count; i++) subset = color[i] == bound_color[i];
+      if (subset && (bound_count > count || depth != bound_depth)) {
+        bind_color = bound_color;
+        bind_count = bound_count;
+        depth = bound_depth;
+        kept_targets++;
+      }
+    }
     if (ps && diag == kDiagOff && EarlyTests(r, d, depth, spec, *word(133)))
       if (RenderShader* early = EarlyShader(d.ps_hash)) {
         ps = early;
@@ -6829,7 +6846,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
-  s.stat_early = s.stat_silent = s.stat_fills_reused = s.cube_skipped = 0;
+  s.stat_early = s.stat_silent = s.stat_fills_reused = s.cube_skipped = s.kept_targets = 0;
   s.skipped_fill = nullptr;
   s.fill_drawn = s.fill_sig_valid = false;
   s.notes.clear();
@@ -7095,10 +7112,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached, {} early-test "
-                "draws, {} silent draws skipped, {} light fills reused, {} cube draws passed over",
+                "draws, {} silent draws skipped, {} light fills reused, {} cube draws passed over, {} draws kept "
+                "the bound targets",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
                 s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size(),
-                s.stat_early, s.stat_silent, s.stat_fills_reused, s.cube_skipped);
+                s.stat_early, s.stat_silent, s.stat_fills_reused, s.cube_skipped, s.kept_targets);
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;
