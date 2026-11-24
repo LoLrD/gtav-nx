@@ -305,6 +305,8 @@ void ReportXma() {
   const uint64_t frames_quiet = XmaContext::frames_quiet_.exchange(0, std::memory_order_relaxed);
   const uint64_t reopens = XmaContext::reopens_.exchange(0, std::memory_order_relaxed);
   const uint64_t blocks_written = XmaContext::blocks_written_.exchange(0, std::memory_order_relaxed);
+  const uint64_t verified_same = XmaContext::verified_same_.exchange(0, std::memory_order_relaxed);
+  const uint64_t verified_different = XmaContext::verified_different_.exchange(0, std::memory_order_relaxed);
   REXLOG_INFO("[xma] on the calling thread, {:.1f} s: kicks {} with {} contexts decoded, {:.1f} ms (max "
               "{:.2f} ms); locks {} with {} contexts, {:.1f} ms waiting (max {:.2f} ms)",
               double(now - last) / 1000.0, kicks, kick_contexts, double(kick_ns) / 1e6, double(kick_max) / 1e6,
@@ -316,8 +318,9 @@ void ReportXma() {
               latency_n ? double(latency_ns) / double(latency_n) / 1e3 : 0.0, double(latency_max) / 1e6,
               latency_n);
   REXLOG_INFO("[xma] frames decoded {}, quiet {}; output blocks {}; codec reopens {}; quiet contexts served on the "
-              "kick {} ({} looping forever)",
-              frames_decoded, frames_quiet, blocks_written, reopens, quiet_inline, quiet_looping);
+              "kick {} ({} looping forever); frames after a flush same as a fresh decoder {}, different {}",
+              frames_decoded, frames_quiet, blocks_written, reopens, quiet_inline, quiet_looping, verified_same,
+              verified_different);
 }
 
 }  // namespace

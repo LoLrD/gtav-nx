@@ -253,6 +253,8 @@ class XmaContext {
   static inline std::atomic<uint64_t> frames_quiet_{0};
   static inline std::atomic<uint64_t> reopens_{0};
   static inline std::atomic<uint64_t> blocks_written_{0};
+  static inline std::atomic<uint64_t> verified_same_{0};
+  static inline std::atomic<uint64_t> verified_different_{0};
 
   bool is_quiet() const { return quiet_.load(std::memory_order_relaxed); }
   void set_quiet(bool quiet) { quiet_.store(quiet, std::memory_order_relaxed); }
@@ -293,6 +295,8 @@ class XmaContext {
   int PrepareDecoder(int sample_rate, bool is_two_channel);
   void PreparePacket(uint32_t frame_size, uint32_t frame_padding);
   bool DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet, AVFrame* av_frame);
+  void VerifyNextFrames();
+  void VerifyFlush();
 
   void StoreContextMerged(const XMA_CONTEXT_DATA& data, const XMA_CONTEXT_DATA& initial_data,
                           uint8_t* context_ptr);
@@ -343,6 +347,9 @@ class XmaContext {
   std::array<AVCodecContext*, 1> spare_contexts_{};  // ~450 KB each (8 channels of output)
   uint32_t next_spare_ = 0;
   AVFrame* av_frame_ = nullptr;
+  AVCodecContext* verify_context_ = nullptr;
+  AVFrame* verify_frame_ = nullptr;
+  uint8_t verify_frames_ = 0;
 
   // Packet data buffer (two packets worth for split frame handling)
   std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;

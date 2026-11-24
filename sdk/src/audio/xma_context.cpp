@@ -321,6 +321,10 @@ REXCVAR_DEFINE_BOOL(xma_direct_decode, false, "Audio",
                     "Decode each XMA frame with the codec's decode callback instead of avcodec_send_packet / "
                     "avcodec_receive_frame: same samples, without the per-frame packet reference, bitstream filter "
                     "and skip-samples side data allocations");
+REXCVAR_DEFINE_BOOL(xma_verify_flush, false, "Audio",
+                    "Diagnostic: the first 4 frames after a decoder flush (xma_flush_streams, or a context that was "
+                    "kicked quiet) are also decoded by a freshly opened decoder and compared bit for bit ([xma] "
+                    "report line)");
 REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
 REXCVAR_DEFINE_BOOL(xma_persistent_enable, false, "Audio",
                     "XMA contexts stay enabled until the game disables them (as the hardware does) and decode "
@@ -506,6 +510,8 @@ XmaContext::~XmaContext() {
   if (av_frame_) {
     av_frame_free(&av_frame_);
   }
+  if (verify_context_) avcodec_free_context(&verify_context_);
+  if (verify_frame_) av_frame_free(&verify_frame_);
 }
 
 int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
@@ -951,6 +957,7 @@ void XmaContext::ResetDecoderState() {
   if (av_context_ && av_context_->sample_rate) {
     if (REXCVAR_GET(xma_flush_streams)) {
       avcodec_flush_buffers(av_context_);
+      VerifyNextFrames();
     } else {  // makes PrepareDecoder reopen the codec on the next decode
       av_context_->sample_rate = 0;
       av_context_->channels = 0;
@@ -1485,6 +1492,29 @@ bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_pac
   return true;
 }
 
+void XmaContext::VerifyNextFrames() {
+  if (verify_context_) avcodec_free_context(&verify_context_);
+  verify_frames_ = REXCVAR_GET(xma_verify_flush) ? 4 : 0;
+}
+
+void XmaContext::VerifyFlush() {
+  --verify_frames_;
+  if (!verify_context_) {
+    verify_context_ = avcodec_alloc_context3(av_codec_);
+    verify_context_->sample_rate = av_context_->sample_rate;
+    verify_context_->channels = av_context_->channels;
+    verify_context_->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    avcodec_open2(verify_context_, av_codec_, nullptr);
+    if (!verify_frame_) verify_frame_ = av_frame_alloc();
+  }
+  bool same = DecodePacket(verify_context_, av_packet_, verify_frame_) &&
+              verify_frame_->nb_samples == av_frame_->nb_samples;
+  for (int c = 0; same && c < av_context_->channels; ++c)
+    same = !std::memcmp(verify_frame_->data[c], av_frame_->data[c], size_t(av_frame_->nb_samples) * sizeof(float));
+  (same ? verified_same_ : verified_different_).fetch_add(1, std::memory_order_relaxed);
+  if (!verify_frames_) avcodec_free_context(&verify_context_);
+}
+
 void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   SCOPE_profile_cpu_f("apu");
 
@@ -1643,7 +1673,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     }
     if (prepared == 1) reopens_.fetch_add(1, std::memory_order_relaxed);
     if (decoder_stale_) {
-      if (prepared == 0) avcodec_flush_buffers(av_context_);
+      if (prepared == 0) {
+        avcodec_flush_buffers(av_context_);
+        VerifyNextFrames();
+      }
     } else if (prepared == 1) {
       // Reopening the codec restarts its output; the carried tail belongs to the
       // old stream.
@@ -1653,6 +1686,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     PreparePacket(packet_info.current_frame_size_, padding_start);
     decoded = DecodePacket(av_context_, av_packet_, av_frame_);
     frames_decoded_.fetch_add(1, std::memory_order_relaxed);
+    if (verify_frames_ && decoded) VerifyFlush();
     if (REXCVAR_GET(xma_trace_buffers) && dumped_ptr_ && traced_frames_ < 2000 &&
         data->GetCurrentInputBufferAddress() == dumped_ptr_) {
       ++traced_frames_;
