@@ -254,7 +254,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_light_fill_reuse, false, "GTAV",
                     "Native renderer, with --gtav_light_shadow_draws=false: a local light shadow face that is only "
                     "its fill quad and a resolve into a texture that already holds that fill keeps the texture "
-                    "(no draw, no copy)");
+                    "(no copy; the quad itself is skipped too when it writes neither depth nor stencil)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -1482,6 +1482,7 @@ struct ResolvedTexture {
   bool render_target = false;
   bool depth_copy = false;  // R32F copy of a depth resolve (only for depth-format fetches)
   bool light_fill = false;
+  uint64_t fill_sig = 0;
   uint32_t fill_rect[6] = {};
   float scale = 1.0f;       // of the source target: the texture is width * scale by height * scale
   uint64_t serial = 0;  // last write order
@@ -2254,8 +2255,18 @@ struct Backend::Impl {
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
   uint32_t stat_early = 0, stat_silent = 0, stat_fills_reused = 0;
-  bool fill_resolve_next = false;
+  bool fill_resolve_next = false, fill_drawn = false, fill_sig_valid = false;
+  uint64_t fill_sig = 0;
   const DrawCommand* skipped_fill = nullptr;
+
+  static uint64_t FillSignature(const FramePacket& f, const DrawCommand& d) {
+    uint64_t h = Hash(&d.vs_hash, sizeof(d.vs_hash), d.ps_hash);
+    h = Hash(f.At(d.inline_vertices), d.inline_size, h);
+    h = Hash(f.At(d.regs), kRegShadowSize, h);
+    if (d.ps_use)
+      for (const auto& run : d.ps_use->runs) h = Hash(f.At(d.ps_consts) + 16 * run.first, 16 * run.count, h);
+    return h;
+  }
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -4675,8 +4686,13 @@ struct Backend::Impl {
     // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
     // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
     if (d.light_fill && d.is_inline && fill_resolve_next && !dumping && REXCVAR_GET(gtav_native_light_fill_reuse)) {
-      skipped_fill = &d;
-      return false;
+      fill_sig = FillSignature(f, d);
+      fill_sig_valid = true;
+      if (!DepthStencilWrites(r, regs::Read(r, regs::RB_DEPTHCONTROL))) {
+        skipped_fill = &d;
+        return false;
+      }
+      fill_drawn = true;
     }
     if (d.vs_hash == 0x5A4385B7FE6CD154ull &&
         ((d.ps_hash == 0xF1490AFF1455E54Full && REXCVAR_GET(gtav_native_skip_depth_restore)) ||
@@ -6567,17 +6583,21 @@ struct Backend::Impl {
     }
     const uint32_t fill_rect[6] = {x1, y1, x2, y2, px, py};
     const bool fill = rc.light_fill && !depth_resolve && !(rc.flags & 0x300) && !src->msaa;
-    if (const DrawCommand* skipped = std::exchange(skipped_fill, nullptr)) {
-      if (fill && dst.light_fill && std::equal(fill_rect, fill_rect + 6, dst.fill_rect)) {
-        stat_fills_reused++;
-        Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
-        if (writeback_resolves) QueueWriteback(list, dst, base);
-        return;
-      }
+    const DrawCommand* skipped = std::exchange(skipped_fill, nullptr);
+    const bool drawn = std::exchange(fill_drawn, false), signed_fill = std::exchange(fill_sig_valid, false);
+    if ((skipped || drawn) && fill && dst.light_fill && dst.fill_sig == fill_sig &&
+        std::equal(fill_rect, fill_rect + 6, dst.fill_rect)) {
+      stat_fills_reused++;
+      Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
+      if (writeback_resolves) QueueWriteback(list, dst, base);
+      return;
+    }
+    if (skipped) {
       fill_resolve_next = false;
       Draw(list, f, *skipped);
     }
-    dst.light_fill = fill;
+    dst.light_fill = fill && signed_fill;
+    dst.fill_sig = fill_sig;
     std::copy(fill_rect, fill_rect + 6, dst.fill_rect);
     if (dumping && !depth_resolve) DumpTarget(list, src, 8 + source);  // the source as the copy sees it
     if (seqdiag)
@@ -6766,6 +6786,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
   s.stat_early = s.stat_silent = s.stat_fills_reused = 0;
   s.skipped_fill = nullptr;
+  s.fill_drawn = s.fill_sig_valid = false;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
