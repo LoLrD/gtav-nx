@@ -61,6 +61,7 @@ REX_HOOK_RAW(sub_832BA500) {
 REX_EXTERN(__imp__sub_83811030);
 REX_HOOK_RAW(sub_83811030) {
   gtav::RenderTrace('D', ctx, base);
+  if (gtav::SkipDraw(base, ctx.r3.u32)) return;
   StatCount(kStatDrawIndexed);
   OnDrawIndexed(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
   uint32_t device = ctx.r3.u32;
@@ -72,6 +73,7 @@ REX_HOOK_RAW(sub_83811030) {
 REX_EXTERN(__imp__sub_83810C18);
 REX_HOOK_RAW(sub_83810C18) {
   gtav::RenderTrace('d', ctx, base);
+  if (gtav::SkipDraw(base, ctx.r3.u32)) return;
   StatCount(kStatDraw);
   OnDraw(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
   __imp__sub_83810C18(ctx, base);

@@ -12,6 +12,7 @@
 #endif
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +33,10 @@ REXCVAR_DEFINE_INT32(gtav_reflection_every, 1, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_light_shadow_every, 1, "GTAV",
                      "Render a local light's shadow map at most every Nth frame, the lights in turn (1 = game, "
                      "0 = never)");
+REXCVAR_DEFINE_BOOL(gtav_light_shadow_draws, true, "GTAV",
+                    "Draw objects into the local light shadow maps (off: the maps are still cleared, lights unshadowed)");
+REXCVAR_DEFINE_BOOL(gtav_reflection_draws, true, "GTAV",
+                    "Draw objects into the paraboloid reflection map (off: the map is still cleared, no environment reflections)");
 REXCVAR_DEFINE_BOOL(gtav_minimap, true, "GTAV", "Draw the minimap (off: no radar at all)");
 REXCVAR_DEFINE_BOOL(gtav_scene_fog_meshes, true, "GTAV",
                     "Draw the fog-lit forward meshes of the scene pass (callback 8270E2A8, one shader, ~65 draws "
@@ -60,6 +65,8 @@ namespace {
 constexpr uint32_t kDlFrameBegin = 0x1A;
 constexpr uint32_t kDlFrameEnd = 0x1B;
 constexpr uint32_t kDlParaboloidReflection = 0x0A;
+constexpr uint32_t kDlShadows = 0x0C;
+constexpr float kLightShadowMaxWidth = 256.0f;
 constexpr uint32_t kTlsDrawList = 344;
 constexpr uint32_t kParaboloidShadowIndex = 1072;
 
@@ -83,6 +90,7 @@ double g_dl_ms[256] = {};
 uint64_t g_dl_draws[256] = {};
 uint32_t g_dl_report_frames = 0;
 std::atomic<bool> g_cuts_paused{false};
+uint32_t g_current_dl = 0xFFFFFFFF;
 
 bool Cut() { return !g_cuts_paused.load(std::memory_order_relaxed); }
 
@@ -179,6 +187,13 @@ void ReportDrawListTimes() {
 
 }  // namespace
 
+bool SkipDraw(const uint8_t* base, uint32_t device) {
+  if (!Cut()) return false;
+  if (g_current_dl == kDlShadows && !REXCVAR_GET(gtav_light_shadow_draws))
+    return std::bit_cast<float>(Be32(base + device + native::d3d::kDevViewport + 8)) <= kLightShadowMaxWidth;
+  return g_current_dl == kDlParaboloidReflection && !REXCVAR_GET(gtav_reflection_draws);
+}
+
 void RenderTrace(char kind, PPCContext& ctx, uint8_t* base) {
   if (kind != 'C' && kind != 'R') g_draw_calls++;
   const int32_t at = REXCVAR_GET(gtav_render_trace);
@@ -232,13 +247,16 @@ REX_HOOK_RAW(sub_835F7E68) {
     ctx.r3.u64 = 1;
     return;
   }
+  gtav::g_current_dl = type;
   if (!REXCVAR_GET(gtav_render_dl_times)) {
     __imp__sub_835F7E68(ctx, base);
+    gtav::g_current_dl = 0xFFFFFFFF;
     return;
   }
   const auto start = std::chrono::steady_clock::now();
   const uint64_t draws = gtav::g_draw_calls;
   __imp__sub_835F7E68(ctx, base);
+  gtav::g_current_dl = 0xFFFFFFFF;
   gtav::g_dl_ms[type] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   gtav::g_dl_draws[type] += gtav::g_draw_calls - draws;
   if (type == gtav::kDlFrameEnd && ++gtav::g_dl_report_frames == 300) gtav::ReportDrawListTimes();
