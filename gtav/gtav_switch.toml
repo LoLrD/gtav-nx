@@ -49,3 +49,5 @@ gtav_script_every = 4
 gtav_script_throttle = "shop_controller,vehicle_gen_controller,building_controller,stats_controller,mp_registration,randomchar_controller,tuneables_processing"
 gtav_physics_max_step = 0.034
 gtav_native_pass_gpu_times = true
+gtav_native_fsr = true
+gtav_native_fsr_sharpness = 0.25
