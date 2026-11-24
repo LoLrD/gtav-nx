@@ -281,6 +281,7 @@ struct Fn {
   std::string name;
   size_t bodyIndex = 0;
   bool eligible = false;
+  bool hooked = false;
   int n = 0;  // statements including the synthetic return
   std::vector<uint8_t> kind;
   std::vector<uint32_t> use, dfull, dpart;
@@ -321,7 +322,8 @@ struct Pass {
   explicit Pass(const ArgsInRegistersOptions& o) : opt(o) {}
 
   int Callee(const Fn& f, int i) const { return f.callee[i]; }
-  bool IsFast(int g) const { return g >= 0 && fns[g].eligible; }
+  bool IsFast(int g) const { return g >= 0 && fns[g].eligible && !fns[g].hooked; }
+  bool IsHooked(int g) const { return g >= 0 && fns[g].eligible && fns[g].hooked; }
 };
 
 // ------------------------------------------------------------------------------------------ parsing
@@ -379,7 +381,8 @@ bool ParseFunction(Pass& P, Fn& f, std::string_view text, bool excluded) {
   int n = static_cast<int>(stmts.size());
   std::vector<std::string_view> target(n), callName(n);
   f.kind.assign(n, kPlain);
-  bool ineligible = excluded;
+  bool ineligible = false;
+  f.hooked = excluded;
   for (int i = 0; i < n; ++i) {
     f.kind[i] = Classify(stmts[i].text, target[i], callName[i]);
     if (f.kind[i] == kPlain) {
@@ -716,6 +719,14 @@ void Evaluate(Pass& P, int fi, EvalResult& r, bool direct) {
   }
   std::map<int, uint32_t> dem;
   for (int i = 0; i < n; ++i) {
+    if (static_cast<Kind>(f.kind[i]) == kCallF && P.IsHooked(f.callee[i])) {
+      uint32_t la = 0;
+      for (uint32_t e = f.succOff[i]; e < f.succOff[i + 1]; ++e)
+        la |= A[f.succ[e]];
+      if (uint32_t m = la & P.S[f.callee[i]].dany)
+        dem[f.callee[i]] |= m;
+      continue;
+    }
     const Summary* G = gs[i];
     if (!G)
       continue;
@@ -1122,7 +1133,7 @@ void ApplyArgsInRegisters(const std::vector<std::string>& names, std::vector<std
   }
   // ineligible functions: TEMP registers their legacy body reads
   for (size_t fi = 0; fi < P.fns.size(); ++fi)
-    if (!P.fns[fi].eligible) {
+    if (!P.fns[fi].eligible || P.fns[fi].hooked) {
       uint32_t m = 0;
       for (int i = 0; i < P.fns[fi].n; ++i)
         m |= P.fns[fi].use[i];
