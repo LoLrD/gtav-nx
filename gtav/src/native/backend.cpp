@@ -5884,7 +5884,9 @@ struct Backend::Impl {
                         uint64_t gpu) {
     InvalidateDrawState();
     Transition(list, r.texture.get(), RenderTextureLayout::SHADER_READ);
-    list->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(buffer, RenderBufferAccess::WRITE));
+    list->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COMPUTE | RenderBarrierStage::COPY,
+                   RenderBufferBarrier(buffer, RenderBufferAccess::WRITE),
+                   RenderTextureBarrier(r.texture.get(), RenderTextureLayout::SHADER_READ));
     pass_end = "writeback compute";
     list->setFramebuffer(nullptr);
     PassStamp(list, "writeback compute");
