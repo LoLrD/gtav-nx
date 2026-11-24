@@ -37,7 +37,8 @@ namespace rex::codegen {
 
 struct ArgsInRegistersOptions {
   /// Functions that keep the old ABI because something else replaces them (hooks), by emitted name
-  /// (sub_82XXXXXX). Direct calls to them stay `name(ctx, base)`.
+  /// (sub_82XXXXXX). Direct calls to them stay `name(ctx, base)`; their own body still becomes one
+  /// body that takes its arguments from ctx.
   std::unordered_set<std::string> excluded;
   /// Emit ME_ARGS_COUNT(name, kind) at every entry (call counters for validation builds).
   bool instrument = false;
