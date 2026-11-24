@@ -17,6 +17,7 @@ sdk/thirdparty/FFmpeg/*
 sdk/thirdparty/FFmpeg/libavcodec/*
 !sdk/thirdparty/FFmpeg/libavcodec/fft_template.c
 !sdk/thirdparty/FFmpeg/libavcodec/mdct_template.c
+!sdk/thirdparty/FFmpeg/libavcodec/wmaprodec.c
 !sdk/thirdparty/ffmpeg-overlay/
 sdk/thirdparty/ffmpeg-overlay/*
 !sdk/thirdparty/ffmpeg-overlay/codec_list.c

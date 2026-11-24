@@ -191,8 +191,11 @@ void XThread::set_last_error(uint32_t error_code) {
   guest_object<X_KTHREAD>()->last_error = error_code;
 }
 
+static std::mutex g_thread_name_mutex;
+
 void XThread::set_name(const std::string_view name) {
   std::lock_guard<std::mutex> lock(thread_lock_);
+  std::lock_guard<std::mutex> names(g_thread_name_mutex);
   thread_name_ = fmt::format("{} ({:08X})", name, handle());
 
   if (thread_) {
@@ -482,7 +485,12 @@ X_STATUS XThread::Create() {
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
 #if REX_PLATFORM_SWITCH
-    RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
+    std::string start_name;
+    {
+      std::lock_guard<std::mutex> names(g_thread_name_mutex);
+      start_name = thread_name_;
+    }
+    RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, start_name));
     if (guest_thread_) {
       RexSwitchPerfSetCurrentGuestEntry(creation_params_.start_address, creation_params_.start_context);
     }
@@ -493,7 +501,10 @@ X_STATUS XThread::Create() {
     rex::thread::set_current_thread_id(handle());
 
     // Set name immediately, if we have one.
-    thread_->set_name(thread_name_);
+    {
+      std::lock_guard<std::mutex> names(g_thread_name_mutex);
+      thread_->set_name(thread_name_);
+    }
 
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();

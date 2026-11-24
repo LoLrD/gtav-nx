@@ -77,6 +77,7 @@ set(GTAV_SOURCES
     src/frame_limit.cpp
     src/wait_profile.cpp
     src/gpu_fence_wait.cpp
+    src/guest_irq_lock.cpp
     src/native_rewrites.cpp
     src/linux_threads.cpp
     src/native/stats.cpp
@@ -497,6 +498,15 @@ endif()
 
 # Bug reports name the build (bug_report.cpp).
 set_source_files_properties(src/bug_report.cpp PROPERTIES COMPILE_DEFINITIONS "GTAV_BUILD_ID=\"${GTAV_BUILD_ID}\"")
+
+if(REXGLUE_PLATFORM_SWITCH)
+    option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" OFF)
+else()
+    option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" ON)
+endif()
+if(GTAV_D3D_PROBES)
+    target_compile_definitions(gtav PRIVATE GTAV_D3D_PROBES=1)
+endif()
 
 if(REXGLUE_PLATFORM_SWITCH)
     target_compile_definitions(gtav PRIVATE GTAV_SWITCH=1)
