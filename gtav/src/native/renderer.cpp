@@ -988,7 +988,8 @@ class Renderer {
     // ~2 s) run on a background thread. The pipeline cache is internally synchronized: the compile
     // workers already create pipelines against it from several threads at once.
     if (cache_writing_.exchange(true)) return;  // the previous save is still being written
-    std::thread([this] {
+    if (cache_saver_.joinable()) cache_saver_.join();
+    cache_saver_ = std::thread([this] {
       auto get_start = std::chrono::steady_clock::now();
       std::vector<uint8_t> data = plume::GetVulkanPipelineCacheData(device_.get());
       double get_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - get_start).count();
@@ -1009,9 +1010,10 @@ class Renderer {
       REXLOG_INFO("[native] pipeline cache saved: {} KB (get {:.0f} ms, write {:.0f} ms)", data.size() / 1024, get_ms,
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
       cache_writing_ = false;
-    }).detach();
+    });
   }
   std::atomic<bool> cache_writing_{false};
+  std::thread cache_saver_;
 
   // Waits for the slot's previous frame and recycles what it left behind.
   void Retire(uint32_t slot) {
