@@ -397,6 +397,33 @@ void FollowMode(bool effective_docked, bool docked_real) {
   }
 }
 
+void Raise(uint32_t cpu_mhz, uint32_t gpu_mhz, uint32_t mem_mhz) {
+  if (!Open()) {
+    return;
+  }
+  const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+  constexpr uint32_t kStockMhz[2][kModules] = {{1020u, 460u, 1331u}, {1020u, 768u, 1600u}};
+  uint32_t profile[kModules];
+  ReadProfile(docked ? kDockedProfile : kHandheldProfile, profile);
+  const uint32_t wanted[kModules] = {cpu_mhz, gpu_mhz, mem_mhz};
+  uint32_t applied[kModules] = {0, 0, 0};
+  for (unsigned m = 0; m < kModules; ++m) {
+    const uint32_t current = profile[m] ? profile[m] : kStockMhz[docked][m];
+    if (wanted[m] > current && R_SUCCEEDED(PutOverride(m, wanted[m] * 1000000u))) {
+      g_set[m] = true;
+      applied[m] = wanted[m];
+    }
+  }
+  std::fprintf(stderr, "[clocks] raised (%s): CPU %u MHz, GPU %u MHz, memory %u MHz (0 = untouched)\n",
+               docked ? "docked" : "handheld", applied[0], applied[1], applied[2]);
+}
+
+void Release() {
+  if (g_open) {
+    Drop();
+  }
+}
+
 void Enable(bool enabled) {
   g_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
   if (!enabled && g_applied) {

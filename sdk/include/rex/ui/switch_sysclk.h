@@ -27,10 +27,19 @@ void FollowMode(bool effective_docked, bool docked_real);
 // Turns all of this on or off (the game passes it from its cvar). Turning it off releases the clocks.
 void Enable(bool enabled);
 
+// Overrides each clock that is above both this mode's profile column and the stock clock; 0 leaves it
+// alone. Released when the game exits cleanly.
+void Raise(uint32_t cpu_mhz, uint32_t gpu_mhz, uint32_t mem_mhz);
+
+// Releases every clock set from here. libnx never runs static destructors, so a title calls it on exit.
+void Release();
+
 #else
 
 inline void FollowMode(bool, bool) {}
 inline void Enable(bool) {}
+inline void Raise(uint32_t, uint32_t, uint32_t) {}
+inline void Release() {}
 
 #endif  // REX_PLATFORM_SWITCH
 
