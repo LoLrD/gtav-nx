@@ -45,6 +45,14 @@ namespace plume {
     // Counters for the host renderer's per-frame stats: render passes begun, barrier calls.
     std::atomic<uint32_t> g_statRenderPasses{0}, g_statBarriers{0};  // (lists may be recorded on several threads)
     std::atomic<uint64_t> g_statDeviceMemoryAllocs{0}, g_statDeviceMemoryFrees{0}, g_statDeviceMemoryBytes{0};
+    uint64_t g_preferredBlockSize = 0;
+    uint64_t g_heapSizeOverride = 0;
+    static void VKAPI_PTR getMemoryPropertiesForAllocator(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *properties) {
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, properties);
+        for (uint32_t i = 0; i < properties->memoryHeapCount; i++) {
+            properties->memoryHeaps[i].size = g_heapSizeOverride;
+        }
+    }
     static std::atomic<uint64_t> g_liveMemoryBytes[VK_MAX_MEMORY_TYPES], g_liveMemoryCount[VK_MAX_MEMORY_TYPES];
     static std::atomic<uint64_t> g_dedicatedBytes[VK_MAX_MEMORY_TYPES], g_dedicatedCount[VK_MAX_MEMORY_TYPES];
     static void VKAPI_PTR countDeviceMemoryAllocate(VmaAllocator, uint32_t memoryType, VkDeviceMemory, VkDeviceSize size, void *) {
@@ -4624,7 +4632,7 @@ namespace plume {
         vmaFunctions.vkFreeMemory = vkFreeMemory;
         vmaFunctions.vkGetBufferMemoryRequirements = vkGetBufferMemoryRequirements;
         vmaFunctions.vkGetImageMemoryRequirements = vkGetImageMemoryRequirements;
-        vmaFunctions.vkGetPhysicalDeviceMemoryProperties = vkGetPhysicalDeviceMemoryProperties;
+        vmaFunctions.vkGetPhysicalDeviceMemoryProperties = (g_heapSizeOverride > 0) ? getMemoryPropertiesForAllocator : vkGetPhysicalDeviceMemoryProperties;
         vmaFunctions.vkGetPhysicalDeviceProperties = vkGetPhysicalDeviceProperties;
         vmaFunctions.vkInvalidateMappedMemoryRanges = vkInvalidateMappedMemoryRanges;
         vmaFunctions.vkMapMemory = vkMapMemory;
@@ -4645,6 +4653,9 @@ namespace plume {
         // memory grew in 256 MB steps); smaller blocks leave less unused memory behind.
         allocatorInfo.preferredLargeHeapBlockSize = 32ull << 20;
 #endif
+        if (g_preferredBlockSize > 0) {
+            allocatorInfo.preferredLargeHeapBlockSize = g_preferredBlockSize;
+        }
 
         res = vmaCreateAllocator(&allocatorInfo, &allocator);
         if (res != VK_SUCCESS) {

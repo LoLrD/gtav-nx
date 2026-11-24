@@ -60,6 +60,13 @@
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
+REXCVAR_DEFINE_INT32(gtav_native_vma_block_mb, 0, "GTAV",
+                     "Size of the device memory blocks the allocator shares between resources (0: its default, 256 MB "
+                     "on a heap over 1 GB). On Switch each block is one allocation in the game's malloc heap");
+REXCVAR_DEFINE_INT32(gtav_native_vma_heap_mb, 0, "GTAV",
+                     "Memory heap size the allocator assumes (0: the driver's). Past 80% of it the allocator gives "
+                     "every new resource memory of its own and frees emptied blocks at once; on Switch the driver "
+                     "reports a fraction of the process heap that all GPU and CPU memory shares anyway");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
 #ifdef __ANDROID__
@@ -113,6 +120,8 @@ extern bool g_exactBarrierStages;
 extern bool g_clearLoadOps;
 extern std::atomic<uint32_t> g_statLoadClears, g_statClearsInPass, g_statClearsPartial;
 extern bool g_colorInputAttachments;
+extern uint64_t g_preferredBlockSize;
+extern uint64_t g_heapSizeOverride;
 }
 
 
@@ -846,6 +855,8 @@ class Renderer {
         preferred = name;
     }
     LoadPipelineCache();
+    plume::g_preferredBlockSize = uint64_t(std::max(0, REXCVAR_GET(gtav_native_vma_block_mb))) << 20;
+    plume::g_heapSizeOverride = uint64_t(std::max(0, REXCVAR_GET(gtav_native_vma_heap_mb))) << 20;
     device_ = interface_->createDevice(preferred);
     if (!device_) {
       REXLOG_ERROR("[native] Plume device creation failed");
