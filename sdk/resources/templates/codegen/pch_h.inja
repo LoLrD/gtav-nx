@@ -159,7 +159,7 @@ extern PPCFuncMapping PPCFuncMappings[];
 // displacement folded into the load/store) instead of (u32)(reg + disp). It differs only when reg + disp crosses
 // 2^32, i.e. for a guest access to 0xFFFFxxxx+ or a negative offset from a near-null pointer, which is a guest
 // fault anyway. Platforms with a physical-window offset keep the old form.
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64) || defined(REX_DFORM_JOINED)
 #define REX_LOAD_D_U8(r, d) REX_LOAD_U8((u32)(r) + (d))
 #define REX_LOAD_D_U16(r, d) REX_LOAD_U16((u32)(r) + (d))
 #define REX_LOAD_D_U32(r, d) REX_LOAD_U32((u32)(r) + (d))
