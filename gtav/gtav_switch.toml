@@ -58,3 +58,4 @@ gtav_native_skip_depth_restore_strips = true
 gtav_native_light_fill_reuse = true
 gtav_native_cube_every = 4
 gtav_native_keep_targets = true
+gtav_native_resolve_src_barrier = 1
