@@ -28,6 +28,7 @@
 
 #include "safe_read.h"
 #include "../linux_threads.h"
+#include "../render_cuts.h"
 #ifndef _WIN32
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -760,6 +761,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   d.base_vertex = base_vertex;
   d.start = start;
   d.count = count;
+  d.hud = InHudDrawList();
   // The shaders the device holds, as the draw reads them: the Set*Shader hooks are not the only
   // writers. Outdoors 28 scenery draws a frame (5106-index meshes) bound their pixel shader another
   // way, so the hooked value was a depth pass's null shader and they came out depth-only.
