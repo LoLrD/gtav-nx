@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 
-REXCVAR_DEFINE_BOOL(gtav_audio_diag, false, "GTAV", "Log how often the game's audio mixer and filter run");
+REXCVAR_DEFINE_BOOL(gtav_audio_diag, false, "GTAV", "Log how often the game's audio mixer runs");
+REXCVAR_DEFINE_BOOL(gtav_audio_reverb, true, "GTAV", "Run the game's reverb effect (off: its send buffers are silenced)");
 
 namespace {
 std::atomic<uint64_t> g_mix{0}, g_mix_silent{0};
@@ -41,3 +43,18 @@ REX_HOOK_RAW(sub_831B5F98) {
   ctx.ctr.u64 = 0;
 }
 
+REX_EXTERN(__imp__sub_831FBD48);
+REX_HOOK_RAW(sub_831FBD48) {
+  const uint32_t effect = ctx.r3.u32;
+  uint32_t active;
+  std::memcpy(&active, base + effect + 2416, 4);
+  if (REXCVAR_GET(gtav_audio_reverb) || base[effect + 2428] != 0 || active == 0) {
+    __imp__sub_831FBD48(ctx, base);
+    return;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t buffer;
+    std::memcpy(&buffer, base + ctx.r4.u32 + i * 4, 4);
+    std::memset(base + __builtin_bswap32(buffer), 0, 1024);
+  }
+}
