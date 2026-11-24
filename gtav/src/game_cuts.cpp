@@ -11,13 +11,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
 
+REXCVAR_DEFINE_INT32(gtav_anim_every, 1, "GTAV",
+                     "Animate peds and objects other than the player every Nth frame, with an N-frame step "
+                     "(1 = game)");
 REXCVAR_DEFINE_BOOL(gtav_game_cpu_times, false, "GTAV",
                     "Diagnostic: log the CPU time per frame of the game's main thread systems, worker jobs and "
                     "scripts every 300 frames");
@@ -60,6 +65,8 @@ constexpr const char* kSlotNames[kSlots] = {
     "scan.setup", "scan.jobs", "phys.task", "phys.task2", "glass.task", "glass.task2"};
 
 constexpr uint32_t kReportFrames = 300;
+constexpr uint32_t kPlayerInfo = 0x83AAC7E4;
+constexpr uint32_t kGameTimeStep = 0x83DDDBF4;
 constexpr uint32_t kScriptName = 104;
 
 std::array<std::atomic<uint64_t>, kSlots> g_ns{};
@@ -69,7 +76,40 @@ uint32_t g_frames = 0;
 std::map<uint32_t, uint64_t> g_script_ns;
 std::map<uint32_t, std::string> g_script_names;
 
+uint32_t L32(const uint8_t* base, uint32_t a) {
+  uint32_t v;
+  std::memcpy(&v, base + a, 4);
+  return __builtin_bswap32(v);
+}
+
+void S32(uint8_t* base, uint32_t a, uint32_t v) {
+  v = __builtin_bswap32(v);
+  std::memcpy(base + a, &v, 4);
+}
+
 bool Cut() { return !g_cuts_paused.load(std::memory_order_relaxed); }
+
+uint32_t PlayerPed(const uint8_t* base) {
+  const uint32_t info = L32(base, kPlayerInfo);
+  return info ? L32(base, info + 4) : 0;
+}
+
+void AnimateTimesliced(PPCContext& ctx, uint8_t* base, PPCFunc* original) {
+  const int32_t every = REXCVAR_GET(gtav_anim_every);
+  const uint32_t entity = ctx.r3.u32;
+  if (every <= 1 || !Cut() || entity == PlayerPed(base)) {
+    original(ctx, base);
+    return;
+  }
+  if ((g_frames + ((entity * 0x9E3779B1u) >> 24)) % uint32_t(every)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  const uint32_t step = L32(base, kGameTimeStep);
+  S32(base, kGameTimeStep, std::bit_cast<uint32_t>(std::bit_cast<float>(step) * float(every)));
+  original(ctx, base);
+  S32(base, kGameTimeStep, step);
+}
 
 uint64_t ThreadNs() {
 #ifdef GTAV_GAME_CPU_CLOCK
@@ -145,6 +185,10 @@ void Report() {
     __imp__sub_##address(ctx, base);   \
   }
 
+#define GTAV_ANIM_HOOK(address)                                \
+  REX_EXTERN(__imp__sub_##address);                            \
+  REX_HOOK_RAW(sub_##address) { gtav::AnimateTimesliced(ctx, base, __imp__sub_##address); }
+
 GTAV_TIMED_HOOK(8283E9A0, kWorld)
 GTAV_TIMED_HOOK(8282C548, kEntities)
 GTAV_TIMED_HOOK(8293B258, kScripts)
@@ -166,6 +210,11 @@ GTAV_TIMED_HOOK(833CE9D0, kPhysicsTask)
 GTAV_TIMED_HOOK(833CB750, kPhysicsTask2)
 GTAV_TIMED_HOOK(8316BFA8, kGlassTask)
 GTAV_TIMED_HOOK(831618C0, kGlassTask2)
+
+GTAV_ANIM_HOOK(8280FDA0)
+GTAV_ANIM_HOOK(827DDE80)
+GTAV_ANIM_HOOK(827DDEE8)
+GTAV_ANIM_HOOK(82791F00)
 
 REX_EXTERN(__imp__sub_82927BE0);
 REX_HOOK_RAW(sub_82927BE0) {
