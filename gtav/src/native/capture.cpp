@@ -12,6 +12,7 @@
 #include "paths.h"
 #include "renderer.h"
 #include "shaders.h"
+#include "stats.h"
 #include "xenos_regs.h"
 
 #include <unordered_map>
@@ -752,6 +753,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   const uint8_t* dev = Guest(device);
   const uint32_t index = uint32_t(g_packet.draws.size());
+  if (!index) TimelineMark(kTlGameDraw, GuestFrame());
   DrawCommand& d = g_packet.draws.emplace_back();
   d.indexed = indexed;
   d.primitive = primitive;
@@ -1320,7 +1322,9 @@ void OnCaptureSwap(uint32_t device, uint32_t front_buffer) {
       max_bytes = max_draws = 0;
     }
   }
+  TimelineMark(kTlGameSwap, frame);
   Submit(std::move(g_packet));
+  TimelineMark(kTlGameSubmitted, frame);
   g_packet = TakeSpare();
 }
 

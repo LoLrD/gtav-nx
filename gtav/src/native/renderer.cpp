@@ -11,6 +11,7 @@
 #include "controls.h"
 #include "paths.h"
 #include "shader_compiler.h"
+#include "stats.h"
 
 #include <plume_render_interface.h>
 
@@ -217,6 +218,7 @@ class Renderer {
       index = guest_swaps_.front();
       guest_swaps_.pop_front();
     }
+    TimelineMark(kTlCpSwap, index);
     auto start = std::chrono::steady_clock::now();
     bool waited = false, timed_out = false;
     {
@@ -228,6 +230,7 @@ class Renderer {
                                            [&] { return recorded_through_ > index; });
       }
     }
+    TimelineMark(kTlCpSwapDone, index);
     auto& st = swap_wait_stats_;
     st.swaps++;
     if (waited) {
@@ -1468,6 +1471,7 @@ class Renderer {
         !REXCVAR_GET(gtav_native_flicker_catch) && !REXCVAR_GET(gtav_native_replay) && !key_replay_.load()) {
       FenceCopiesRecorded(frame.index);
       FenceReleaseBefore(frame.end_fence);
+      TimelineMark(kTlRecordEnd, frame.index);
       fence_released_ = frame.index + 1;
     }
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
@@ -1801,6 +1805,7 @@ class Renderer {
       space_cv_.notify_one();
       render_frame_ = frame.index;
       render_state_ = 1;  // recording + presenting
+      TimelineMark(kTlRecordBegin, frame.index);
       ApplyFenceCopies(frame);
       Validate(frame);
       AbStep(presented);
@@ -1809,7 +1814,9 @@ class Renderer {
       if (fence_released_ != frame.index + 1) {
         FenceCopiesRecorded(frame.index);
         FenceReleaseBefore(frame.end_fence);
+        TimelineMark(kTlRecordEnd, frame.index);
       }
+      TimelineMark(kTlPresented, frame.index);
       render_state_ = 2;
       {
         std::lock_guard lock(recorded_mutex_);
