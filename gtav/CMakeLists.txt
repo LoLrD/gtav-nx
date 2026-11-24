@@ -70,6 +70,7 @@ set(GTAV_SOURCES
     src/pc_controls.cpp
     src/audio_diag.cpp
     src/render_cuts.cpp
+    src/audio_cuts.cpp
     src/bug_report.cpp
     src/frame_limit.cpp
     src/wait_profile.cpp
