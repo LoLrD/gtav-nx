@@ -18,6 +18,9 @@
 #include <rex/runtime.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if defined(__SWITCH__)
+#include "switch_compat.h"
+#endif
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -83,6 +86,9 @@ class GtavApp : public rex::ReXApp {
       gtav::native::menu::SetNotice("The game crashed last time. A bug report was saved:\n" + report +
                                         "\nAttach it to a GitHub issue (F1 > Create bug report makes a new one).",
                                     30.0);
+#if defined(__SWITCH__)
+    gtav::switch_compat::ApplyPresentInterval();
+#endif
 #if !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IPHONE)
     gtav::StartVehicleContextPoll();  // keyboard/mouse: on-foot or vehicle layout (PC controls)
 #endif
