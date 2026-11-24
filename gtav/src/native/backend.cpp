@@ -238,6 +238,11 @@ REXCVAR_DEFINE_BOOL(gtav_native_depth_zcull, false, "GTAV",
                     "Native renderer: depth targets without transfer-destination usage, cleared in a render pass "
                     "when created, so NVK gives them a ZCULL plane (hidden pixels rejected before shading); "
                     "read when a depth target is created");
+REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
+                     "Native renderer: depth/stencil tests before the pixel shader (same images, hidden pixels are "
+                     "not shaded): 1 = draws whose pixel shader can kill pixels and that write neither depth nor "
+                     "stencil, 2 = also every draw whose pixel shader cannot kill (no texkill, alpha test or "
+                     "alpha-to-mask)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -970,12 +975,44 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 // --gtav_native_render_scale: pipelines drawing into scaled targets carry this spec bit (it also
 // keys them apart) and get spec constant 1 = 1 / scale, which the shaders' vPos is multiplied by.
 constexpr uint32_t kSpecScaled = 1u << 8;
+constexpr uint32_t kSpecEarlyTests = 1u << 9;
 float g_pixel_scale_inv = 1.0f;
 uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
-  out[0] = RenderSpecConstant(0, spec);
+  out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
   if (!(spec & kSpecScaled)) return 1;
   out[1] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
   return 2;
+}
+
+std::vector<uint8_t> EarlyFragmentTestsSpirv(const std::vector<uint8_t>& data) {
+  constexpr uint32_t kOpEntryPoint = 15, kOpExecutionMode = 16, kOpDecorate = 71, kOpMemberDecorate = 72;
+  constexpr uint32_t kFragment = 4, kEarlyFragmentTests = 9, kDepthReplacing = 12, kBuiltIn = 11, kFragDepth = 22;
+  const size_t n = data.size() / 4;
+  if (n < 5) return {};
+  std::vector<uint32_t> words(n);
+  std::memcpy(words.data(), data.data(), n * 4);
+  uint32_t entry = 0;
+  size_t insert_at = 0;
+  for (size_t at = 5; at < n;) {
+    const uint32_t count = words[at] >> 16, op = words[at] & 0xFFFF;
+    if (!count || at + count > n) return {};
+    if (op == kOpEntryPoint && count >= 3 && words[at + 1] == kFragment) {
+      entry = words[at + 2];
+      insert_at = at + count;
+    } else if (op == kOpExecutionMode && count >= 3) {
+      if (words[at + 2] == kDepthReplacing || words[at + 2] == kEarlyFragmentTests) return {};
+      insert_at = at + count;
+    } else if ((op == kOpDecorate && count >= 4 && words[at + 2] == kBuiltIn && words[at + 3] == kFragDepth) ||
+               (op == kOpMemberDecorate && count >= 5 && words[at + 3] == kBuiltIn && words[at + 4] == kFragDepth)) {
+      return {};
+    }
+    at += count;
+  }
+  if (!entry) return {};
+  words.insert(words.begin() + ptrdiff_t(insert_at), {3u << 16 | kOpExecutionMode, entry, kEarlyFragmentTests});
+  std::vector<uint8_t> out(words.size() * 4);
+  std::memcpy(out.data(), words.data(), out.size());
+  return out;
 }
 
 struct PipelineJob {
@@ -1242,24 +1279,27 @@ class PipelineWarmer {
     std::unique_ptr<RenderPipeline> result;
   };
 
-  const RenderShader* LoadShader(uint64_t hash, bool pixel) {
+  const RenderShader* LoadShader(uint64_t hash, bool pixel, bool early = false) {
     if (!hash) return nullptr;
     std::string name = fmt::format("{}_{:016X}.spv", pixel ? "ps" : "vs", hash);
+    const std::string key = early ? name + "#early" : name;
     {
       std::lock_guard lock(shader_mutex_);
-      if (auto it = shaders_.find(name); it != shaders_.end()) return it->second.get();
+      if (auto it = shaders_.find(key); it != shaders_.end()) return it->second.get();
     }
     std::unique_ptr<RenderShader> shader;
     if (FILE* f = std::fopen((spirv_dir_ + "/" + name).c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
       std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
       std::fseek(f, 0, SEEK_SET);
-      if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size())
-        shader = device_->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+      if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size()) {
+        if (early) data = EarlyFragmentTestsSpirv(data);
+        if (!data.empty()) shader = device_->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+      }
       std::fclose(f);
     }
     std::lock_guard lock(shader_mutex_);
-    auto& slot = shaders_[name];
+    auto& slot = shaders_[key];
     if (!slot) slot = std::move(shader);
     return slot.get();
   }
@@ -1290,7 +1330,7 @@ class PipelineWarmer {
       }
       std::unique_ptr<RenderPipeline> pipeline;
       const RenderShader* vs = LoadShader(rec->vs, false);
-      const RenderShader* ps = LoadShader(rec->ps, true);
+      const RenderShader* ps = LoadShader(rec->ps, true, spec.value & kSpecEarlyTests);
       if (io.ok && vs && (ps || !rec->ps) && (!has_gs || gs_)) {
         desc.pipelineLayout = layout_;
         desc.vertexShader = vs;
@@ -2199,6 +2239,7 @@ struct Backend::Impl {
 
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
+  uint32_t stat_early = 0;
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -2894,6 +2935,46 @@ struct Backend::Impl {
       }
     }
     return (shaders[key] = std::move(shader)).get();
+  }
+
+  std::unordered_map<uint64_t, std::unique_ptr<RenderShader>> early_shaders;
+  RenderShader* EarlyShader(uint64_t hash) {
+    auto [it, inserted] = early_shaders.try_emplace(hash);
+    if (!inserted) return it->second.get();
+    std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
+    if (dir.empty()) dir = DefaultSpirvDir();
+    if (FILE* f = std::fopen(fmt::format("{}/ps_{:016X}.spv", dir, hash).c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
+      std::fseek(f, 0, SEEK_SET);
+      const bool read = !data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size();
+      std::fclose(f);
+      if (read) data = EarlyFragmentTestsSpirv(data);
+      if (read && !data.empty())
+        it->second = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+    }
+    return it->second.get();
+  }
+
+  static bool DepthStencilWrites(const uint8_t* r, uint32_t dc) {
+    if ((dc & 2) && (dc & 4)) return true;
+    if (!(dc & 1) || !((regs::Read(r, regs::RB_STENCILREFMASK) >> 16) & 0xFF)) return false;
+    const bool front = ((dc >> 11) & 7) || ((dc >> 14) & 7) || ((dc >> 17) & 7);
+    const bool back = (dc & 0x80) && (((dc >> 23) & 7) || ((dc >> 26) & 7) || ((dc >> 29) & 7));
+    return front || back;
+  }
+
+  bool EarlyTests(const uint8_t* r, const DrawCommand& d, const RenderTarget* depth, uint32_t spec,
+                  uint32_t alpha_to_mask) const {
+    const int32_t mode = REXCVAR_GET(gtav_native_early_depth_tests);
+    if (mode <= 0 || !depth || active_query >= 0 || dumping || !d.ps_use || d.ps_use->writes_depth ||
+        d.ps_use->memexport || TileOverride(d.ps_hash))
+      return false;
+    const uint32_t dc = regs::Read(r, regs::RB_DEPTHCONTROL);
+    if (!(dc & 3)) return false;
+    const bool kills = d.ps_use->kills || (spec & 2) || alpha_to_mask ||
+                       ((regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1);
+    return kills ? !DepthStencilWrites(r, dc) : mode >= 2;
   }
 
   // Color formats that share one EDRAM layout alias the same target: the guest draws into a
@@ -4889,6 +4970,12 @@ struct Backend::Impl {
 
     uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    if (ps && diag == kDiagOff && EarlyTests(r, d, depth, spec, *word(133)))
+      if (RenderShader* early = EarlyShader(d.ps_hash)) {
+        ps = early;
+        spec |= kSpecEarlyTests;
+        stat_early++;
+      }
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     RenderPipeline* pipeline =
         Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag, colorless,
@@ -6637,6 +6724,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
+  s.stat_early = 0;
   s.notes.clear();
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
@@ -6887,9 +6975,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.lost_first.clear();
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
-                "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
+                "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached, {} early-test "
+                "draws",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
-                s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size());
+                s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size(),
+                s.stat_early);
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;

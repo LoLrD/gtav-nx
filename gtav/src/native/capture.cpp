@@ -827,7 +827,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     return at;
   };
   const ConstantUse& vs_use = *vs_info.consts;
-  static const ConstantUse kNoConstants{0, {}, 0};
+  static const ConstantUse kNoConstants{0, {}, 0, false, false, false};
   const ConstantUse& ps_use = pixel_shader ? *ps_info.consts : kNoConstants;
   d.vs_const_count = uint16_t(vs_use.count);
   d.ps_const_count = uint16_t(ps_use.count);

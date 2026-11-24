@@ -50,3 +50,4 @@ gtav_script_throttle = "shop_controller,vehicle_gen_controller,building_controll
 gtav_physics_max_step = 0.034
 gtav_native_pass_gpu_times = true
 gtav_native_depth_zcull = true
+gtav_native_early_depth_tests = 1
