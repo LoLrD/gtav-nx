@@ -1,3 +1,4 @@
+#include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -8,10 +9,29 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <thread>
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(gtav_audio_skip_silent, true, "GTAV",
                     "Skip synth, resampling and mixing of voices whose gains are all zero");
 REXCVAR_DEFINE_BOOL(gtav_audio_kill_reverb_buses, false, "GTAV", "Do not feed, process or return the reverb and delay buses");
+REXCVAR_DEFINE_INT32(gtav_audio_quiet_xma, 0, "GTAV",
+                     "A wave player whose voices have had zero gain for this many mixer frames (5.3 ms each) "
+                     "has its XMA parsed but not decoded (silence, the stream keeps its position); 0 = always decode");
+REXCVAR_DEFINE_INT32(gtav_audio_quiet_loop_every, 0, "GTAV",
+                     "A wave player kept quiet by gtav_audio_quiet_xma whose XMA loops forever runs only once in this "
+                     "many mixer frames (its output stays silent, its loop position advances slower); 0 = every frame");
+REXCVAR_DEFINE_INT32(gtav_audio_controller_ms, 0, "GTAV",
+                     "Minimum time between two updates of the audio controller thread (sounds, categories, voice "
+                     "requests); 0 = the game's own period");
+REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
+                      "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters; "
+                      "all when empty) are ignored (A/B runs)");
 REXCVAR_DECLARE(bool, gtav_audio_diag);
 
 namespace {
@@ -30,9 +50,21 @@ uint32_t g_marked_n = 0;
 std::array<uint32_t, 8> g_killed{};
 uint32_t g_killed_n = 0;
 bool g_wave_silent = false;
+uint32_t g_frame = 0;
+std::array<uint32_t, kBuffers> g_wave_owner{};
+std::array<uint32_t, kBuffers> g_wave_seen{};
+std::array<uint16_t, kBuffers> g_wave_run{};
+std::array<uint32_t, kBuffers> g_wave_called{};
+std::array<bool, kBuffers> g_wave_looping{};
 
-std::atomic<uint64_t> g_synth_run{0}, g_synth_skip{0}, g_mix_run{0}, g_mix_skip{0}, g_resample_skip{0}, g_feed_skip{0};
+std::atomic<uint64_t> g_synth_run{0}, g_synth_skip{0}, g_mix_run{0}, g_mix_skip{0}, g_resample_skip{0}, g_feed_skip{0},
+    g_wave_loud{0}, g_wave_quiet{0}, g_wave_skip{0}, g_controller{0}, g_ns_sources{0}, g_ns_loud{0}, g_ns_quiet{0};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
+std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
+constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8;
+std::atomic<uint32_t> g_ab_off{0};
+
+bool AbOff(uint32_t what) { return (g_ab_off.load(std::memory_order_relaxed) & what) != 0; }
 
 uint32_t L32(const uint8_t* base, uint32_t a) {
   uint32_t v;
@@ -57,6 +89,46 @@ void Count(std::atomic<uint64_t>& counter) {
   if (REXCVAR_GET(gtav_audio_diag)) counter.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::chrono::steady_clock::time_point Now() {
+  return REXCVAR_GET(gtav_audio_diag) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+void AddTime(std::atomic<uint64_t>& counter, std::chrono::steady_clock::time_point since) {
+  if (!REXCVAR_GET(gtav_audio_diag)) return;
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since);
+  counter.fetch_add(uint64_t(ns.count()), std::memory_order_relaxed);
+}
+
+void NameThread(const char* name) {
+#if defined(__APPLE__)
+  static thread_local bool named = false;
+  if (named || !REXCVAR_GET(gtav_audio_diag)) return;
+  named = true;
+  pthread_setname_np(name);
+#endif
+}
+
+void CheckAb() {
+  const std::string& path = REXCVAR_GET(gtav_audio_ab_file);
+  if (path.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now < g_ab_check) return;
+  g_ab_check = now + std::chrono::seconds(1);
+  std::ifstream in(path);
+  uint32_t off = 0;
+  if (in) {
+    std::string word;
+    while (in >> word)
+      off |= word == "quiet"        ? kAbQuiet
+             : word == "loop"       ? kAbLoop
+             : word == "controller" ? kAbController
+             : word == "filters"    ? kAbFilters
+                                    : 0;
+    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters;
+  }
+  if (off != g_ab_off.exchange(off)) REXLOG_INFO("[audio-ab] off {}", off);
+}
+
 void Report() {
   if (!REXCVAR_GET(gtav_audio_diag)) return;
   const auto now = std::chrono::steady_clock::now();
@@ -64,9 +136,27 @@ void Report() {
   if (s < 10.0) return;
   g_report = now;
   REXLOG_INFO("[audio-cuts] per second: synth {:.0f} run {:.0f} skipped, voices {:.0f} mixed {:.0f} skipped, "
-              "resamples skipped {:.0f}, bus feeds skipped {:.0f}",
+              "resamples skipped {:.0f}, bus feeds skipped {:.0f}, wave players {:.0f} decoded {:.0f} quiet "
+              "{:.0f} skipped, controller updates {:.1f}; ms per second: sources {:.2f}, loud wave players {:.2f}, "
+              "quiet {:.2f}",
               g_synth_run.exchange(0) / s, g_synth_skip.exchange(0) / s, g_mix_run.exchange(0) / s,
-              g_mix_skip.exchange(0) / s, g_resample_skip.exchange(0) / s, g_feed_skip.exchange(0) / s);
+              g_mix_skip.exchange(0) / s, g_resample_skip.exchange(0) / s, g_feed_skip.exchange(0) / s,
+              g_wave_loud.exchange(0) / s, g_wave_quiet.exchange(0) / s, g_wave_skip.exchange(0) / s,
+              g_controller.exchange(0) / s, g_ns_sources.exchange(0) / s / 1e6, g_ns_loud.exchange(0) / s / 1e6,
+              g_ns_quiet.exchange(0) / s / 1e6);
+}
+
+bool LongSilent(uint32_t player, uint16_t id, bool silent) {
+  const bool same = g_wave_owner[id] == player;
+  if (!same || g_wave_seen[id] != g_frame) {
+    if (!same) g_wave_looping[id] = false;
+    const uint32_t run = same && g_wave_seen[id] + 1 == g_frame ? g_wave_run[id] : 0u;
+    g_wave_run[id] = silent ? uint16_t(std::min<uint32_t>(run + 1u, 0xFFFF)) : 0;
+    g_wave_owner[id] = player;
+    g_wave_seen[id] = g_frame;
+  }
+  const int32_t after = REXCVAR_GET(gtav_audio_quiet_xma);
+  return after > 0 && !AbOff(kAbQuiet) && g_wave_run[id] >= uint32_t(after);
 }
 
 bool VoiceSilent(const uint8_t* base, uint32_t v) {
@@ -132,11 +222,18 @@ void BuildFrameState(uint8_t* base, uint32_t mixer) {
 }
 }  // namespace
 
+bool GtavAudioFiltersAbOff() { return AbOff(kAbFilters); }
+
 REX_EXTERN(__imp__sub_831C4708);
 REX_HOOK_RAW(sub_831C4708) {
+  ++g_frame;
+  NameThread("audio engine");
+  CheckAb();
   BuildFrameState(base, ctx.r3.u32);
   Report();
+  const auto start = Now();
   __imp__sub_831C4708(ctx, base);
+  AddTime(g_ns_sources, start);
 }
 
 REX_EXTERN(__imp__sub_83215AE8);
@@ -219,9 +316,28 @@ REX_HOOK_RAW(sub_831C1018) {
 REX_EXTERN(__imp__sub_831C9008);
 REX_HOOK_RAW(sub_831C9008) {
   const uint16_t id = L16(base, ctx.r3.u32 + 4);
-  g_wave_silent = REXCVAR_GET(gtav_audio_skip_silent) && id < kBuffers && g_state[id] == 1;
+  const bool silent = id < kBuffers && g_state[id] == 1;
+  const bool quiet = id < kBuffers && LongSilent(ctx.r3.u32, id, silent);
+  const int32_t every = REXCVAR_GET(gtav_audio_quiet_loop_every);
+  if (quiet && every > 1 && !AbOff(kAbLoop) && g_wave_looping[id] && g_frame - g_wave_called[id] < uint32_t(every)) {
+    Count(g_wave_skip);
+    std::memset(base + Pool(base) + (uint32_t(id) << 10), 0, 1024);
+    return;
+  }
+  g_wave_silent = REXCVAR_GET(gtav_audio_skip_silent) && silent;
+  Count(quiet ? g_wave_quiet : g_wave_loud);
+  rex::audio::XmaDecoder::SetQuietKicks(quiet);
+  rex::audio::XmaDecoder::ResetKickCount();
+  const auto start = Now();
   __imp__sub_831C9008(ctx, base);
+  AddTime(quiet ? g_ns_quiet : g_ns_loud, start);
+  rex::audio::XmaDecoder::SetQuietKicks(false);
   g_wave_silent = false;
+  if (id < kBuffers) {
+    g_wave_called[id] = g_frame;
+    if (rex::audio::XmaDecoder::kicks())
+      g_wave_looping[id] = rex::audio::XmaDecoder::kicks() == rex::audio::XmaDecoder::kicks_looping();
+  }
 }
 
 REX_EXTERN(__imp__sub_831BB3D8);
@@ -240,4 +356,25 @@ REX_HOOK_RAW(sub_831BB508) {
     return;
   }
   __imp__sub_831BB508(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_831E7C10);
+REX_HOOK_RAW(sub_831E7C10) {
+  const auto start = std::chrono::steady_clock::now();
+  NameThread("audio control");
+  Count(g_controller);
+  static bool logged = false;
+  if (!logged && REXCVAR_GET(gtav_audio_diag)) {
+    logged = true;
+    uint32_t period;
+    std::memcpy(&period, base + 0x8204C198, 4);
+    period = __builtin_bswap32(period);
+    float ms;
+    std::memcpy(&ms, &period, 4);
+    REXLOG_INFO("[audio-cuts] controller period {} ms, sleep flag {}", ms, base[0x8398C665]);
+  }
+  __imp__sub_831E7C10(ctx, base);
+  const int32_t ms = REXCVAR_GET(gtav_audio_controller_ms);
+  if (ms > 0 && !AbOff(kAbController))
+    std::this_thread::sleep_until(start + std::chrono::milliseconds(ms));
 }

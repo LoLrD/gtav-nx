@@ -227,6 +227,8 @@ struct MeasurementXma {
   std::atomic<uint64_t> latency_ns{0};   // from the kick until the context is decoded
   std::atomic<uint64_t> latency_max_ns{0};
   std::atomic<uint64_t> latency_n{0};
+  std::atomic<uint64_t> quiet_inline{0};
+  std::atomic<uint64_t> quiet_looping{0};
 };
 
 MeasurementXma g_measurement_xma;
@@ -297,6 +299,14 @@ void ReportXma() {
   const uint64_t latency_ns = g_measurement_xma.latency_ns.exchange(0, std::memory_order_relaxed);
   const uint64_t latency_max = g_measurement_xma.latency_max_ns.exchange(0, std::memory_order_relaxed);
   const uint64_t latency_n = g_measurement_xma.latency_n.exchange(0, std::memory_order_relaxed);
+  const uint64_t quiet_inline = g_measurement_xma.quiet_inline.exchange(0, std::memory_order_relaxed);
+  const uint64_t quiet_looping = g_measurement_xma.quiet_looping.exchange(0, std::memory_order_relaxed);
+  const uint64_t frames_decoded = XmaContext::frames_decoded_.exchange(0, std::memory_order_relaxed);
+  const uint64_t frames_quiet = XmaContext::frames_quiet_.exchange(0, std::memory_order_relaxed);
+  const uint64_t reopens = XmaContext::reopens_.exchange(0, std::memory_order_relaxed);
+  const uint64_t blocks_written = XmaContext::blocks_written_.exchange(0, std::memory_order_relaxed);
+  const uint64_t verified_same = XmaContext::verified_same_.exchange(0, std::memory_order_relaxed);
+  const uint64_t verified_different = XmaContext::verified_different_.exchange(0, std::memory_order_relaxed);
   REXLOG_INFO("[xma] on the calling thread, {:.1f} s: kicks {} with {} contexts decoded, {:.1f} ms (max "
               "{:.2f} ms); locks {} with {} contexts, {:.1f} ms waiting (max {:.2f} ms)",
               double(now - last) / 1000.0, kicks, kick_contexts, double(kick_ns) / 1e6, double(kick_max) / 1e6,
@@ -307,6 +317,10 @@ void ReportXma() {
               double(work_max) / 1e6, of_the_backup,
               latency_n ? double(latency_ns) / double(latency_n) / 1e3 : 0.0, double(latency_max) / 1e6,
               latency_n);
+  REXLOG_INFO("[xma] frames decoded {}, quiet {}; output blocks {}; codec reopens {}; quiet contexts served on the "
+              "kick {} ({} looping forever); frames after a flush same as a fresh decoder {}, different {}",
+              frames_decoded, frames_quiet, blocks_written, reopens, quiet_inline, quiet_looping, verified_same,
+              verified_different);
 }
 
 }  // namespace
@@ -534,6 +548,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
           const auto* ts = runtime::ThreadState::Get(); const PPCContext* ppc = ts ? ts->context() : nullptr;
           context.LogKick(fmt::format("kick from lr {:08X}", ppc ? uint32_t(ppc->lr) : 0).c_str());
         }
+        const bool looping = XMA_CONTEXT_DATA(memory()->TranslateVirtual(context.guest_ptr())).loop_count == 255;
+        ++tls_kicks_;
+        tls_kicks_looping_ += looping;
+        if (tls_quiet_kicks_ && looping) g_measurement_xma.quiet_looping.fetch_add(1, std::memory_order_relaxed);
+        context.set_quiet(tls_quiet_kicks_);
         context.Enable();
       }
     }
@@ -552,7 +571,17 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     const int32_t worker_mode = REXCVAR_GET(audio_xma_in_worker);
     const auto kick_before = std::chrono::steady_clock::now();
     uint64_t kick_contexts = 0;
-    if (worker_mode != 0) {
+    if (worker_mode != 0 && tls_quiet_kicks_) {
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          auto& context = contexts_[base_context_id + i];
+          context.Work();
+          context.SignalWorkDone();
+          g_measurement_xma.quiet_inline.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+    if (worker_mode != 0 && kicked_value) {
       uint32_t marked = kicked_value;
       for (int i = 0; marked && i < 32; ++i, marked >>= 1) {
         if (marked & 1) {

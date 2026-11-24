@@ -49,6 +49,14 @@ class XmaDecoder {
   uint32_t ReadRegister(uint32_t addr);
   void WriteRegister(uint32_t addr, uint32_t value);
 
+  static void SetQuietKicks(bool quiet) { tls_quiet_kicks_ = quiet; }
+  static void ResetKickCount() {
+    tls_kicks_ = 0;
+    tls_kicks_looping_ = 0;
+  }
+  static uint32_t kicks() { return tls_kicks_; }
+  static uint32_t kicks_looping() { return tls_kicks_looping_; }
+
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
@@ -59,6 +67,9 @@ class XmaDecoder {
  private:
   void WorkerThreadMain();
   static inline thread_local void* tls_mmio_ppc_context_ = nullptr;
+  static inline thread_local bool tls_quiet_kicks_ = false;
+  static inline thread_local uint32_t tls_kicks_ = 0;
+  static inline thread_local uint32_t tls_kicks_looping_ = 0;
 
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
     return as->ReadRegister(addr);
