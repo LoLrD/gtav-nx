@@ -375,6 +375,12 @@ REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_watch_full_frames, 64, "GTAV",
                      "Native renderer, with a write watch: frames after which a cached texture or buffer the watch "
                      "keeps finding unchanged is hashed in full anyway");
+REXCVAR_DEFINE_BOOL(gtav_native_draw_memo, false, "GTAV",
+                    "Native renderer: a draw whose shaders, registers, vertex declaration and targets match one of the "
+                    "last 8 prepared draws of the frame reuses its shared constant words, layout and pipeline");
+REXCVAR_DEFINE_BOOL(gtav_native_draw_memo_verify, false, "GTAV",
+                    "Native renderer, with gtav_native_draw_memo: prepare every draw in full and log where a memo "
+                    "hit would have differed (diagnostic)");
 REXCVAR_DEFINE_BOOL(gtav_native_resolve_audit, false, "GTAV",
                     "Native renderer (diagnostic): log per resolve kind how many resolves a frame overwrite a "
                     "destination nothing read since its last resolve, and how many copy the same source again");
@@ -4956,6 +4962,117 @@ struct Backend::Impl {
     }
   }
   // False: the draw is skipped (nothing for DrawBack).
+  struct DrawMemoKey {
+    uint64_t vs_hash, ps_hash;
+    const ConstantUse* vs_use;
+    const ConstantUse* ps_use;
+    RenderShader* ps;
+    uint32_t primitive, element_count, count, tw, th;
+    float scale;
+    bool colorless, redirect2x;
+    RenderTarget* color[4];
+    RenderTarget* depth;
+    const RenderFramebuffer* bound_fb;
+    RenderTarget* bound_color[4];
+    RenderTarget* bound_depth;
+    VertexElement elements[kMaxVertexElements];
+    uint8_t regs[kRegShadowSize];
+  };
+  struct DrawMemo {
+    DrawMemoKey key;
+    uint64_t frame = ~0ull, used = 0;
+    uint32_t words[32];
+    uint32_t spec_words = 0, spec = 0, diag = 0, bind_count = 0;
+    const LayoutMemo* decl = nullptr;
+    RenderShader* ps_out = nullptr;
+    RenderPipeline* pipeline = nullptr;
+    bool indirect = false, kept = false, early = false;
+  };
+  static constexpr uint32_t kDrawMemos = 8;
+  std::array<DrawMemo, kDrawMemos> draw_memos;
+  uint64_t draw_memo_uses = 0;
+  bool draw_memo_on = false, draw_memo_verify = false;
+  uint64_t draw_memo_hits = 0, draw_memo_new_shaders = 0, draw_memo_regs = 0,
+           draw_memo_targets = 0, draw_memo_mismatches = 0;
+  uint32_t draw_memo_logged = 0;
+  DrawMemoKey draw_memo_key;
+  std::map<uint32_t, uint64_t> draw_memo_reg_diffs;
+  void FillDrawMemoKey(DrawMemoKey& k, const DrawCommand& d, const uint8_t* r, RenderTarget* const color[4],
+                       uint32_t count, RenderTarget* depth, bool colorless, RenderShader* ps) {
+    std::memset(&k, 0, sizeof(k));
+    k.vs_hash = d.vs_hash;
+    k.ps_hash = d.ps_hash;
+    k.vs_use = d.vs_use;
+    k.ps_use = d.ps_use;
+    k.ps = ps;
+    k.primitive = d.primitive;
+    k.element_count = d.element_count;
+    k.count = count;
+    const RenderTarget* first = count ? color[0] : depth;
+    k.tw = first->width;
+    k.th = first->height;
+    k.scale = first->scale;
+    k.colorless = colorless;
+    k.redirect2x = redirect2x;
+    for (uint32_t i = 0; i < count; i++) k.color[i] = color[i];
+    k.depth = depth;
+    k.bound_fb = bound_fb;
+    for (uint32_t i = 0; i < 4; i++) k.bound_color[i] = bound_color[i];
+    k.bound_depth = bound_depth;
+    std::memcpy(k.elements, d.elements, sizeof(VertexElement) * d.element_count);
+    std::memcpy(k.regs, r, kRegShadowSize);
+  }
+  DrawMemo* FindDrawMemo(const DrawMemoKey& k) {
+    bool shaders = false, regs = false;
+    for (auto& m : draw_memos) {
+      if (m.frame != frame || m.key.vs_hash != k.vs_hash || m.key.ps_hash != k.ps_hash) continue;
+      shaders = true;
+      if (std::memcmp(&m.key, &k, sizeof(k)) == 0) {
+        m.used = ++draw_memo_uses;
+        return &m;
+      }
+      if (std::memcmp(m.key.regs, k.regs, kRegShadowSize) != 0) {
+        regs = true;
+        if (draw_memo_verify)
+          for (uint32_t at = 0; at < kRegShadowSize; at += 4)
+            if (std::memcmp(m.key.regs + at, k.regs + at, 4) != 0) {
+              draw_memo_reg_diffs[at]++;
+              break;
+            }
+      }
+    }
+    if (!shaders) draw_memo_new_shaders++;
+    else if (regs) draw_memo_regs++;
+    else draw_memo_targets++;
+    return nullptr;
+  }
+  DrawMemo& ReplaceDrawMemo() {
+    DrawMemo* oldest = &draw_memos[0];
+    for (auto& m : draw_memos) {
+      if (m.frame != frame) return m;
+      if (m.used < oldest->used) oldest = &m;
+    }
+    return *oldest;
+  }
+  void VerifyDrawMemo(const DrawMemo& m, const DrawMemo& out, const DrawCommand& d) {
+    const char* field = std::memcmp(m.words, out.words, sizeof(m.words)) ? "words"
+                        : m.spec_words != out.spec_words                   ? "spec words"
+                        : m.decl != out.decl                               ? "layout"
+                        : m.indirect != out.indirect                       ? "indirect"
+                        : m.diag != out.diag                               ? "diag"
+                        : m.ps_out != out.ps_out                           ? "pixel shader"
+                        : m.kept != out.kept || m.bind_count != out.bind_count ? "targets"
+                        : m.early != out.early || m.spec != out.spec       ? "spec"
+                        : m.pipeline != out.pipeline                       ? "pipeline"
+                                                                           : nullptr;
+    draw_memo_hits++;
+    if (!field) return;
+    draw_memo_mismatches++;
+    if (draw_memo_logged++ < 20)
+      REXLOG_INFO("[native] draw memo mismatch at frame {}: {} (vs {:016X} ps {:016X})", frame, field, d.vs_hash,
+                  d.ps_hash);
+  }
+
   bool DrawFront(RenderCommandList* list, const FramePacket& f, const DrawCommand& d, DrawRecord& rec) {
     prof.Start();
     const uint8_t* r = f.At(d.regs);
@@ -5198,9 +5315,21 @@ struct Backend::Impl {
     if (bm_hit) fetch_cache = {bm_hit, bm_hit->hash, d.fetch, tex_mask, true};
     prof.Mark(prof.fetch);
 
+    DrawMemo* memo = nullptr;
+    const bool memo_try = draw_memo_on && !dumping;
+    if (memo_try) {
+      FillDrawMemoKey(draw_memo_key, d, r, color, count, depth, colorless, ps);
+      memo = FindDrawMemo(draw_memo_key);
+    }
+    const bool fast = memo && !draw_memo_verify;
     // Shared constant words 128-159, from the registers and the targets.
-    std::memset(rec.words, 0, sizeof(rec.words));
     auto word = [&](uint32_t index) -> uint32_t* { return &rec.words[index - 128]; };
+    uint32_t spec = 0;
+    if (fast) {
+      std::memcpy(rec.words, memo->words, sizeof(rec.words));
+      spec = memo->spec_words;
+    } else {
+    std::memset(rec.words, 0, sizeof(rec.words));
     const uint8_t* bools = r;  // the shadow starts with the 0x4900 bool constants
     *word(128) = (be32(bools) & 0xFFFF) | (be32(bools + 16) & 0xFFFF) << 16;
     float alpha_ref = regs::ReadFloat(r, regs::RB_ALPHA_REF);
@@ -5257,13 +5386,15 @@ struct Backend::Impl {
       float v[4] = {scale, scale, scale, scale};
       std::memcpy(word(140 + 4 * i), v, sizeof(v));
     }
-    uint32_t spec = (colorcontrol & 8) ? 2u : 0u;
+    spec = (colorcontrol & 8) ? 2u : 0u;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
+    }
+    const uint32_t spec_words = spec;
 
     // Vertex streams: the layout, the checks that skip a draw, the cache entries DrawBack fills.
-    const LayoutMemo& decl = *InternLayout(d);
+    const LayoutMemo& decl = fast ? *memo->decl : *InternLayout(d);
     const vertex_layout::HostLayout& vl = decl.vl;
-    rec.indirect = indirect_fetch_shaders.count(d.vs_hash) != 0;
+    rec.indirect = fast ? memo->indirect : indirect_fetch_shaders.count(d.vs_hash) != 0;
     // Rect lists without geometry shaders: the three vertices of each rect are gathered and
     // expanded on the CPU (DrawBack: RectGather, RectDraw), drawn as a plain triangle list. The
     // tiled-lighting rects' vertex shaders fetch by an index computed from POSITION.zw (the tile),
@@ -5315,7 +5446,26 @@ struct Backend::Impl {
     }
     prof.Mark(prof.streams);
 
-    uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
+    uint32_t diag = kDiagOff;
+    bool kept = false, early = false;
+    RenderPipeline* pipeline = nullptr;
+    if (fast) {
+      diag = memo->diag;
+      ps = memo->ps_out;
+      kept = memo->kept;
+      early = memo->early;
+      if (kept) {
+        bind_color = bound_color;
+        bind_count = memo->bind_count;
+        depth = bound_depth;
+        kept_targets++;
+      }
+      spec = memo->spec;
+      stat_early += early;
+      pipeline = memo->pipeline;
+      draw_memo_hits++;
+    } else {
+    diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
     if (!colorless && count && bound_fb && REXCVAR_GET(gtav_native_keep_targets)) {
       uint32_t bound_count = 0;
@@ -5328,22 +5478,44 @@ struct Backend::Impl {
         bind_count = bound_count;
         depth = bound_depth;
         kept_targets++;
+        kept = true;
       }
     }
     if (ps && diag == kDiagOff && EarlyTests(r, d, depth, spec, *word(133)))
-      if (RenderShader* early = EarlyShader(d.ps_hash)) {
-        ps = early;
+      if (RenderShader* early_ps = EarlyShader(d.ps_hash)) {
+        ps = early_ps;
         spec |= kSpecEarlyTests;
         stat_early++;
+        early = true;
       }
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
-    RenderPipeline* pipeline =
-        Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag, colorless,
-                 d.vs_hash, d.ps_hash);
+    pipeline = Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag,
+                        colorless, d.vs_hash, d.ps_hash);
     if (!pipeline) {
       stat_skipped++;
       if (!pipeline_failed) NoteLost(lost_pipeline, "pipeline", d, r);
       return false;
+    }
+    DrawMemo out;
+    std::memcpy(out.words, rec.words, sizeof(out.words));
+    out.spec_words = spec_words;
+    out.decl = &decl;
+    out.indirect = rec.indirect;
+    out.diag = diag;
+    out.ps_out = ps;
+    out.kept = kept;
+    out.bind_count = bind_count;
+    out.early = early;
+    out.spec = spec;
+    out.pipeline = pipeline;
+    if (memo) {
+      VerifyDrawMemo(*memo, out, d);
+    } else if (memo_try && diag == kDiagOff) {
+      out.key = draw_memo_key;
+      out.frame = frame;
+      out.used = ++draw_memo_uses;
+      ReplaceDrawMemo() = out;
+    }
     }
     prof.Mark(prof.pipe);
 
@@ -7346,6 +7518,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.tile_alias_done.clear();
   write_watch::Harvest();  // before this frame's texture and buffer lookups
   s.fetch_cache.valid = false;
+  s.draw_memo_on = REXCVAR_GET(gtav_native_draw_memo);
+  s.draw_memo_verify = s.draw_memo_on && REXCVAR_GET(gtav_native_draw_memo_verify);
   s.slot_generation++;
   s.frame_generation++;
   s.EvictTextures();
@@ -7568,6 +7742,20 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   "ones not checked",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
                   t.full_bytes / n / 1048576.0, t.guest_bytes / n / 1024, t.full_ms / n, t.stable / n);
+      if (s.draw_memo_on) {
+        REXLOG_INFO("[native]   draw memo per frame: {:.0f} hits, misses {:.0f} new shaders, {:.0f} other registers, "
+                    "{:.0f} other targets{}",
+                    s.draw_memo_hits / n, s.draw_memo_new_shaders / n, s.draw_memo_regs / n, s.draw_memo_targets / n,
+                    s.draw_memo_verify ? fmt::format(", {} mismatches (verify)", s.draw_memo_mismatches) : std::string());
+        s.draw_memo_hits = s.draw_memo_new_shaders = s.draw_memo_regs = s.draw_memo_targets = s.draw_memo_mismatches = 0;
+        std::vector<std::pair<uint64_t, uint32_t>> diffs;
+        for (auto& [at, c] : s.draw_memo_reg_diffs) diffs.emplace_back(c, at);
+        std::sort(diffs.rbegin(), diffs.rend());
+        std::string top;
+        for (size_t i = 0; i < diffs.size() && i < 8; i++) top += fmt::format(" +{}:{:.0f}", diffs[i].second, diffs[i].first / n);
+        if (!top.empty()) REXLOG_INFO("[native]   draw memo register misses by first changed shadow byte:{}", top);
+        s.draw_memo_reg_diffs.clear();
+      }
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
                   "{:.0f} pipeline binds",
                   t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);
