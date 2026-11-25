@@ -85,3 +85,4 @@ gtav_native_preload_all_shaders = false
 gtav_native_upload_chunk_mb = 32
 gtav_native_idle_target_frames = 900
 masseffect_io_ranges_mb = 0
+gtav_nr_lzx = true
