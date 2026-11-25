@@ -76,6 +76,7 @@ std::string g_trace;
 uint32_t g_trace_events = 0;
 bool g_trace_done = false;
 uint64_t g_draw_calls = 0;
+uint64_t g_draw_indices = 0;
 
 struct SkipRule {
   uint32_t type;
@@ -88,6 +89,7 @@ uint64_t g_dl_frame = 0;
 uint32_t g_dl_instances[256] = {};
 double g_dl_ms[256] = {};
 uint64_t g_dl_draws[256] = {};
+uint64_t g_dl_indices[256] = {};
 uint32_t g_dl_report_frames = 0;
 std::atomic<bool> g_cuts_paused{false};
 uint32_t g_current_dl = 0xFFFFFFFF;
@@ -173,15 +175,17 @@ void ReportDrawListTimes() {
   for (int t = 0; t < 256; t++) {
     if (g_dl_ms[t] == 0) continue;
     total += g_dl_ms[t];
-    line += fmt::format(" {:02X}:{:.2f}ms/{:.0f}", t, g_dl_ms[t] / 300, g_dl_draws[t] / 300.0);
+    line += fmt::format(" {:02X}:{:.2f}ms/{:.0f}/{:.0f}k", t, g_dl_ms[t] / 300, g_dl_draws[t] / 300.0,
+                        g_dl_indices[t] / 300e3);
   }
-  REXLOG_INFO("[render-cuts] render thread per frame{}: CPU {:.2f} ms, by draw list (ms/draws) {:.2f} ms:{}",
+  REXLOG_INFO("[render-cuts] render thread per frame{}: CPU {:.2f} ms, by draw list (ms/draws/indices) {:.2f} ms:{}",
               REXCVAR_GET(gtav_render_cuts_ab) ? (Cut() ? " (cuts on)" : " (cuts off)") : "", (cpu - cpu_at) / 300,
               total / 300, line);
   if (REXCVAR_GET(gtav_render_cuts_ab)) g_cuts_paused.store(Cut(), std::memory_order_relaxed);
   cpu_at = cpu;
   std::memset(g_dl_ms, 0, sizeof(g_dl_ms));
   std::memset(g_dl_draws, 0, sizeof(g_dl_draws));
+  std::memset(g_dl_indices, 0, sizeof(g_dl_indices));
   g_dl_report_frames = 0;
 }
 
@@ -203,7 +207,13 @@ bool LightShadowPass(const uint8_t* device) {
 
 void RenderTrace(char kind, PPCContext& ctx, uint8_t* base) {
   if (kind != 'C' && kind != 'R') g_draw_calls++;
+  if (kind == 'D') g_draw_indices += ctx.r7.u32;
   const int32_t at = REXCVAR_GET(gtav_render_trace);
+  static int32_t traced_at = 0;
+  if (at != traced_at) {
+    traced_at = at;
+    g_trace_done = false;
+  }
   if (at <= 0 || g_trace_done) return;
   const uint64_t frame = native::GuestFrame();
   if (frame < uint64_t(at)) return;
@@ -261,11 +271,12 @@ REX_HOOK_RAW(sub_835F7E68) {
     return;
   }
   const auto start = std::chrono::steady_clock::now();
-  const uint64_t draws = gtav::g_draw_calls;
+  const uint64_t draws = gtav::g_draw_calls, indices = gtav::g_draw_indices;
   __imp__sub_835F7E68(ctx, base);
   gtav::g_current_dl = 0xFFFFFFFF;
   gtav::g_dl_ms[type] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   gtav::g_dl_draws[type] += gtav::g_draw_calls - draws;
+  gtav::g_dl_indices[type] += gtav::g_draw_indices - indices;
   if (type == gtav::kDlFrameEnd && ++gtav::g_dl_report_frames == 300) gtav::ReportDrawListTimes();
 }
 
