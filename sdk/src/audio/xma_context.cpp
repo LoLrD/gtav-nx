@@ -522,7 +522,7 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
   // Allocate ffmpeg stuff:
   av_packet_ = av_packet_alloc();
   assert_not_null(av_packet_);
-  av_packet_->buf = av_buffer_alloc(128 * 1024);
+  av_packet_->buf = av_buffer_alloc(int(xma_frame_.size()) + AV_INPUT_BUFFER_PADDING_SIZE);
 
   // find the XMA2 audio decoder
   av_codec_ = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
@@ -530,16 +530,6 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
     REXAPU_ERROR("XmaContext {}: Codec not found", id);
     return 1;
   }
-
-  av_context_ = avcodec_alloc_context3(av_codec_);
-  if (!av_context_) {
-    REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
-    return 1;
-  }
-
-  // Initialize these to 0. They'll actually be set later.
-  av_context_->channels = 0;
-  av_context_->sample_rate = 0;
 
   av_frame_ = av_frame_alloc();
   if (!av_frame_) {
@@ -1404,20 +1394,18 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || av_context_->sample_rate != sample_rate ||
       av_context_->channels != static_cast<int>(channels)) {
-    REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
-                       av_context_->sample_rate, sample_rate, av_context_->channels, channels);
     for (auto& spare : spare_contexts_) {
       if (REXCVAR_GET(xma_flush_streams) && spare && spare->sample_rate == sample_rate &&
           spare->channels == static_cast<int>(channels)) {
         std::swap(av_context_, spare);  // the current one is kept for its format
-        if (!spare->sample_rate) avcodec_free_context(&spare);  // never opened
+        if (spare && !spare->sample_rate) avcodec_free_context(&spare);  // never opened
         avcodec_flush_buffers(av_context_);  // a new stream
         return 1;
       }
     }
-    if (av_context_->sample_rate && REXCVAR_GET(xma_flush_streams)) {  // keep it, replacing the oldest spare
+    if (av_context_ && av_context_->sample_rate && REXCVAR_GET(xma_flush_streams)) {  // keep it, replacing the oldest spare
       auto& slot = spare_contexts_[next_spare_++ % spare_contexts_.size()];
       if (slot) avcodec_free_context(&slot);
       slot = av_context_;
