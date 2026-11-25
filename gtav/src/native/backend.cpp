@@ -3513,6 +3513,8 @@ struct Backend::Impl {
       ScopedMs ft{tprof.full_ms};
       tprof.full++;
       tprof.full_bytes += t.bytes;
+      if (!t.watch.ranges[1] && !GuestTextureRanges(words, t.watch.ranges)) t.watch.ranges[1] = 0;
+      tprof.guest_bytes += uint64_t(t.watch.ranges[1]) + t.watch.ranges[3];
       const PreHashItem* pre = nullptr;
       if (prehash_on && t.pre_frame == frame && !std::memcmp(t.pre_words, words, sizeof(t.pre_words)))
         pre = PreHashed(t.pre_index);
@@ -4176,6 +4178,7 @@ struct Backend::Impl {
   uint64_t conv_bytes[4] = {}, conv_draws[4] = {};  // vertices converted: rect lists, inline, snapshots, rebuilt buffers
   struct TextureProfile {
     uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0, stable = 0;
+    uint64_t guest_bytes = 0;
     double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
   } tprof;
   // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
@@ -7524,9 +7527,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_fetch_resolves = 0;
       auto& t = s.tprof;
       REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
-                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms), {:.0f} stable ones not checked",
+                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.0f} KB of guest bytes, {:.2f} ms), {:.0f} stable "
+                  "ones not checked",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
-                  t.full_bytes / n / 1048576.0, t.full_ms / n, t.stable / n);
+                  t.full_bytes / n / 1048576.0, t.guest_bytes / n / 1024, t.full_ms / n, t.stable / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
                   "{:.0f} pipeline binds",
                   t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);
