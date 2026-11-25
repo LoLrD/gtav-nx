@@ -241,6 +241,11 @@ REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV
 REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV",
                       "Native renderer: render the full-width (1280) targets at this fraction of their size "
                       "(0.5-2: above 1 renders at a higher resolution than the Xbox 720p; read at start)");
+REXCVAR_DEFINE_INT32(gtav_native_render_scale_pitch, 1280, "GTAV",
+                     "Native renderer: single-sampled colour targets at least this many pixels wide take "
+                     "--gtav_native_render_scale too (640: the half-width effect targets, ambient occlusion and the "
+                     "half-size scene copies; depth below 1280, the sun cascades among it, stays full size; read at "
+                     "start)");
 REXCVAR_DEFINE_BOOL(gtav_native_fsr, false, "GTAV",
                     "Native renderer (live): upscale the scene rendered below full size (--gtav_native_render_scale "
                     "under 1) with FSR 1 (EASU, then RCAS); a frame still reduced at the present is upscaled whole");
@@ -2078,6 +2083,7 @@ struct Backend::Impl {
   // Render scale: target sizes and coordinates in host texels (rounded edges, so neighbouring
   // rects stay adjacent). 1 when off.
   float rs = 1.0f;
+  uint32_t scale_pitch = 1280;
   static uint32_t Sz(uint32_t v, float s) { return s == 1.0f ? v : std::max(1u, uint32_t(std::lround(v * s))); }
   static int32_t Sc(int32_t v, float s) { return s == 1.0f ? v : int32_t(std::lround(v * s)); }
   static RenderRect ScaleRect(const RenderRect& r, float s) {
@@ -2922,6 +2928,7 @@ struct Backend::Impl {
   bool Init(RenderDevice* dev) {
     device = dev;
     rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 2.0));
+    scale_pitch = uint32_t(std::max(1, REXCVAR_GET(gtav_native_render_scale_pitch)));
     g_pixel_scale_inv = 1.0f / rs;
     if (rs != 1.0f) REXLOG_INFO("[native] render scale {:.3f} (full-width targets)", rs);
     g_upload_chunk = uint64_t(std::clamp(REXCVAR_GET(gtav_native_upload_chunk_mb), 8, 256)) << 20;
@@ -3308,7 +3315,7 @@ struct Backend::Impl {
     }
     uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(depth) << 16 | uint64_t(pitch) << 17 |
                    uint64_t(msaa) << 31;
-    const bool scaled = rs != 1.0f && !msaa && pitch >= 1280;
+    const bool scaled = rs != 1.0f && !msaa && (pitch >= 1280 || (!depth && pitch >= scale_pitch));
     if (scaled && upscale_full) key |= kFullSizeKey;
     auto& memo = target_memo[(key ^ key >> 12 ^ key >> 17) & (target_memo.size() - 1)];
     if (memo.first != key || !memo.second) memo = {key, &targets[key]};
