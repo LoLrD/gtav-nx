@@ -13,6 +13,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 #if defined(__APPLE__)
 #include <pthread.h>
@@ -35,6 +36,9 @@ REXCVAR_DEFINE_DOUBLE(gtav_audio_silence_db, 0, "GTAV",
                       "Sources whose loudest voice route gain is below this level in dB (e.g. -48) are treated as "
                       "silent: not generated or mixed, their XMA parsed without decoding; 6 dB lower to stay audible; "
                       "0 = only zero gains");
+REXCVAR_DEFINE_INT32(gtav_audio_max_wave_players, 0, "GTAV",
+                     "Only this many of the loudest audible wave players (XMA) of a mixer frame are decoded and mixed; "
+                     "quieter ones are treated as silent and their XMA is parsed without decoding; 0 = all");
 REXCVAR_DEFINE_BOOL(gtav_audio_compact_channels, false, "GTAV",
                     "Mix a voice into a 6-channel submix only on the channels it has gain on (4, 2 or 1 of them, same "
                     "samples): the speakers it is silent on are moved behind the ones it plays on for that call");
@@ -43,7 +47,7 @@ REXCVAR_DEFINE_BOOL(gtav_audio_batch_kicks, false, "GTAV",
                     "kick (audio_xma_in_worker 1 or 2)");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters, "
-                      "silence, batch, compact, float; all when empty) are ignored (A/B runs)");
+                      "silence, batch, compact, float, waves; all when empty) are ignored (A/B runs)");
 REXCVAR_DECLARE(bool, gtav_audio_diag);
 
 namespace {
@@ -60,6 +64,8 @@ std::array<uint8_t, kBuffers> g_state{};
 std::array<uint16_t, kBuffers> g_loud{};
 std::array<uint32_t, kBuffers> g_kept{};
 std::array<uint32_t, kBuffers> g_culled{};
+std::array<uint32_t, kBuffers> g_wave_kept{};
+std::array<std::pair<uint32_t, uint16_t>, kVoices> g_waves{};
 std::array<uint16_t, kVoices> g_marked{};
 uint32_t g_marked_n = 0;
 std::array<uint32_t, 8> g_killed{};
@@ -76,13 +82,14 @@ std::atomic<uint64_t> g_synth_run{0}, g_synth_skip{0}, g_mix_run{0}, g_mix_skip{
     g_wave_loud{0}, g_wave_quiet{0}, g_wave_skip{0}, g_controller{0}, g_ns_sources{0}, g_ns_loud{0}, g_ns_quiet{0},
     g_ns_mix{0}, g_ns_synth{0};
 std::array<std::atomic<uint64_t>, 9> g_route_channels{};
-std::atomic<uint64_t> g_route_bus{0}, g_route_unbuffered{0}, g_cull{0}, g_audible{0}, g_audible_max{0};
+std::atomic<uint64_t> g_route_bus{0}, g_route_unbuffered{0}, g_cull{0}, g_wave_limited{0}, g_audible{0},
+    g_audible_max{0};
 std::array<std::atomic<uint64_t>, 6> g_loud_db{};
 std::array<std::atomic<uint64_t>, 64> g_route_dest{};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
 std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
 constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16, kAbBatch = 32,
-                   kAbCompact = 64, kAbFloat = 128;
+                   kAbCompact = 64, kAbFloat = 128, kAbWaves = 256;
 std::atomic<uint32_t> g_ab_off{0};
 
 bool AbOff(uint32_t what) { return (g_ab_off.load(std::memory_order_relaxed) & what) != 0; }
@@ -158,8 +165,10 @@ void CheckAb() {
              : word == "batch"      ? kAbBatch
              : word == "compact"    ? kAbCompact
              : word == "float"      ? kAbFloat
+             : word == "waves"      ? kAbWaves
                                     : 0;
-    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch | kAbCompact | kAbFloat;
+    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch | kAbCompact | kAbFloat |
+                    kAbWaves;
   }
   if (off != g_ab_off.exchange(off)) REXLOG_INFO("[audio-ab] off {}", off);
 }
@@ -174,9 +183,11 @@ void ReportRoutes(double s) {
   REXLOG_INFO("[audio-cuts] routes per second:{}, 4-buffer bus {:.0f}, no buffer {:.0f}; by submix:{}", channels,
               g_route_bus.exchange(0) / s, g_route_unbuffered.exchange(0) / s, dests);
   const double frames = s * 187.5;
-  REXLOG_INFO("[audio-cuts] audible sources per frame {:.1f} (max {}), culled {:.1f}; by loudest gain: >-6 dB {:.1f}, "
-              "-6..-12 {:.1f}, -12..-24 {:.1f}, -24..-36 {:.1f}, -36..-48 {:.1f}, <-48 {:.1f}",
+  REXLOG_INFO("[audio-cuts] audible sources per frame {:.1f} (max {}), culled {:.1f}, wave players limited {:.1f}; by "
+              "loudest gain: >-6 dB {:.1f}, -6..-12 {:.1f}, -12..-24 {:.1f}, -24..-36 {:.1f}, -36..-48 {:.1f}, "
+              "<-48 {:.1f}",
               g_audible.exchange(0) / frames, g_audible_max.exchange(0), g_cull.exchange(0) / frames,
+              g_wave_limited.exchange(0) / frames,
               g_loud_db[0].exchange(0) / frames, g_loud_db[1].exchange(0) / frames, g_loud_db[2].exchange(0) / frames,
               g_loud_db[3].exchange(0) / frames, g_loud_db[4].exchange(0) / frames, g_loud_db[5].exchange(0) / frames);
 }
@@ -301,6 +312,27 @@ void CullQuiet() {
   }
 }
 
+void LimitWavePlayers() {
+  const int32_t max = REXCVAR_GET(gtav_audio_max_wave_players);
+  if (max <= 0 || AbOff(kAbWaves)) return;
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < g_marked_n; ++i) {
+    const uint16_t buf = g_marked[i];
+    if (g_state[buf] != 2 || g_wave_seen[buf] + 1 != g_frame) continue;
+    g_waves[n++] = {uint32_t(g_loud[buf]) << (g_wave_kept[buf] + 1 == g_frame ? 1 : 0), buf};
+  }
+  const uint32_t keep = std::min<uint32_t>(n, uint32_t(max));
+  std::nth_element(g_waves.begin(), g_waves.begin() + keep, g_waves.begin() + n,
+                   [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (uint32_t i = 0; i < keep; ++i) g_wave_kept[g_waves[i].second] = g_frame;
+  for (uint32_t i = keep; i < n; ++i) {
+    const uint16_t buf = g_waves[i].second;
+    g_state[buf] = 1;
+    g_culled[buf] = g_frame;
+    Count(g_wave_limited);
+  }
+}
+
 bool Culled(uint32_t buf) { return buf < kBuffers && g_culled[buf] == g_frame; }
 
 void BuildFrameState(uint8_t* base, uint32_t mixer) {
@@ -315,6 +347,7 @@ void BuildFrameState(uint8_t* base, uint32_t mixer) {
   }
   if (REXCVAR_GET(gtav_audio_diag)) CountLoudness();
   CullQuiet();
+  LimitWavePlayers();
   g_killed_n = 0;
   if (!REXCVAR_GET(gtav_audio_kill_reverb_buses)) return;
   const uint32_t submixes = L32(base, mixer + 6672);
