@@ -61,6 +61,7 @@ gtav_script_every = 4
 gtav_script_throttle = "shop_controller,vehicle_gen_controller,building_controller,stats_controller,mp_registration,randomchar_controller,tuneables_processing"
 gtav_physics_max_step = 0.034
 gtav_native_pass_gpu_times = true
+gtav_native_vertex_inputs_used = true
 gtav_native_fsr = true
 gtav_native_fsr_sharpness = -1
 gtav_native_fsr_bilinear = true
@@ -88,4 +89,7 @@ gtav_native_idle_target_frames = 900
 masseffect_io_ranges_mb = 0
 gtav_nr_lzx = true
 vsync = false
-gtav_native_ab_sweep = "gtav_native_resolve_keep_clears=false|true;gtav_native_clear_aliases_first=false|true;gtav_sun_shadow_every=2|1;gtav_reflection_every=1|30;gtav_native_light_fill_reuse=true|false;gtav_native_skip_silent_draws=true|false;gtav_native_early_depth_tests=2|0;gtav_native_keep_targets=true|false;gtav_native_skip_depth_restore_strips=true|false;gtav_native_cube_every=300|1;gtav_light_shadow_draws=false|true;gtav_native_fsr_bilinear=true|false;gtav_native_resolve_src_barrier=1|0;gtav_native_fragment_barriers=true|false;gtav_native_resolve_discard=true|false;gtav_native_pass_gpu_times=true|false;gtav_native_draw_memo=false|true"
+gtav_native_ab_sweep = "gtav_native_vertex_inputs_used=true|false;gtav_sun_shadow_every=2|1;gtav_native_early_depth_tests=2|0;gtav_light_shadow_draws=false|true;gtav_native_pass_gpu_times=true|false"
+gtav_native_ab_sweep_seconds = 8
+gtav_debug_commands = true
+gtav_bench_script = "sdmc:/switch/gtav-nx/bench.txt"
