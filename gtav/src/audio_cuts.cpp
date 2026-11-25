@@ -43,7 +43,7 @@ REXCVAR_DEFINE_BOOL(gtav_audio_batch_kicks, false, "GTAV",
                     "kick (audio_xma_in_worker 1 or 2)");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters, "
-                      "silence, batch, compact; all when empty) are ignored (A/B runs)");
+                      "silence, batch, compact, float; all when empty) are ignored (A/B runs)");
 REXCVAR_DECLARE(bool, gtav_audio_diag);
 
 namespace {
@@ -82,7 +82,7 @@ std::array<std::atomic<uint64_t>, 64> g_route_dest{};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
 std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
 constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16, kAbBatch = 32,
-                   kAbCompact = 64;
+                   kAbCompact = 64, kAbFloat = 128;
 std::atomic<uint32_t> g_ab_off{0};
 
 bool AbOff(uint32_t what) { return (g_ab_off.load(std::memory_order_relaxed) & what) != 0; }
@@ -157,8 +157,9 @@ void CheckAb() {
              : word == "silence"    ? kAbSilence
              : word == "batch"      ? kAbBatch
              : word == "compact"    ? kAbCompact
+             : word == "float"      ? kAbFloat
                                     : 0;
-    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch | kAbCompact;
+    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch | kAbCompact | kAbFloat;
   }
   if (off != g_ab_off.exchange(off)) REXLOG_INFO("[audio-ab] off {}", off);
 }
@@ -331,6 +332,8 @@ void BuildFrameState(uint8_t* base, uint32_t mixer) {
 }  // namespace
 
 bool GtavAudioFiltersAbOff() { return AbOff(kAbFilters); }
+
+bool GtavAudioFloatAbOff() { return AbOff(kAbFloat); }
 
 REX_EXTERN(__imp__sub_831C4708);
 REX_HOOK_RAW(sub_831C4708) {
