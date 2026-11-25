@@ -426,6 +426,10 @@ class Memory {
   // Note that the contents at the returned host address are big-endian.
   uint32_t HostToGuestVirtual(const void* host_address) const;
 
+  // With REX_STORE_CARDS, clears the store card of every 4 KB guest page in the range (see the generated
+  // REX_CARD): host code that writes guest memory calls it so card readers see the change.
+  void MarkStoreCards(uint32_t guest_address, uint32_t length) const;
+
   // Returns the guest physical address for the guest virtual address, or
   // UINT32_MAX if it can't be obtained.
   uint32_t GetPhysicalAddress(uint32_t address) const;

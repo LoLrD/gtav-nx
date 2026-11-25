@@ -343,12 +343,18 @@ bool Memory::Initialize() {
   heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                               0x1FD00000, 4096, &heaps_.physical);
 
-  // Protect the first and last 64kb of memory.
+  // Protect the first and last 64kb of memory. With store cards the first 1 MB is the card table instead.
+#if defined(REX_STORE_CARDS)
+  heaps_.v00000000.AllocFixed(0x00000000, 0x100000, 0x10000,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+#else
   heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               !REXCVAR_GET(protect_zero)
                                   ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
                                   : memory::kMemoryProtectNoAccess);
+#endif
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
 
@@ -640,16 +646,33 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
 
 void Memory::Zero(uint32_t address, uint32_t size) {
   std::memset(TranslateVirtual(address), 0, size);
+  MarkStoreCards(address, size);
 }
 
 void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {
   std::memset(TranslateVirtual(address), value, size);
+  MarkStoreCards(address, size);
 }
 
 void Memory::Copy(uint32_t dest, uint32_t src, uint32_t size) {
   uint8_t* pdest = TranslateVirtual(dest);
   const uint8_t* psrc = TranslateVirtual(src);
   std::memcpy(pdest, psrc, size);
+  MarkStoreCards(dest, size);
+}
+
+void Memory::MarkStoreCards(uint32_t guest_address, uint32_t length) const {
+#if defined(REX_STORE_CARDS)
+  if (!length) {
+    return;
+  }
+  const uint32_t first = guest_address >> 12;
+  const uint32_t last = uint32_t((uint64_t(guest_address) + length - 1) >> 12);
+  std::memset(virtual_membase_ + first, 0, last - first + 1);
+#else
+  (void)guest_address;
+  (void)length;
+#endif
 }
 
 uint32_t Memory::SearchAligned(uint32_t start, uint32_t end, const uint32_t* values,
@@ -2572,6 +2595,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
                                     bool unwatch_exact_range, bool unprotect) {
+  memory_->MarkStoreCards(virtual_address, length);
   // TODO(Triang3l): Support read watches.
   assert_true(is_write);
   if (!is_write) {

@@ -83,6 +83,12 @@ constexpr uint32_t kPhysOffset = 0;
 constexpr uint32_t kGuard = 64;
 constexpr uint32_t kMaxChecked = 1u << 20;
 
+inline void MarkCards(uint8_t* base, uint32_t a, uint32_t n) {
+#if defined(REX_STORE_CARDS)
+  if (n) std::memset(base + (a >> 12), 0, ((uint64_t(a) + n - 1) >> 12) - (a >> 12) + 1);
+#endif
+}
+
 inline uint8_t* Host(uint8_t* base, uint32_t a) {
   return base + a + (kPhysOffset && a >= 0xE0000000u ? kPhysOffset : 0u);
 }
@@ -307,6 +313,7 @@ inline void Copy(Stat& s, PPCContext& ctx, uint8_t* base) {
     return;
   }
   std::memcpy(Host(base, dst), Host(base, src), n);
+  MarkCards(base, dst, n);
 }
 
 }  // namespace
@@ -326,6 +333,7 @@ REX_HOOK_RAW(sub_8378D940) {
     return;
   }
   std::memset(Host(base, dst), int(ctx.r4.u32 & 0xFF), n);
+  MarkCards(base, dst, n);
 }
 
 REX_HOOK_RAW(sub_8378DAE0) {
@@ -339,6 +347,7 @@ REX_HOOK_RAW(sub_8378DAE0) {
     return;
   }
   std::memset(Host(base, dst), int(ctx.r4.u32 & 0xFF), n);
+  MarkCards(base, dst, n);
 }
 
 namespace {
