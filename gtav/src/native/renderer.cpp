@@ -60,6 +60,9 @@
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
+REXCVAR_DEFINE_INT32(gtav_native_pipeline_cache_save_s, 20, "GTAV",
+                     "Native renderer: at most one pipeline cache save in this many seconds while new pipelines appear "
+                     "(each save copies the whole cache in memory)");
 REXCVAR_DEFINE_INT32(gtav_native_vma_block_mb, 0, "GTAV",
                      "Size of the device memory blocks the allocator shares between resources (0: its default, 256 MB "
                      "on a heap over 1 GB). On Switch each block is one allocation in the game's malloc heap");
@@ -991,7 +994,9 @@ class Renderer {
   void MaybeSavePipelineCache(uint32_t new_pipelines) {
     pipelines_since_save_ += new_pipelines;
     auto now = std::chrono::steady_clock::now();
-    if (!pipelines_since_save_ || now - last_cache_save_ < std::chrono::seconds(20)) return;
+    if (!pipelines_since_save_ ||
+        now - last_cache_save_ < std::chrono::seconds(REXCVAR_GET(gtav_native_pipeline_cache_save_s)))
+      return;
     last_cache_save_ = now;
     pipelines_since_save_ = 0;
     // Both the get (vkGetPipelineCacheData copies the whole cache: ~9 ms for 17 MB, a render-thread
