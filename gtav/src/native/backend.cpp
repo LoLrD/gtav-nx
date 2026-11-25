@@ -4999,7 +4999,7 @@ struct Backend::Impl {
   std::map<uint32_t, uint64_t> draw_memo_reg_diffs;
   void FillDrawMemoKey(DrawMemoKey& k, const DrawCommand& d, const uint8_t* r, RenderTarget* const color[4],
                        uint32_t count, RenderTarget* depth, bool colorless, RenderShader* ps) {
-    std::memset(&k, 0, sizeof(k));
+    std::memset(&k, 0, offsetof(DrawMemoKey, elements));
     k.vs_hash = d.vs_hash;
     k.ps_hash = d.ps_hash;
     k.vs_use = d.vs_use;
@@ -5019,27 +5019,28 @@ struct Backend::Impl {
     k.bound_fb = bound_fb;
     for (uint32_t i = 0; i < 4; i++) k.bound_color[i] = bound_color[i];
     k.bound_depth = bound_depth;
+    std::memset(k.elements, 0, sizeof(k.elements));
     std::memcpy(k.elements, d.elements, sizeof(VertexElement) * d.element_count);
-    std::memcpy(k.regs, r, kRegShadowSize);
   }
-  DrawMemo* FindDrawMemo(const DrawMemoKey& k) {
+  DrawMemo* FindDrawMemo(const DrawMemoKey& k, const DrawCommand& d, const uint8_t* r) {
     bool shaders = false, regs = false;
     for (auto& m : draw_memos) {
       if (m.frame != frame || m.key.vs_hash != k.vs_hash || m.key.ps_hash != k.ps_hash) continue;
       shaders = true;
-      if (std::memcmp(&m.key, &k, sizeof(k)) == 0) {
+      if (std::memcmp(&m.key, &k, offsetof(DrawMemoKey, elements)) != 0 ||
+          std::memcmp(m.key.elements, d.elements, sizeof(VertexElement) * d.element_count) != 0)
+        continue;
+      if (std::memcmp(m.key.regs, r, kRegShadowSize) == 0) {
         m.used = ++draw_memo_uses;
         return &m;
       }
-      if (std::memcmp(m.key.regs, k.regs, kRegShadowSize) != 0) {
-        regs = true;
-        if (draw_memo_verify)
-          for (uint32_t at = 0; at < kRegShadowSize; at += 4)
-            if (std::memcmp(m.key.regs + at, k.regs + at, 4) != 0) {
-              draw_memo_reg_diffs[at]++;
-              break;
-            }
-      }
+      regs = true;
+      if (draw_memo_verify)
+        for (uint32_t at = 0; at < kRegShadowSize; at += 4)
+          if (std::memcmp(m.key.regs + at, r + at, 4) != 0) {
+            draw_memo_reg_diffs[at]++;
+            break;
+          }
     }
     if (!shaders) draw_memo_new_shaders++;
     else if (regs) draw_memo_regs++;
@@ -5319,7 +5320,7 @@ struct Backend::Impl {
     const bool memo_try = draw_memo_on && !dumping;
     if (memo_try) {
       FillDrawMemoKey(draw_memo_key, d, r, color, count, depth, colorless, ps);
-      memo = FindDrawMemo(draw_memo_key);
+      memo = FindDrawMemo(draw_memo_key, d, r);
     }
     const bool fast = memo && !draw_memo_verify;
     // Shared constant words 128-159, from the registers and the targets.
@@ -5512,6 +5513,7 @@ struct Backend::Impl {
       VerifyDrawMemo(*memo, out, d);
     } else if (memo_try && diag == kDiagOff) {
       out.key = draw_memo_key;
+      std::memcpy(out.key.regs, r, kRegShadowSize);
       out.frame = frame;
       out.used = ++draw_memo_uses;
       ReplaceDrawMemo() = out;
