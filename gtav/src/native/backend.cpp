@@ -375,6 +375,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_watch_full_frames, 64, "GTAV",
                      "Native renderer, with a write watch: frames after which a cached texture or buffer the watch "
                      "keeps finding unchanged is hashed in full anyway");
+REXCVAR_DEFINE_BOOL(gtav_native_resolve_audit, false, "GTAV",
+                    "Native renderer (diagnostic): log per resolve kind how many resolves a frame overwrite a "
+                    "destination nothing read since its last resolve, and how many copy the same source again");
 REXCVAR_DEFINE_BOOL(gtav_native_write_watch_verify, false, "GTAV",
                     "Native renderer: also hash textures and buffers the write watch says are unchanged, and "
                     "log how many had changed (diagnostic)");
@@ -1571,6 +1574,10 @@ struct ResolvedTexture {
   uint32_t cube_descriptor = 0;
   std::unordered_map<uint32_t, std::pair<std::unique_ptr<RenderTextureView>, std::unique_ptr<RenderFramebuffer>>>
       subresource_targets;  // key: face << 8 | level
+  uint64_t audit_frame = ~0ull, audit_written = 0;
+  const RenderTarget* audit_src = nullptr;
+  uint32_t audit_rect[8] = {}, audit_sub = 0;
+  bool audit_read = true;
 };
 
 // Write-watch state of a cached guest resource (write_watch.h): unchanged while the pages it was
@@ -1901,7 +1908,7 @@ struct Backend::Impl {
 
   ResolvedTexture* LatestResolved(uint32_t address, bool depth_fetch, uint32_t width = 0, uint32_t height = 0) {
     ResolvedTexture* r = FindResolved(address, depth_fetch, width, height);
-    if (r) r->used_frame = frame;
+    if (r) r->used_frame = frame, r->audit_read = true;
     return r;
   }
   ResolvedTexture* FindResolved(uint32_t address, bool depth_fetch, uint32_t width, uint32_t height) {
@@ -6351,6 +6358,7 @@ struct Backend::Impl {
     if (latest == resolved_latest.end() || !memory_pipeline) return 0;
     ResolvedTexture& r = resolved[latest->second];
     r.used_frame = frame;
+    r.audit_read = true;
     GuestLayout g;
     if (!GuestLayoutOf(r, &g)) return 0;
     auto& m = memory_images[address];
@@ -6530,6 +6538,7 @@ struct Backend::Impl {
 
   void QueueWriteback(RenderCommandList* list, ResolvedTexture& r, uint32_t address, const FramePacket& f,
                       const ResolveCommand& rc) {
+    r.audit_read = true;
     if (!memory_pipeline || r.width * r.height > kWritebackMaxTexels) return;
     GuestLayout g;
     if (!GuestLayoutOf(r, &g) || (rc.dest_bytes && g.size > rc.dest_bytes)) return;
@@ -6962,6 +6971,28 @@ struct Backend::Impl {
     return target.second.get();
   }
 
+  bool resolve_audit = false;
+  std::map<std::string, std::array<uint32_t, 3>> audit_counts;  // label -> resolves, overwritten unread, same copy again
+  void AuditResolve(ResolvedTexture& dst, const RenderTarget* src, bool depth, uint32_t x1, uint32_t y1, uint32_t x2,
+                    uint32_t y2, uint32_t px, uint32_t py, uint32_t sub) {
+    const uint32_t rect[8] = {px, py, px + (x2 - x1), py + (y2 - y1), x1, y1, x2, y2};
+    auto& c = audit_counts[fmt::format("dl {:02X} {}{}x{}", cur_draw_list, depth ? "depth " : "", x2 - x1, y2 - y1)];
+    c[0]++;
+    if (dst.audit_frame == frame && dst.audit_sub == sub) {
+      const bool covers = rect[0] <= dst.audit_rect[0] && rect[1] <= dst.audit_rect[1] && rect[2] >= dst.audit_rect[2] &&
+                          rect[3] >= dst.audit_rect[3];
+      if (!dst.audit_read && covers) c[1]++;
+      if (!depth && dst.audit_src == src && dst.audit_written == src->written && std::equal(rect, rect + 8, dst.audit_rect))
+        c[2]++;
+    }
+    dst.audit_frame = frame;
+    dst.audit_sub = sub;
+    dst.audit_src = src;
+    dst.audit_written = src->written;
+    dst.audit_read = false;
+    std::copy(rect, rect + 8, dst.audit_rect);
+  }
+
   void Resolve(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
     ScopedMs timer{t_resolve};
     fetch_cache.valid = false;
@@ -7088,6 +7119,7 @@ struct Backend::Impl {
     x2 = std::min(x2, x1 + (dw > px ? dw - px : 0));
     y2 = std::min(y2, y1 + (dh > py ? dh - py : 0));
     if (x2 <= x1 || y2 <= y1) return;
+    if (resolve_audit) AuditResolve(dst, src, depth_resolve, x1, y1, x2, y2, px, py, rc.dest_face << 8 | rc.dest_level);
     if (rc.has_rect && rc.has_point) {
       if (!depth_resolve) {
         auto c = regs::Color(r, int(source));
@@ -7524,6 +7556,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         for (auto& [c, k] : v) REXLOG_INFO("[native]   PASSDIAG {:6.1f} per frame: {}", c / n, k);
         s.pass_reasons.clear();
       }
+      for (auto& [k, c] : s.audit_counts)
+        REXLOG_INFO("[native]   RESOLVEAUDIT {:6.2f} per frame: {} ({:.2f} overwritten unread, {:.2f} same copy again)",
+                    c[0] / n, k, c[1] / n, c[2] / n);
+      s.audit_counts.clear();
+      s.resolve_audit = REXCVAR_GET(gtav_native_resolve_audit);
       s.stat_fetch_resolves = 0;
       auto& t = s.tprof;
       REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
