@@ -60,6 +60,9 @@
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
+REXCVAR_DEFINE_INT32(gtav_native_shot_burst, 0, "GTAV",
+                     "Native renderer diagnostic (live): screenshot the next N presented frames in a row (to "
+                     "GTAV_NATIVE_SHOT_DIR or logs/shots)");
 REXCVAR_DEFINE_INT32(gtav_native_pipeline_cache_save_s, 20, "GTAV",
                      "Native renderer: at most one pipeline cache save in this many seconds while new pipelines appear "
                      "(each save copies the whole cache in memory)");
@@ -1694,6 +1697,12 @@ class Renderer {
   }
 
   bool WantShot(uint64_t index) {
+    if (const int32_t burst = REXCVAR_GET(gtav_native_shot_burst); burst > 0) {
+      rex::cvar::SetFlagByName("gtav_native_shot_burst", std::to_string(burst - 1));
+      std::error_code ec;
+      std::filesystem::create_directories(ShotDir(), ec);
+      return true;
+    }
     if (key_shot_.exchange(false)) {
       std::error_code ec;
       std::filesystem::create_directories(ShotDir(), ec);
