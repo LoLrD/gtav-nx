@@ -411,10 +411,14 @@ constexpr uint32_t kSamplerDescriptors = 1024;
 constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kOverflow = 3, kFirstTextureDescriptor = 4;
 // Smaller chunks on the phone: three frames in flight each kept 64 MB chunks mostly empty.
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-constexpr uint64_t kUploadChunk = 32ull << 20;
+#define GTAV_UPLOAD_CHUNK_DEFAULT 32
 #else
-constexpr uint64_t kUploadChunk = 64ull << 20;
+#define GTAV_UPLOAD_CHUNK_DEFAULT 64
 #endif
+REXCVAR_DEFINE_INT32(gtav_native_upload_chunk_mb, GTAV_UPLOAD_CHUNK_DEFAULT, "GTAV",
+                     "Native renderer: size of the per-frame upload memory blocks (constants, converted vertices); "
+                     "each frame in flight keeps as many as its largest frame needed (read at start)");
+uint64_t g_upload_chunk = uint64_t(GTAV_UPLOAD_CHUNK_DEFAULT) << 20;
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
 constexpr uint32_t kMaxTargetRows = 4096;
@@ -1453,6 +1457,7 @@ struct UploadRing {
   std::vector<Chunk> chunks;
   size_t chunk = 0;
   uint64_t offset = 0;
+  uint64_t peak = 0, largest = 0;
   // Frames recorded on several threads: the render thread's own allocations and the record
   // contexts' spans (Backend::Impl::ContextUpload) come through AllocateShared.
   std::unique_ptr<std::mutex> mutex = std::make_unique<std::mutex>();
@@ -1462,16 +1467,17 @@ struct UploadRing {
   }
 
   UploadAllocation Allocate(uint64_t size, uint64_t alignment = 256) {
+    largest = std::max(largest, size);
     offset = (offset + alignment - 1) & ~(alignment - 1);
-    if (offset + size > kUploadChunk) {
+    if (offset + size > g_upload_chunk) {
       chunk++;
       offset = 0;
     }
-    if (size > kUploadChunk) size = kUploadChunk;  // callers keep allocations far below this
+    if (size > g_upload_chunk) size = g_upload_chunk;  // callers keep allocations far below this
     while (chunks.size() <= chunk) {
       Chunk c;
       c.buffer = device->createBuffer(RenderBufferDesc::UploadBuffer(
-          kUploadChunk, RenderBufferFlag::CONSTANT | RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
+          g_upload_chunk, RenderBufferFlag::CONSTANT | RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
                             RenderBufferFlag::DEVICE_ADDRESSABLE));
       c.cpu = static_cast<uint8_t*>(c.buffer->map());
       c.gpu = c.buffer->getDeviceAddress();
@@ -1484,6 +1490,7 @@ struct UploadRing {
   }
 
   void Reset() {
+    peak = std::max(peak, chunk * g_upload_chunk + offset);
     chunk = 0;
     offset = 0;
   }
@@ -2529,14 +2536,21 @@ struct Backend::Impl {
     }
     if (frame % 600 == 0) {
       size_t upload_chunks = upload.chunks.size();
-      for (const auto& p : parked) upload_chunks += p.upload.chunks.size();
+      uint64_t upload_peak = std::exchange(upload.peak, 0), upload_largest = std::exchange(upload.largest, 0);
+      for (auto& p : parked) {
+        upload_chunks += p.upload.chunks.size();
+        upload_peak = std::max(upload_peak, std::exchange(p.upload.peak, 0));
+        upload_largest = std::max(upload_largest, std::exchange(p.upload.largest, 0));
+      }
       uint64_t target_bytes = 0;
       for (const auto& [key, t] : targets)
         if (t.texture) target_bytes += uint64_t(t.width) * t.height * std::max(1u, t.msaa) * 4;
       REXLOG_INFO("[native] caches: {} textures {:.0f} MB (budget {} MB), {} buffers {:.0f} MB; {} upload chunks "
-                  "({} MB), {} render targets (~{} MB at 4 B/px)",
+                  "({} MB, largest frame {:.1f} MB, largest allocation {:.2f} MB), {} render targets (~{} MB at 4 "
+                  "B/px)",
                   textures.size(), total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0,
-                  upload_chunks, (upload_chunks * kUploadChunk) >> 20, targets.size(), target_bytes >> 20);
+                  upload_chunks, (upload_chunks * g_upload_chunk) >> 20, upload_peak / 1048576.0,
+                  upload_largest / 1048576.0, targets.size(), target_bytes >> 20);
       REXLOG_INFO("[native] texture memory per 600 frames: {} textures created ({} over 1 MB, {} in the arena); "
                   "device memory: {} allocations ({} MB), {} frees",
                   texture_allocs.created, texture_allocs.large, texture_allocs.in_arena,
@@ -2792,6 +2806,7 @@ struct Backend::Impl {
     rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 2.0));
     g_pixel_scale_inv = 1.0f / rs;
     if (rs != 1.0f) REXLOG_INFO("[native] render scale {:.3f} (full-width targets)", rs);
+    g_upload_chunk = uint64_t(std::clamp(REXCVAR_GET(gtav_native_upload_chunk_mb), 8, 256)) << 20;
     upload.device = dev;
     for (auto& p : parked) p.upload.device = dev;
     RenderDescriptorSetBuilder set;
