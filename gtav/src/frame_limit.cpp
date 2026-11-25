@@ -41,6 +41,9 @@ REXCVAR_DEFINE_INT32(gtav_vehicle_fps, 120, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_audio_unsync, true, "GTAV",
                     "Above 30 fps: stop the audio update waiting for the next 16 ms audio frame "
                     "(otherwise the game cannot exceed 62.5 fps)");
+REXCVAR_DEFINE_BOOL(gtav_audio_unsync_at_30, false, "GTAV",
+                    "At gtav_fps_limit 30: pace frames with this limiter instead of the game's own, and stop the "
+                    "audio update waiting for the next 16 ms audio frame (frames otherwise take 32 or 48 ms)");
 REXCVAR_DEFINE_BOOL(gtav_no_power_throttling, true, "GTAV",
                     "Windows: opt out of power throttling (EcoQoS / efficiency cores, ignored timer "
                     "resolution) while the window is hidden, minimized or in the background");
@@ -142,13 +145,13 @@ REX_HOOK_RAW(sub_827B5878) {
       default: break;
     }
   }
-  if (limit == 30) {
+  if (limit == 30 && !REXCVAR_GET(gtav_audio_unsync_at_30)) {
     Store32(base, kFrameIntervalVblanks, 2);  // the 360's value (also after a switch from another limit)
     __imp__sub_827B5878(ctx, base);
     return;
   }
   Store32(base, kFrameIntervalVblanks, 0);
-  if (REXCVAR_GET(gtav_audio_unsync)) base[kAudioSyncTimedOut] = 1;
+  if (REXCVAR_GET(gtav_audio_unsync) || limit == 30) base[kAudioSyncTimedOut] = 1;
   __imp__sub_827B5878(ctx, base);
   if (limit <= 0) return;
   using clock = std::chrono::steady_clock;
