@@ -34,6 +34,10 @@ REXCVAR_DECLARE(bool, xma_persistent_enable);
 #include <atomic>
 #include <chrono>
 
+#if defined(__APPLE__)
+#include <time.h>
+#endif
+
 extern "C" {
 #include "libavutil/cpu.h"
 #include "libavutil/log.h"
@@ -257,6 +261,18 @@ bool TakePending(uint32_t context_id) {
   return (g_pending[context_id / 32].fetch_and(~bit, std::memory_order_acquire) & bit) != 0;
 }
 
+std::atomic<double> g_worker_cpu_ms{0};
+
+double ThreadCpuMsXma() {
+#if defined(__APPLE__)
+  timespec t{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+  return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+#else
+  return 0;
+#endif
+}
+
 int64_t NowMsXma() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -307,13 +323,18 @@ void ReportXma() {
   const uint64_t blocks_written = XmaContext::blocks_written_.exchange(0, std::memory_order_relaxed);
   const uint64_t verified_same = XmaContext::verified_same_.exchange(0, std::memory_order_relaxed);
   const uint64_t verified_different = XmaContext::verified_different_.exchange(0, std::memory_order_relaxed);
+  static double worker_cpu_at = 0;
+  const double worker_cpu = g_worker_cpu_ms.load(std::memory_order_relaxed);
+  const double worker_cpu_percent = (worker_cpu - worker_cpu_at) / double(now - last) * 100.0;
+  worker_cpu_at = worker_cpu;
   REXLOG_INFO("[xma] on the calling thread, {:.1f} s: kicks {} with {} contexts decoded, {:.1f} ms (max "
               "{:.2f} ms); locks {} with {} contexts, {:.1f} ms waiting (max {:.2f} ms)",
               double(now - last) / 1000.0, kicks, kick_contexts, double(kick_ns) / 1e6, double(kick_max) / 1e6,
               locks, lock_contexts, double(lock_ns) / 1e6, double(lock_max) / 1e6);
-  REXLOG_INFO("[xma] split (mode {}): worker {} contexts in {:.1f} ms (max {:.2f} ms), fallback of the "
-              "kick thread {}; from the kick to the data ready mean {:.0f} us and max {:.2f} ms ({} measurements)",
-              REXCVAR_GET(audio_xma_in_worker), of_the_worker, double(work_ns) / 1e6,
+  REXLOG_INFO("[xma] split (mode {}): worker thread cpu {:.1f} %, {} contexts in {:.1f} ms (max {:.2f} ms), "
+              "fallback of the kick thread {}; from the kick to the data ready mean {:.0f} us and max {:.2f} ms ({} "
+              "measurements)",
+              REXCVAR_GET(audio_xma_in_worker), worker_cpu_percent, of_the_worker, double(work_ns) / 1e6,
               double(work_max) / 1e6, of_the_backup,
               latency_n ? double(latency_ns) / double(latency_n) / 1e3 : 0.0, double(latency_max) / 1e6,
               latency_n);
@@ -327,7 +348,12 @@ void ReportXma() {
 
 void XmaDecoder::WorkerThreadMain() {
   int64_t last_sweep_ns = 0;
+  int64_t last_cpu_ns = 0;
   while (worker_running_) {
+    if (NowNs() - last_cpu_ns >= 100'000'000) {
+      last_cpu_ns = NowNs();
+      g_worker_cpu_ms.store(ThreadCpuMsXma(), std::memory_order_relaxed);
+    }
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
     // First the ones a kick has just enabled: they are reached without walking all 320 or touching their
