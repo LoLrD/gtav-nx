@@ -317,6 +317,12 @@ REXCVAR_DEFINE_BOOL(gtav_native_resolve_discard, true, "GTAV",
                     "Native renderer: resolve copies over a whole destination do not load its old contents");
 REXCVAR_DEFINE_BOOL(gtav_native_defer_clears, true, "GTAV",
                     "Native renderer: apply resolve clears in the target's next render pass instead of a pass of their own");
+REXCVAR_DEFINE_BOOL(gtav_native_resolve_keep_clears, false, "GTAV",
+                    "Native renderer: a resolve reading only texels outside the source's deferred clears leaves "
+                    "them deferred (no render pass of their own between the halves of a split resolve)");
+REXCVAR_DEFINE_BOOL(gtav_native_clear_aliases_first, false, "GTAV",
+                    "Native renderer: a clear's alias clears run before its own pass and its G-buffer alpha clear "
+                    "inside it, so the draws after the clear keep that pass");
 REXCVAR_DEFINE_INT32(gtav_native_resolve_src_barrier, 0, "GTAV",
                      "Native renderer: a colour resolve first ends its source's render pass and makes the source "
                      "SHADER_READ, before anything else of the resolve (0: off, 1: full-width sources only, 2: every "
@@ -2907,7 +2913,7 @@ struct Backend::Impl {
   std::string seq_note;
 
   void Transition(RenderCommandList* list, RenderTexture* t, RenderTextureLayout layout) {
-    if (!pending_clears.empty() && layout != RenderTextureLayout::COLOR_WRITE) FlushClearsOf(list, t);
+    if (!pending_clears.empty() && layout != RenderTextureLayout::COLOR_WRITE && t != clears_kept) FlushClearsOf(list, t);
     auto& cur = layouts[t];
     if (cur == layout) return;
     if (pass_stats) {
@@ -3818,6 +3824,16 @@ struct Backend::Impl {
   };
   std::unordered_map<RenderTarget*, std::vector<PendingClear>> pending_clears;
   bool defer_clears = true;
+  const RenderTexture* clears_kept = nullptr;  // a resolve's source whose deferred clears it does not read
+  uint32_t stat_clears_kept = 0;
+  bool ClearsOutside(RenderTarget* t, const RenderRect& read) const {
+    auto it = pending_clears.find(t);
+    if (it == pending_clears.end()) return false;
+    for (const auto& c : it->second)
+      if (c.rect.left < read.right && read.left < c.rect.right && c.rect.top < read.bottom && read.top < c.rect.bottom)
+        return false;
+    return true;
+  }
   void FlushClears(RenderCommandList* list, RenderTarget* t) {
     if (pending_clears.find(t) == pending_clears.end()) return;
     RenderTarget* targets[4] = {t};
@@ -6276,11 +6292,6 @@ struct Backend::Impl {
     uint32_t count = ActiveTargets(r, std::min(height, kMaxTargetRows), targets, &depth, z || stencil);
     if (!color) count = 0;
     if (count == 0 && !depth) return;
-    // Depth/stencil-only clears of the bound pass's depth target stay in that pass (see DrawFront).
-    if (count == 0 && depth == bound_depth && bound_fb && bound_color[0] && bound_color[0]->msaa == depth->msaa) {
-    } else {
-      BindTargets(list, targets, count, depth);
-    }
     RenderColor col(((c.color >> 16) & 0xFF) / 255.0f, ((c.color >> 8) & 0xFF) / 255.0f, (c.color & 0xFF) / 255.0f,
                     (c.color >> 24) / 255.0f);
     // Clears cover the rects passed to D3D Clear (all of the target without any), clipped by the
@@ -6312,14 +6323,12 @@ struct Backend::Impl {
     };
     const RenderRect* rc;
     uint32_t rn;
-    for (uint32_t i = 0; i < count; i++)
-      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) ClearAttachment(list, i, col, rc, rn);
-    if (depth && rects_for(depth, &rc, &rn)) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF, rc, rn);
     // The same EDRAM under another color format is another host target here, and D3D sets the new
     // surface's format only at the next draw, so the registers can still name the previous one: the
     // phone pass clears 2D0 while it reads 7e3 and then draws 8888, which kept the stale 8888
     // contents (a box around the phone). A clear wipes the memory, so clear every alias of it.
     auto surface = regs::Surface(r);
+    std::vector<RenderTarget*> aliases;
     for (uint32_t i = 0; i < count; i++) {
       if (!(c.flags & (1u << i))) continue;
       uint32_t base = regs::Color(r, int(i)).base;
@@ -6327,11 +6336,28 @@ struct Backend::Impl {
         if (&t == targets[i] || t.depth || !t.texture || (key & 0xFFF) != base || ((key >> 17) & 0x3FFF) != surface.pitch ||
             (key >> 31) != surface.msaa)
           continue;
-        RenderTarget* alias = &t;
+        aliases.push_back(&t);
+      }
+    }
+    bool aliases_first = REXCVAR_GET(gtav_native_clear_aliases_first) && !dumping;
+    for (RenderTarget* alias : aliases)
+      aliases_first = aliases_first && std::find(targets, targets + count, alias) == targets + count;
+    auto clear_aliases = [&] {
+      for (RenderTarget* alias : aliases) {
         BindTargets(list, &alias, 1, nullptr);
         if (rects_for(alias, &rc, &rn)) list->clearColor(0, col, rc, rn);
       }
+    };
+    if (aliases_first) clear_aliases();
+    // Depth/stencil-only clears of the bound pass's depth target stay in that pass (see DrawFront).
+    if (count == 0 && depth == bound_depth && bound_fb && bound_color[0] && bound_color[0]->msaa == depth->msaa) {
+    } else {
+      BindTargets(list, targets, count, depth);
     }
+    for (uint32_t i = 0; i < count; i++)
+      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) ClearAttachment(list, i, col, rc, rn);
+    if (depth && rects_for(depth, &rc, &rn)) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF, rc, rn);
+    if (!aliases_first) clear_aliases();
     // G-buffer RT2 (600) leftover alpha: the G-buffer clear (target 0 at 180) leaves RT2 alone, and
     // where no G-buffer draw lands (sky) the Xbox keeps alpha 1 there (the emulator's resolve of
     // RT2 to 06AA0000 has it; natively the top tile kept 0). That alpha is a flag the screen-space
@@ -6345,8 +6371,13 @@ struct Backend::Impl {
             ((key >> 12) & 0xF) != 0 || ("," + alpha1 + ",").find(fmt::format(",{:X},", key & 0xFFF)) == std::string::npos)
           continue;
         RenderTarget* rt = &t;
-        BindTargets(list, &rt, 1, nullptr);
-        list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        const uint32_t in_pass = uint32_t(std::find(bound_color, bound_color + 4, rt) - bound_color);
+        if (aliases_first && bound_fb && in_pass < 4) {
+          ClearAttachment(list, in_pass, RenderColor(0.0f, 0.0f, 0.0f, 1.0f), nullptr, 0);
+        } else {
+          BindTargets(list, &rt, 1, nullptr);
+          list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        }
         if (rt3_alpha_logged++ < 3)
           REXLOG_INFO("[native] G-buffer clear: target {:03X} cleared to alpha 1", uint32_t(key & 0xFFF));
       }
@@ -7180,7 +7211,25 @@ struct Backend::Impl {
     std::copy(rect, rect + 8, dst.audit_rect);
   }
 
+  struct ResolveRect {
+    uint32_t x1, y1, x2, y2, px, py;
+  };
+  static ResolveRect SourceRect(const ResolveCommand& rc, const RenderTarget* src, uint32_t dw, uint32_t dh) {
+    ResolveRect q{0, 0, std::min(dw, src->width), std::min(dh, src->height), 0, 0};
+    if (rc.has_rect) {
+      q.x1 = rc.source_rect[0], q.y1 = rc.source_rect[1];
+      q.x2 = std::min(rc.source_rect[2], src->width), q.y2 = std::min(rc.source_rect[3], src->height);
+    }
+    q.px = rc.has_point ? rc.dest_point[0] : q.x1, q.py = rc.has_point ? rc.dest_point[1] : q.y1;
+    q.x2 = std::min(q.x2, q.x1 + (dw > q.px ? dw - q.px : 0));
+    q.y2 = std::min(q.y2, q.y1 + (dh > q.py ? dh - q.py : 0));
+    return q;
+  }
   void Resolve(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
+    ResolveBody(list, f, rc);
+    clears_kept = nullptr;
+  }
+  void ResolveBody(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
     ScopedMs timer{t_resolve};
     fetch_cache.valid = false;
     slot_generation++;  // (the block memo; the slot memo is invalidated by address below)
@@ -7204,7 +7253,15 @@ struct Backend::Impl {
         front_format = uint32_t(c.format);
         front_pitch = surface.pitch;
       }
-      FlushClears(list, src);
+      const ResolveRect rr = SourceRect(rc, src, dw, dh);
+      if (REXCVAR_GET(gtav_native_resolve_keep_clears) && !dumping && !src->msaa && rr.x2 > rr.x1 && rr.y2 > rr.y1 &&
+          ClearsOutside(src, ScaleRect(RenderRect{int32_t(rr.x1), int32_t(rr.y1), int32_t(rr.x2), int32_t(rr.y2)},
+                                       src->scale))) {
+        clears_kept = src->texture.get();
+        stat_clears_kept++;
+      } else {
+        FlushClears(list, src);
+      }
       if (const int32_t barrier = REXCVAR_GET(gtav_native_resolve_src_barrier);
           barrier > 0 && src->descriptor && (barrier > 1 || surface.pitch >= 1280))
         Transition(list, src->texture.get(), RenderTextureLayout::SHADER_READ);
@@ -7297,14 +7354,8 @@ struct Backend::Impl {
       dst.cube_faces = 0;
     }
     if (cube && rc.dest_level == 0) dst.cube_faces |= 1u << rc.dest_face;
-    uint32_t x1 = 0, y1 = 0, x2 = std::min(dw, src->width), y2 = std::min(dh, src->height);
-    if (rc.has_rect) {
-      x1 = rc.source_rect[0], y1 = rc.source_rect[1];
-      x2 = std::min(rc.source_rect[2], src->width), y2 = std::min(rc.source_rect[3], src->height);
-    }
-    uint32_t px = rc.has_point ? rc.dest_point[0] : x1, py = rc.has_point ? rc.dest_point[1] : y1;
-    x2 = std::min(x2, x1 + (dw > px ? dw - px : 0));
-    y2 = std::min(y2, y1 + (dh > py ? dh - py : 0));
+    const ResolveRect rr = SourceRect(rc, src, dw, dh);
+    const uint32_t x1 = rr.x1, y1 = rr.y1, x2 = rr.x2, y2 = rr.y2, px = rr.px, py = rr.py;
     if (x2 <= x1 || y2 <= y1) return;
     if (resolve_audit) AuditResolve(dst, src, depth_resolve, x1, y1, x2, y2, px, py, rc.dest_face << 8 | rc.dest_level);
     if (rc.has_rect && rc.has_point) {
