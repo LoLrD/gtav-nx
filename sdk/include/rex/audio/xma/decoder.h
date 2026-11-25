@@ -54,6 +54,8 @@ class XmaDecoder {
     tls_kicks_ = 0;
     tls_kicks_looping_ = 0;
   }
+  static void SetDeferWake(bool defer) { tls_defer_wake_ = defer; }
+  static void WakeDeferred();
   static uint32_t kicks() { return tls_kicks_; }
   static uint32_t kicks_looping() { return tls_kicks_looping_; }
 
@@ -70,6 +72,9 @@ class XmaDecoder {
   static inline thread_local bool tls_quiet_kicks_ = false;
   static inline thread_local uint32_t tls_kicks_ = 0;
   static inline thread_local uint32_t tls_kicks_looping_ = 0;
+  static inline thread_local bool tls_defer_wake_ = false;
+  static inline thread_local bool tls_wake_pending_ = false;
+  static inline XmaDecoder* instance_ = nullptr;
 
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
     return as->ReadRegister(addr);
