@@ -2812,6 +2812,7 @@ struct Backend::Impl {
   std::vector<std::string> pass_labels[Backend::kFramesInFlight];
   std::map<std::string, uint64_t> pass_label_draws;
   std::string cur_pass_label;
+  uint8_t cur_draw_list = kNoDrawList;
   std::unordered_map<std::string, std::pair<double, uint32_t>> pass_gpu;  // label -> ms, passes
   uint32_t pass_gpu_frames = 0;
   void PassStamp(RenderCommandList* list, std::string label) {
@@ -3670,7 +3671,8 @@ struct Backend::Impl {
     MaybeCutStream();  // a new command list from here, when the frame is recorded in chunks
     list->setFramebuffer(fb.get());
     if (pass_times) {
-      cur_pass_label = fmt::format("targets {}x{} {}c fmt {}{}{}", count ? color[0]->width : depth ? depth->width : 0,
+      cur_pass_label = fmt::format("dl {:02X} targets {}x{} {}c fmt {}{}{}", cur_draw_list,
+                                   count ? color[0]->width : depth ? depth->width : 0,
                                    count ? color[0]->height : depth ? depth->height : 0, count,
                                    count ? uint32_t(color[0]->format) : 0, depth ? " +depth" : "",
                                    count && color[0]->msaa ? " msaa" : "");
@@ -7125,7 +7127,7 @@ struct Backend::Impl {
                          rc.dest_level == 0 && dst.discard_framebuffer && REXCVAR_GET(gtav_native_resolve_discard);
       list->setFramebuffer(whole ? dst.discard_framebuffer.get() : ResolveFramebuffer(dst, rc.dest_face, rc.dest_level));
       PassBegin("resolve copy");
-      if (pass_times) PassStamp(list, fmt::format("resolve copy {}x{}", x2 - x1, y2 - y1));
+      if (pass_times) PassStamp(list, fmt::format("dl {:02X} resolve copy {}x{}", cur_draw_list, x2 - x1, y2 - y1));
       pass_end = "resolve copy";
       bound_fb = nullptr;
       // Host texels: source and destination share the scale, so the copy stays 1:1.
@@ -7372,6 +7374,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.MarkCubeSkips(f);
   for (size_t ci = 0; ci < f.commands.size(); ci++) {
     const auto& c = f.commands[ci];
+    s.cur_draw_list = c.draw_list;
     if (ci == s.full_size_from) s.BeginFullSize(list);
     if (!s.skip_commands.empty() && s.skip_commands[ci]) {
       if (c.kind == CommandKind::kDraw) {
