@@ -169,6 +169,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   context_bitmap_.Resize(kContextCount);
 
   worker_running_ = true;
+  instance_ = this;
   work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(work_event_);
   worker_thread_ = system::object_ref<system::XHostThread>(
@@ -615,7 +616,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         }
       }
       g_pending_from_ns.store(NowNs(), std::memory_order_release);
-      work_event_->Set();
+      if (tls_defer_wake_) {
+        tls_wake_pending_ = true;
+      } else {
+        work_event_->Set();
+      }
     }
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
@@ -714,6 +719,13 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 #pragma warning(suppress : 4065)
     }
   }
+}
+
+void XmaDecoder::WakeDeferred() {
+  tls_defer_wake_ = false;
+  if (!tls_wake_pending_) return;
+  tls_wake_pending_ = false;
+  instance_->work_event_->Set();
 }
 
 void XmaDecoder::Pause() {

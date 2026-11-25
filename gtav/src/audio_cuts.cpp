@@ -35,9 +35,12 @@ REXCVAR_DEFINE_DOUBLE(gtav_audio_silence_db, 0, "GTAV",
                       "Sources whose loudest voice route gain is below this level in dB (e.g. -48) are treated as "
                       "silent: not generated or mixed, their XMA parsed without decoding; 6 dB lower to stay audible; "
                       "0 = only zero gains");
+REXCVAR_DEFINE_BOOL(gtav_audio_batch_kicks, false, "GTAV",
+                    "Wake the XMA decoder thread once after the mixer has generated all sources instead of on every "
+                    "kick (audio_xma_in_worker 1 or 2)");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters, "
-                      "silence; all when empty) are ignored (A/B runs)");
+                      "silence, batch; all when empty) are ignored (A/B runs)");
 REXCVAR_DECLARE(bool, gtav_audio_diag);
 
 namespace {
@@ -75,7 +78,7 @@ std::array<std::atomic<uint64_t>, 6> g_loud_db{};
 std::array<std::atomic<uint64_t>, 64> g_route_dest{};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
 std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
-constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16;
+constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16, kAbBatch = 32;
 std::atomic<uint32_t> g_ab_off{0};
 
 bool AbOff(uint32_t what) { return (g_ab_off.load(std::memory_order_relaxed) & what) != 0; }
@@ -148,8 +151,9 @@ void CheckAb() {
              : word == "controller" ? kAbController
              : word == "filters"    ? kAbFilters
              : word == "silence"    ? kAbSilence
+             : word == "batch"      ? kAbBatch
                                     : 0;
-    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence;
+    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch;
   }
   if (off != g_ab_off.exchange(off)) REXLOG_INFO("[audio-ab] off {}", off);
 }
@@ -331,7 +335,10 @@ REX_HOOK_RAW(sub_831C4708) {
   BuildFrameState(base, ctx.r3.u32);
   Report();
   const auto start = Now();
+  const bool batch = REXCVAR_GET(gtav_audio_batch_kicks) && !AbOff(kAbBatch);
+  if (batch) rex::audio::XmaDecoder::SetDeferWake(true);
   __imp__sub_831C4708(ctx, base);
+  if (batch) rex::audio::XmaDecoder::WakeDeferred();
   AddTime(g_ns_sources, start);
 }
 
