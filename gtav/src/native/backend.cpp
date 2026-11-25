@@ -29,6 +29,7 @@
 #include "byteswap_simd.h"
 
 #include <algorithm>
+#include <bitset>
 #include <map>
 #include <tuple>
 #include <chrono>
@@ -417,9 +418,72 @@ namespace {
 // Tree-orb diagnostic (F11 cycles, logs/diag_mode sets): on the draws picked by
 // GTAV_NATIVE_DIAG_PS / GTAV_NATIVE_DIAG_VS=hash,hash or ALL (default: VS 49CD0CC3ED116BB1),
 // override one pipeline stage to find the one that drops the leaf pixels.
-enum DiagMode : uint32_t { kDiagOff, kDiagDepthAlways, kDiagNoCull, kDiagFlat, kDiagFlatDepthAlways, kDiagModes };
-const char* const kDiagNames[kDiagModes] = {"off", "depth_always", "no_cull", "flat", "flat+depth_always"};
+enum DiagMode : uint32_t { kDiagOff, kDiagDepthAlways, kDiagNoCull, kDiagFlat, kDiagFlatDepthAlways, kDiagConst, kDiagModes };
+const char* const kDiagNames[kDiagModes] = {"off", "depth_always", "no_cull", "flat", "flat+depth_always", "const"};
 std::atomic<uint32_t> g_diag_mode{kDiagOff};
+
+REXCVAR_DEFINE_STRING(gtav_native_diag_no_pixels, "", "GTAV",
+                      "GPU-cost diagnostic (breaks the picture): draws of these draw lists (hex, comma-separated, or "
+                      "all) get a 1x1 scissor");
+REXCVAR_DEFINE_STRING(gtav_native_diag_const_ps, "", "GTAV",
+                      "GPU-cost diagnostic (breaks the picture): colour draws of these draw lists use a pixel shader "
+                      "writing a constant to every target");
+REXCVAR_DEFINE_STRING(gtav_native_diag_no_draws, "", "GTAV",
+                      "GPU-cost diagnostic (breaks the picture): draws of these draw lists are recorded but not issued");
+REXCVAR_DEFINE_STRING(gtav_native_diag_half_draws, "", "GTAV",
+                      "GPU-cost diagnostic (breaks the picture): every second draw of these draw lists is not issued");
+
+struct DrawListMask {
+  std::string spec;
+  std::bitset<256> lists;
+  void Update(const std::string& value) {
+    if (value == spec) return;
+    spec = value;
+    lists.reset();
+    if (value == "all") lists.set();
+    size_t at = 0;
+    while (at < value.size()) {
+      size_t end = value.find(',', at);
+      if (end == std::string::npos) end = value.size();
+      const std::string one = value.substr(at, end - at);
+      at = end + 1;
+      char* stop = nullptr;
+      const unsigned long dl = std::strtoul(one.c_str(), &stop, 16);
+      if (stop != one.c_str() && dl < 256) lists.set(dl);
+    }
+  }
+  bool Has(uint8_t dl) const { return lists.test(dl); }
+};
+
+REXCVAR_DEFINE_BOOL(gtav_native_vertex_inputs_used, false, "GTAV",
+                    "Native renderer: pipelines declare only the vertex inputs their vertex shader reads (from the "
+                    "SPIR-V) instead of the declaration plus zero inputs at all 32 locations");
+
+uint32_t SpirvInputsRead(const uint8_t* bytes, size_t size) {
+  if (size < 20 || size % 4) return ~0u;
+  const uint32_t* w = reinterpret_cast<const uint32_t*>(bytes);
+  const size_t n = size / 4;
+  if (w[0] != 0x07230203u) return ~0u;
+  std::unordered_map<uint32_t, uint32_t> location;
+  std::unordered_set<uint32_t> inputs, read;
+  for (size_t i = 5; i < n;) {
+    const uint32_t count = w[i] >> 16, op = w[i] & 0xFFFF;
+    if (!count || i + count > n) return ~0u;
+    if (op == 71 && count >= 4 && w[i + 2] == 30) location[w[i + 1]] = w[i + 3];
+    if (op == 59 && count >= 4 && w[i + 3] == 1) inputs.insert(w[i + 2]);
+    if ((op == 61 || op == 65 || op == 66) && count >= 4) read.insert(w[i + 3]);
+    i += count;
+  }
+  uint32_t mask = 0;
+  for (uint32_t id : inputs)
+    if (auto it = location.find(id); it != location.end() && it->second < 32 && read.count(id)) mask |= 1u << it->second;
+  return mask;
+}
+
+REXCVAR_DEFINE_BOOL(gtav_native_resolve_census, false, "GTAV",
+                    "Native renderer diagnostic: classify colour resolve copies by whether the destination could "
+                    "take the source's image (same format, size and texels; the source not used again before a "
+                    "full clear), logged every 300 frames");
 
 REXCVAR_DEFINE_INT32(gtav_native_diag_all, 0, "GTAV",
                      "Diagnostic: apply this F11 mode to every draw (3 = flat pixel shader; for GPU-cost A/B)");
@@ -850,11 +914,13 @@ class SpirvPreload {
                 }
               }
               if (name.empty()) break;
+              const uint32_t inputs = SpirvInputsRead(data.data(), data.size());
               auto shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
               {
                 std::lock_guard lock(mutex_);
                 creating_.erase(name);
                 modules_[name] = std::move(shader);
+                module_inputs_[name] = inputs;
               }
               cv_.notify_all();
               (*created)++;
@@ -869,12 +935,15 @@ class SpirvPreload {
   }
 
   // A module created ahead of use (1), or the file's bytes to create it now (2), else 0.
-  int TakeShader(const std::string& name, std::unique_ptr<RenderShader>* shader, std::vector<uint8_t>* data) {
+  int TakeShader(const std::string& name, std::unique_ptr<RenderShader>* shader, std::vector<uint8_t>* data,
+                 uint32_t* inputs) {
     std::unique_lock lock(mutex_);
     cv_.wait(lock, [&] { return creating_.count(name) == 0; });
     if (auto it = modules_.find(name); it != modules_.end()) {
       *shader = std::move(it->second);
       modules_.erase(it);
+      *inputs = module_inputs_[name];
+      module_inputs_.erase(name);
       return 1;
     }
     auto it = files_.find(name);
@@ -922,6 +991,7 @@ class SpirvPreload {
   std::vector<std::string> pending_;         // .spv files the workers have not created yet
   std::unordered_set<std::string> creating_;
   std::unordered_map<std::string, std::unique_ptr<RenderShader>> modules_;
+  std::unordered_map<std::string, uint32_t> module_inputs_;
   std::condition_variable cv_;
   std::atomic<bool> done_{false};
 };
@@ -2008,6 +2078,14 @@ struct Backend::Impl {
 
   bool rect_gs = true;  // rect lists expanded by rectlist_gs (false: on the CPU, see RectCorners)
   std::unique_ptr<RenderShader> blit_vs, blit_ps, rectlist_gs, depth_ps, resolve_ps, depth_pack_ps, diag_flat_ps, alpha_ps;
+  std::unique_ptr<RenderShader> diag_const_ps;
+  std::unordered_map<const RenderShader*, uint32_t> vs_inputs;
+  std::unordered_map<uint64_t, uint32_t> pipeline_inputs;
+  uint64_t input_stat_draws = 0, input_stat_inputs = 0, input_stat_frames = 0;
+  DrawListMask diag_no_pixels, diag_const_ps_lists, diag_no_draws, diag_half_draws;
+  uint32_t diag_half_count = 0;
+  uint64_t front_serial = 0;
+  RenderPipeline* front_pipeline = nullptr;
   std::unique_ptr<RenderPipeline> depth_pack_pipeline;
   std::unique_ptr<RenderPipeline> depth_copy_pipeline;
   std::unordered_map<uint32_t, std::unique_ptr<RenderPipeline>> resolve_pipelines;  // by destination format
@@ -2841,7 +2919,19 @@ struct Backend::Impl {
   bool pass_times = false;
   std::unique_ptr<RenderQueryPool> pass_pools[Backend::kFramesInFlight];
   std::vector<std::string> pass_labels[Backend::kFramesInFlight];
-  std::map<std::string, uint64_t> pass_label_draws, pass_label_indices, pass_label_pixels;
+  std::map<std::string, uint64_t> pass_label_draws, pass_label_indices, pass_label_pixels, pass_label_pipelines,
+      pass_label_vs;
+  std::unordered_set<uint64_t> pass_vs;
+  RenderPipeline* pass_pipeline = nullptr;
+  void PassDrawn(uint64_t vs_hash) {
+    if (front_pipeline != pass_pipeline) pass_label_pipelines[cur_pass_label]++, pass_pipeline = front_pipeline;
+    pass_vs.insert(vs_hash);
+  }
+  void PassShadersDone() {
+    if (!pass_vs.empty()) pass_label_vs[cur_pass_label] += pass_vs.size();
+    pass_vs.clear();
+    pass_pipeline = nullptr;
+  }
   uint64_t dl_passes[256] = {}, dl_barriers[256] = {};
   double pass_groups[Backend::kPassGroups] = {};
   bool pass_groups_valid = false;
@@ -3042,6 +3132,8 @@ struct Backend::Impl {
     diag_flat_ps = device->createShader(g_native_diag_flat_ps, sizeof(g_native_diag_flat_ps), "PSDiagFlat",
                                         RenderShaderFormat::SPIRV);
     alpha_ps = device->createShader(g_native_alpha_ps, sizeof(g_native_alpha_ps), "PSAlpha", RenderShaderFormat::SPIRV);
+    diag_const_ps = device->createShader(g_native_diag_const_ps, sizeof(g_native_diag_const_ps), "PSDiagConst",
+                                         RenderShaderFormat::SPIRV);
     resolve_ps = device->createShader(g_native_resolve_ps, sizeof(g_native_resolve_ps), "PSResolve",
                                       RenderShaderFormat::SPIRV);
     depth_pack_ps = device->createShader(g_native_depth_pack_ps, sizeof(g_native_depth_pack_ps), "PSDepthPack",
@@ -3233,7 +3325,8 @@ struct Backend::Impl {
     std::unique_ptr<RenderShader> shader;
     std::vector<uint8_t> data;
     std::unique_ptr<RenderShader> ready;
-    if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
+    uint32_t inputs = ~0u;
+    if (int got = g_spirv_preload.TakeShader(name, &ready, &data, &inputs); got == 1) {
       shader = std::move(ready);
     } else if (got == 2) {
       shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
@@ -3258,6 +3351,7 @@ struct Backend::Impl {
         std::fclose(f);
       }
     }
+    if (!pixel && shader) vs_inputs[shader.get()] = data.empty() ? inputs : SpirvInputsRead(data.data(), data.size());
     // vs_<hash>.indirect (written by the shader census): the shader fetches vertices by a computed
     // index and needs the raw streams (Draw fills its vfetchIndirect records).
     if (!pixel && shader) {
@@ -3723,6 +3817,7 @@ struct Backend::Impl {
     MaybeCutStream();  // a new command list from here, when the frame is recorded in chunks
     list->setFramebuffer(fb.get());
     if (pass_times) {
+      PassShadersDone();
       const RenderTarget* first = count ? color[0] : depth;
       const uint32_t real_w = first ? Sz(first->width, first->scale) : 0, real_h = first ? Sz(first->height, first->scale) : 0;
       cur_pass_label = fmt::format("dl {:02X} targets {}x{} px {}x{} {}c fmt {}{}{}", cur_draw_list,
@@ -3739,6 +3834,8 @@ struct Backend::Impl {
     pass_draws = 0;
     for (uint32_t i = 0; i < 4; i++) bound_color[i] = i < count ? color[i] : nullptr;
     bound_depth = depth;
+    if (census_on && !census_flushing)
+      for (uint32_t i = 0; i < count; i++) CensusEvent(color[i], kCensusDrawn);
     for (uint32_t i = 0; i < count && !pending_clears.empty(); i++) {
       auto it = pending_clears.find(color[i]);
       if (it == pending_clears.end()) continue;
@@ -3838,7 +3935,72 @@ struct Backend::Impl {
     if (pending_clears.find(t) == pending_clears.end()) return;
     RenderTarget* targets[4] = {t};
     bound_fb = nullptr;  // the pass that applies them
+    census_flushing = true;
     BindTargets(list, targets, 1, nullptr);
+    census_flushing = false;
+  }
+
+  enum CensusOutcome : uint32_t { kCensusOther, kCensusClearFlag, kCensusFullClear, kCensusSplit, kCensusResolve,
+                                  kCensusDrawn, kCensusUnused, kCensusOutcomes };
+  struct CensusPending {
+    uint64_t pixels;
+    bool whole;
+    const ResolvedTexture* dst;
+    uint32_t rect[4];
+  };
+  bool census_on = false, census_flushing = false;
+  std::unordered_map<const RenderTarget*, CensusPending> census_pending;
+  uint64_t census_n[2][kCensusOutcomes] = {}, census_px[2][kCensusOutcomes] = {};
+  uint64_t census_frames = 0;
+  void CensusCount(const CensusPending& p, CensusOutcome o) {
+    census_n[p.whole][o]++;
+    census_px[p.whole][o] += p.pixels;
+  }
+  void CensusEvent(const RenderTarget* t, CensusOutcome o) {
+    auto it = census_pending.find(t);
+    if (it == census_pending.end()) return;
+    CensusCount(it->second, o);
+    census_pending.erase(it);
+  }
+  void CensusResolve(const RenderTarget* src, const ResolvedTexture& dst, RenderFormat dst_format, uint32_t x1,
+                     uint32_t y1, uint32_t x2, uint32_t y2, uint32_t px, uint32_t py, uint32_t flags) {
+    const float s = src->scale;
+    const uint64_t pixels = uint64_t(Sz(x2 - x1, s)) * Sz(y2 - y1, s);
+    const bool identity = dst_format == src->format && !src->msaa && dst.mips == 1 && dst.layers == 1 && px == x1 &&
+                          py == y1 && Sz(dst.width, s) == Sz(src->width, s) && Sz(dst.height, s) == Sz(src->height, s);
+    if (auto it = census_pending.find(src); it != census_pending.end()) {
+      const auto& p = it->second;
+      const bool disjoint = y1 >= p.rect[3] || y2 <= p.rect[1] || x1 >= p.rect[2] || x2 <= p.rect[0];
+      CensusCount(p, p.dst == &dst && disjoint && identity ? kCensusSplit : kCensusResolve);
+      census_pending.erase(it);
+    }
+    if (!identity) {
+      census_n[0][kCensusOther]++;
+      census_px[0][kCensusOther] += pixels;
+      return;
+    }
+    const bool whole = x1 == 0 && y1 == 0 && x2 >= std::min(dst.width, src->width) && y2 >= std::min(dst.height, src->height);
+    CensusPending p{pixels, whole, &dst, {x1, y1, x2, y2}};
+    if ((flags & 0x100) && whole) return CensusCount(p, kCensusClearFlag);
+    census_pending[src] = p;
+  }
+  void CensusFrameEnd() {
+    for (auto& [t, p] : census_pending) CensusCount(p, kCensusUnused);
+    census_pending.clear();
+    if (++census_frames < 300) return;
+    static constexpr const char* kNames[kCensusOutcomes] = {"not identity", "cleared by the resolve", "full clear",
+                                                            "split (other part next)", "resolved again", "drawn into",
+                                                            "unused to frame end"};
+    std::string line;
+    for (uint32_t w = 0; w < 2; w++)
+      for (uint32_t o = 0; o < kCensusOutcomes; o++)
+        if (census_n[w][o])
+          line += fmt::format("; {}{}: {:.1f} copies {:.3f} Mpx", o ? (w ? "whole, " : "part, ") : "", kNames[o],
+                              census_n[w][o] / 300.0, census_px[w][o] / 300.0 / 1e6);
+    REXLOG_INFO("[native] resolve census per frame{}", line);
+    std::memset(census_n, 0, sizeof(census_n));
+    std::memset(census_px, 0, sizeof(census_px));
+    census_frames = 0;
   }
   void FlushClearsOf(RenderCommandList* list, const RenderTexture* texture) {
     for (auto& [t, v] : pending_clears)
@@ -3977,7 +4139,8 @@ struct Backend::Impl {
     k.stencil[1] = regs::Read(r, regs::RB_STENCILREFMASK_BF);
     k.mode = regs::Read(r, regs::PA_SU_SC_MODE_CNTL);
     k.alpha_to_mask = (regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1;
-    uint32_t exp = (REXCVAR_GET(gtav_native_depth_clamp) ? 1u : 0u) | (REXCVAR_GET(gtav_native_lightvol_keep) ? 2u : 0u);
+    uint32_t exp = (REXCVAR_GET(gtav_native_depth_clamp) ? 1u : 0u) | (REXCVAR_GET(gtav_native_lightvol_keep) ? 2u : 0u) |
+                   (REXCVAR_GET(gtav_native_vertex_inputs_used) ? 4u : 0u);
     return Hash(&k, sizeof(k), Hash(&exp, 4, layout_hash));
   }
   static uint64_t LayoutHash(const vertex_layout::HostLayout& vl) {
@@ -4100,6 +4263,7 @@ struct Backend::Impl {
                           bd.blendOp == RenderBlendOperation::ADD && bd.srcBlendAlpha == RenderBlend::ONE &&
                           bd.dstBlendAlpha == RenderBlend::ZERO && bd.blendOpAlpha == RenderBlendOperation::ADD);
       bd.renderTargetWriteMask = uint8_t((mask >> (4 * i)) & 0xF);
+      if (diag == kDiagConst) bd.blendEnabled = false;
       if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) {
         // Magenta into RT0's colour only (also from the alpha-only leaf pass); RT0 alpha and the other
         // G-buffer targets keep what is behind (the lighting pass reads RT0 alpha: writing it turned
@@ -4112,16 +4276,29 @@ struct Backend::Impl {
 
     // Input layout: the declaration's elements, plus zero inputs for every other location (the
     // shader's declared inputs are not known here; unused ones are ignored).
-    std::vector<RenderInputElement> elements(vl.elements, vl.elements + vl.element_count);
-    bool used[32] = {};
-    for (const auto& e : elements) used[e.location] = true;
+    uint32_t read = ~0u;
+    if (REXCVAR_GET(gtav_native_vertex_inputs_used))
+      if (auto vi = vs_inputs.find(vs); vi != vs_inputs.end()) read = vi->second;
+    std::vector<RenderInputElement> elements;
+    bool used[32] = {}, stream_read[kMaxStreams] = {};
+    for (uint32_t i = 0; i < vl.element_count; i++) {
+      const RenderInputElement& e = vl.elements[i];
+      used[e.location] = true;
+      if (!(read >> e.location & 1)) continue;
+      elements.push_back(e);
+      stream_read[e.slotIndex] = true;
+    }
+    bool dummy = false;
     for (uint32_t loc = 0; loc < 32; loc++)
-      if (!used[loc])
+      if (!used[loc] && (read >> loc & 1)) {
         elements.emplace_back("TEXCOORD", 31, loc, RenderFormat::R32G32B32A32_FLOAT, kDummyStream, 0);
+        dummy = true;
+      }
     std::vector<RenderInputSlot> slots;
     for (uint32_t s = 0; s < kMaxStreams; s++)
-      if (vl.stream_used[s]) slots.emplace_back(s, vl.host_stride[s]);
-    slots.emplace_back(kDummyStream, 0);
+      if (vl.stream_used[s] && (read == ~0u || stream_read[s])) slots.emplace_back(s, vl.host_stride[s]);
+    if (dummy || read == ~0u) slots.emplace_back(kDummyStream, 0);
+    pipeline_inputs[key] = uint32_t(elements.size());
     desc.inputElements = elements.data();
     desc.inputElementsCount = uint32_t(elements.size());
     desc.inputSlots = slots.data();
@@ -4133,7 +4310,7 @@ struct Backend::Impl {
     // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes. Not while
     // the pixel shader is still being translated: the draw then goes out depth-only under the same
     // key, and a record of that (ps 0) made every later run draw those surfaces unlit (grey world).
-    if (vs && ps != diag_flat_ps.get() && !TileOverride(ps_hash) && (ps || !ps_hash)) {
+    if (vs && ps != diag_flat_ps.get() && ps != diag_const_ps.get() && !TileOverride(ps_hash) && (ps || !ps_hash)) {
       PipelineBytesWriter w;
       uint8_t has_gs = desc.geometryShader != nullptr;
       PipelineFields(w, desc, elements, slots, sc, has_gs);
@@ -4562,6 +4739,7 @@ struct Backend::Impl {
     bool has_depth = false;
     bool indirect = false;  // the vertex shader fetches by a computed index (indirect_fetch_shaders)
     bool rect_cpu = false;
+    bool not_issued = false;
     // (The arrays are not zeroed per draw: DrawFront sets every field of a record it returns.)
     CachedBuffer* stream_buffer[kMaxStreams];  // guest vertex buffers (null: inline, snapshot or rect data)
     uint64_t stream_key[kMaxStreams];
@@ -5496,7 +5674,9 @@ struct Backend::Impl {
       draw_memo_hits++;
     } else {
     diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
+    if (count && diag == kDiagOff && ps && diag_const_ps_lists.Has(cur_draw_list) && diag_const_ps) diag = kDiagConst;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    if (diag == kDiagConst) ps = diag_const_ps.get();
     if (!colorless && count && bound_fb && REXCVAR_GET(gtav_native_keep_targets)) {
       uint32_t bound_count = 0;
       while (bound_count < 4 && bound_color[bound_count]) bound_count++;
@@ -5519,6 +5699,8 @@ struct Backend::Impl {
         early = true;
       }
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
+    if (auto pi = pipeline_inputs.find(pkey); pi != pipeline_inputs.end())
+      input_stat_draws++, input_stat_inputs += pi->second;
     pipeline = Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag,
                         colorless, d.vs_hash, d.ps_hash);
     if (!pipeline) {
@@ -5607,7 +5789,10 @@ struct Backend::Impl {
     }
     rec.viewports = std::max(bind_count, 1u);
     rec.vp = vp;
-    rec.scissor = scissor;
+    rec.scissor = diag_no_pixels.Has(cur_draw_list) ? RenderRect(0, 0, 1, 1) : scissor;
+    rec.not_issued = diag_no_draws.Has(cur_draw_list) || (diag_half_draws.Has(cur_draw_list) && !(diag_half_count++ & 1));
+    front_serial++;
+    front_pipeline = pipeline;
     rec.d = &d;
     rec.index = uint32_t(&d - f.draws.data());
     rec.pipeline = pipeline;
@@ -6154,7 +6339,8 @@ struct Backend::Impl {
     const uint32_t snap_first = d.snap_vertices && !rec.indirect ? d.snap_first : 0;
     const uint32_t first_index = d.snap_index_size ? 0 : d.start;
     const IndexSource ix = IndexData(f, d);
-    if (rect_cpu) {
+    if (rec.not_issued) {
+    } else if (rect_cpu) {
       list->drawInstanced(uint32_t(rc.rect_src.size() / 3) * 6, 1, 0, 0);
     } else if (d.primitive == 13 || d.primitive == 5) {
       // Quad list -> triangle list (0 1 2, 0 2 3 per quad); triangle fan -> triangle list (0 i i+1).
@@ -6308,6 +6494,9 @@ struct Backend::Impl {
                           std::min(c.rects[i][2] * scale, clip.right), std::min(c.rects[i][3] * scale, clip.bottom));
     bool partial = c.rect_count > 0 || clip.left > 0 || clip.top > 0 || clip.right < int32_t(cw) ||
                    clip.bottom < int32_t(ch);
+    if (census_on && !partial)
+      for (uint32_t i = 0; i < count; i++)
+        if (c.flags & (1u << i)) CensusEvent(targets[i], kCensusFullClear);
     std::vector<RenderRect> rects;
     // Returns the clear rects for target t (nullptr: all of it); false when nothing is left.
     auto rects_for = [&](const RenderTarget* t, const RenderRect** out, uint32_t* n) {
@@ -7430,6 +7619,7 @@ struct Backend::Impl {
       // A copy over the whole destination need not load its old contents first.
       const bool whole = px == 0 && py == 0 && x2 - x1 >= dw && y2 - y1 >= dh && rc.dest_face == 0 &&
                          rc.dest_level == 0 && dst.discard_framebuffer && REXCVAR_GET(gtav_native_resolve_discard);
+      if (census_on && !depth_resolve) CensusResolve(src, dst, dst_format, x1, y1, x2, y2, px, py, rc.flags);
       list->setFramebuffer(whole ? dst.discard_framebuffer.get() : ResolveFramebuffer(dst, rc.dest_face, rc.dest_level));
       PassBegin("resolve copy");
       if (pass_times) PassStamp(list, fmt::format("dl {:02X} resolve copy {}x{}", cur_draw_list, x2 - x1, y2 - y1));
@@ -7562,6 +7752,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.bound_fb = nullptr;
   s.pass_end = "frame start";
   s.pass_times = REXCVAR_GET(gtav_native_pass_gpu_times) && s.pass_labels[s.slot].empty();
+  s.diag_no_pixels.Update(REXCVAR_GET(gtav_native_diag_no_pixels));
+  s.diag_const_ps_lists.Update(REXCVAR_GET(gtav_native_diag_const_ps));
+  s.diag_no_draws.Update(REXCVAR_GET(gtav_native_diag_no_draws));
+  s.diag_half_draws.Update(REXCVAR_GET(gtav_native_diag_half_draws));
+  s.diag_half_count = 0;
+  s.census_on = REXCVAR_GET(gtav_native_resolve_census);
   if (s.pass_times) {
     if (!s.pass_pools[s.slot]) s.pass_pools[s.slot] = s.device->createQueryPool(Impl::kPassStamps);
     list->resetQueryPool(s.pass_pools[s.slot].get(), 0, Impl::kPassStamps);
@@ -7684,6 +7880,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     const auto& c = f.commands[ci];
     s.cur_draw_list = c.draw_list;
     const uint32_t passes_before = plume::g_statRenderPasses, barriers_before = plume::g_statBarriers;
+    const uint64_t front_before = s.front_serial;
     if (ci == s.full_size_from) s.BeginFullSize(list);
     if (!s.skip_commands.empty() && s.skip_commands[ci]) {
       if (c.kind == CommandKind::kDraw) {
@@ -7707,6 +7904,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         s.cur_draw = c.index + 1;
         s.pass_draws++;
         if (s.pass_times) {
+          if (s.front_serial != front_before) s.PassDrawn(f.draws[c.index].vs_hash);
           s.pass_label_draws[s.cur_pass_label]++;
           s.pass_label_indices[s.cur_pass_label] += f.draws[c.index].count;
         }
@@ -7889,7 +8087,15 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     break;
   }
   if (r && r->scale != 1.0f && s.upscale_ready && REXCVAR_GET(gtav_native_fsr)) r = s.UpscaleFront(list, *r);
+  if (s.census_on) s.CensusFrameEnd();
+  if (++s.input_stat_frames == 300) {
+    if (s.input_stat_draws)
+      REXLOG_INFO("[native] vertex inputs declared per draw {:.1f} (gtav_native_vertex_inputs_used {})",
+                  double(s.input_stat_inputs) / s.input_stat_draws, REXCVAR_GET(gtav_native_vertex_inputs_used));
+    s.input_stat_draws = s.input_stat_inputs = s.input_stat_frames = 0;
+  }
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)
+    s.PassShadersDone();
     list->setFramebuffer(nullptr);
     s.bound_fb = nullptr;
     s.PassStamp(list, "end");
@@ -7959,10 +8165,12 @@ void Backend::FrameComplete(uint32_t slot) {
       std::vector<std::pair<double, std::string>> v;
       double total = 0;
       for (auto& [k, e] : s.pass_gpu) {
-        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes, {:.0f} draws, {:.1f}k indices, {:.3f} Mpx)", k,
+        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes, {:.0f} draws, {:.1f}k indices, {:.3f} Mpx, "
+                                            "{:.0f} pipeline changes, {:.0f} vertex shaders)", k,
                                             e.second / 300.0, s.pass_label_draws[k] / 300.0,
                                             s.pass_label_indices[k] / 300.0 / 1000.0,
-                                            s.pass_label_pixels[k] / 300.0 / 1e6));
+                                            s.pass_label_pixels[k] / 300.0 / 1e6, s.pass_label_pipelines[k] / 300.0,
+                                            s.pass_label_vs[k] / 300.0));
         total += e.first;
       }
       std::sort(v.rbegin(), v.rend());
@@ -7980,6 +8188,8 @@ void Backend::FrameComplete(uint32_t slot) {
       s.pass_label_draws.clear();
       s.pass_label_indices.clear();
       s.pass_label_pixels.clear();
+      s.pass_label_pipelines.clear();
+      s.pass_label_vs.clear();
       std::fill(std::begin(s.dl_passes), std::end(s.dl_passes), 0);
       std::fill(std::begin(s.dl_barriers), std::end(s.dl_barriers), 0);
     }

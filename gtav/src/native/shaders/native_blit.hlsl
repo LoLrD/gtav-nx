@@ -128,6 +128,19 @@ float4 PSDiagFlat(float4 position : SV_Position, uint primitive : SV_PrimitiveID
     return float4(shade, 0.0, shade, 1.0);
 }
 
+struct DiagConstOut {
+    float4 c0 : SV_Target0;
+    float4 c1 : SV_Target1;
+    float4 c2 : SV_Target2;
+    float4 c3 : SV_Target3;
+};
+
+DiagConstOut PSDiagConst(float4 position : SV_Position) {
+    DiagConstOut o;
+    o.c0 = o.c1 = o.c2 = o.c3 = float4(0.5, 0.5, 0.5, 1.0);
+    return o;
+}
+
 // Frame dumps (GTAV_NATIVE_DUMP_ALPHA=1): per-draw snapshots show the target's alpha as grey.
 float4 PSAlpha(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float a = g_Textures[g_Push.TextureIndex].SampleLevel(g_Samplers[g_Push.SamplerIndex], uv, 0).a;
