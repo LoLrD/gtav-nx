@@ -1,0 +1,3 @@
+add_executable(rex_threading_stress threading_stress.cpp)
+target_link_libraries(rex_threading_stress PRIVATE rexcore)
+set_target_properties(rex_threading_stress PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
