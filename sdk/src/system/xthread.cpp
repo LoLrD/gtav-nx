@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <string>
 
 #include <fmt/format.h>
 
@@ -66,6 +67,13 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
+
+REXCVAR_DEFINE_STRING(switch_guest_audio_threads, "", "Kernel",
+                      "Switch: guest threads (hex, comma-separated) that run just below the presentation threads "
+                      "instead of at the guest priority, as a start routine or as start routine/first word of the "
+                      "start context (a trampoline whose context starts with the real routine); only for threads "
+                      "that sleep or block between short bursts of work, such as the game's audio feeder. Their "
+                      "Sleep(0) sleeps instead of yielding");
 
 namespace rex::system {
 
@@ -134,8 +142,30 @@ XThread::~XThread() {
 }
 
 thread_local XThread* current_xthread_tls_ = nullptr;
+thread_local bool guest_audio_thread_tls_ = false;
 
 namespace {
+
+bool IsGuestAudioThread(uint32_t entry, uint32_t context, memory::Memory* guest_memory) {
+  const std::string list = REXCVAR_GET(switch_guest_audio_threads);
+  for (size_t at = 0; at < list.size();) {
+    const size_t end = std::min(list.find(',', at), list.size());
+    const std::string item = list.substr(at, end - at);
+    at = end + 1;
+    const size_t slash = item.find('/');
+    if (item.empty() || std::stoul(item.substr(0, slash), nullptr, 16) != entry) {
+      continue;
+    }
+    if (slash == std::string::npos) {
+      return true;
+    }
+    if (context && memory::load_and_swap<uint32_t>(guest_memory->TranslateVirtual(context)) ==
+                       std::stoul(item.substr(slash + 1), nullptr, 16)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 XThread* GetBoundCurrentXThread() {
   return current_xthread_tls_;
@@ -364,9 +394,9 @@ namespace {
 // the GPU and the kernel's own workers. This is the scheme MarathonRecomp-NX
 // ships with. Host threads are told apart by the name their owner gives them
 // before Create().
-int SwitchPriorityFor(bool guest_thread, std::string_view name) {
+int SwitchPriorityFor(bool guest_thread, bool guest_audio, std::string_view name) {
   if (guest_thread) {
-    return REX_SWITCH_PRIO_GUEST;
+    return guest_audio ? REX_SWITCH_PRIO_PRESENT + 2 : REX_SWITCH_PRIO_GUEST;
   }
   // set_name() stores the name with the handle appended ("Audio Worker (F8000014)"),
   // so the prefix is compared. With an exact comparison the Audio Worker and the
@@ -487,15 +517,23 @@ X_STATUS XThread::Create() {
   rex::thread::Thread::CreationParameters params;
   params.stack_size = rex::round_up(size_t(REXCVAR_GET(guest_thread_host_stack_kb)) << 10, size_t(4096));
   params.create_suspended = true;
-  thread_ = rex::thread::Thread::Create(params, [this]() {
+  const bool guest_audio = guest_thread_ && !REXCVAR_GET(switch_guest_audio_threads).empty() &&
+                           IsGuestAudioThread(creation_params_.start_address, creation_params_.start_context,
+                                              memory());
+  if (guest_audio) {
+    REXSYS_INFO("XThread: guest thread {:08X} (context {:08X}) runs as an audio thread",
+                creation_params_.start_address, creation_params_.start_context);
+  }
+  thread_ = rex::thread::Thread::Create(params, [this, guest_audio]() {
     rex::initialize_seh_thread();
+    guest_audio_thread_tls_ = guest_audio;
 #if REX_PLATFORM_SWITCH
     std::string start_name;
     {
       std::lock_guard<std::mutex> names(g_thread_name_mutex);
       start_name = thread_name_;
     }
-    RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, start_name));
+    RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, guest_audio, start_name));
     if (guest_thread_) {
       RexSwitchPerfSetCurrentGuestEntry(creation_params_.start_address, creation_params_.start_context);
     }
@@ -1110,7 +1148,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
       // little so higher-priority threads get the core. priority_ is the guest increment, so it
       // must not be compared with the host ThreadPriority constants (kBelowNormal is 8 on POSIX:
       // every Sleep(0) became a 100 us nanosleep, ~1,500 times a frame on GTA V's update thread).
-      if (priority_ < 0) {
+      if (priority_ < 0 || guest_audio_thread_tls_) {
         rex::thread::Sleep(std::chrono::microseconds(100));
       } else if (const int32_t us = REXCVAR_GET(guest_sleep_zero_us); us > 0) {
         rex::thread::Sleep(std::chrono::microseconds(us));
