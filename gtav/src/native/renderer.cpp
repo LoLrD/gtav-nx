@@ -102,6 +102,8 @@ REXCVAR_DEFINE_STRING(gtav_native_ab, "", "GTAV",
 REXCVAR_DEFINE_STRING(gtav_native_ab_sweep, "", "GTAV",
                       "Native renderer benchmark: name=a|b;other=c|d;... runs each as gtav_native_ab for "
                       "gtav_native_ab_sweep_seconds, logs one SWEEP line per setting, restores it, then the next (wraps)");
+REXCVAR_DEFINE_STRING(gtav_mesa_env, "", "GTAV",
+                      "Environment set before the Vulkan device is created (driver knobs): NAME=VALUE;NAME2=VALUE2");
 REXCVAR_DEFINE_INT32(gtav_native_ab_sweep_seconds, 12, "GTAV",
                      "Native renderer: seconds each gtav_native_ab_sweep setting is flipped");
 REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
@@ -855,6 +857,7 @@ class Renderer {
       return false;
     }
 #endif
+    ApplyMesaEnv();
     interface_ = plume::CreateVulkanInterface();
     if (!interface_) {
       REXLOG_ERROR("[native] Plume Vulkan interface creation failed");
@@ -1040,6 +1043,26 @@ class Renderer {
   }
   std::atomic<bool> cache_writing_{false};
   std::thread cache_saver_;
+
+  static void ApplyMesaEnv() {
+    const std::string spec = REXCVAR_GET(gtav_mesa_env);
+    size_t at = 0;
+    while (at < spec.size()) {
+      size_t end = spec.find(';', at);
+      if (end == std::string::npos) end = spec.size();
+      const std::string one = spec.substr(at, end - at);
+      at = end + 1;
+      const size_t eq = one.find('=');
+      if (eq == std::string::npos || eq == 0) continue;
+      const std::string name = one.substr(0, eq), value = one.substr(eq + 1);
+#ifdef _WIN32
+      _putenv_s(name.c_str(), value.c_str());
+#else
+      setenv(name.c_str(), value.c_str(), 1);
+#endif
+      REXLOG_INFO("[native] driver environment {}={}", name, value);
+    }
+  }
 
   // Waits for the slot's previous frame and recycles what it left behind.
   void Retire(uint32_t slot) {
