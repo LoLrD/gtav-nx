@@ -100,6 +100,7 @@ REX_EXTERN(sub_82CE8BE8);
 REX_EXTERN(sub_82CE8B18);
 REX_EXTERN(sub_82C86EE8);
 REX_EXTERN(sub_82C7D360);
+REX_EXTERN(sub_82C871C0);
 REX_EXTERN(sub_82C7E370);
 REX_EXTERN(sub_82C6ACD0);
 REX_EXTERN(sub_82C6ACE8);
@@ -481,6 +482,13 @@ REX_HOOK_RAW(sub_82CE9CA8) {
             Call(ctx, base, sub_82D2DCD0, {});
             REXLOG_INFO("[controls] fill population");
           }
+          if (cmd == "set") {
+            std::istringstream r(rest);
+            std::string value;
+            r >> value;
+            REXLOG_INFO("[controls] set {} {}: {}", arg, value, rex::cvar::SetFlagByName(arg, value));
+          }
+          if (cmd == "weather") Call(ctx, base, sub_82C871C0, {ScratchString(ctx, base, arg)});
           if (cmd == "timescale") g_timescale = std::stof(arg);
           if (cmd == "shadowscale") Call(ctx, base, sub_82C7D360, {std::bit_cast<uint32_t>(std::stof(arg))});
           if (cmd == "lightshadows") Call(ctx, base, sub_82C7E370, {arg == "off" ? 1u : 0u});
