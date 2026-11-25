@@ -30,6 +30,9 @@
 
 REXCVAR_DEFINE_INT32(gtav_reflection_every, 1, "GTAV",
                      "Render the paraboloid reflection map (cars, glass, wet surfaces) every Nth frame (1 = game)");
+REXCVAR_DEFINE_INT32(gtav_sun_shadow_every, 1, "GTAV",
+                     "Render the sun's cascaded shadow map (the shadow draw list with the 640x640 cascades) every "
+                     "Nth frame; the frames between keep the previous map and its matrices (1 = game; live)");
 REXCVAR_DEFINE_INT32(gtav_light_shadow_every, 1, "GTAV",
                      "Render a local light's shadow map at most every Nth frame, the lights in turn (1 = game, "
                      "0 = never)");
@@ -67,6 +70,7 @@ constexpr uint32_t kDlFrameEnd = 0x1B;
 constexpr uint32_t kDlParaboloidReflection = 0x0A;
 constexpr uint32_t kDlShadows = 0x0C;
 constexpr float kLightShadowMaxWidth = 256.0f;
+constexpr float kSunCascadeWidth = 640.0f;
 constexpr uint32_t kTlsDrawList = 344;
 constexpr uint32_t kParaboloidShadowIndex = 1072;
 
@@ -93,6 +97,7 @@ uint64_t g_dl_indices[256] = {};
 uint32_t g_dl_report_frames = 0;
 std::atomic<bool> g_cuts_paused{false};
 uint32_t g_current_dl = 0xFFFFFFFF;
+uint32_t g_cascade_instance = 0xFFFFFFFF;
 
 bool Cut() { return !g_cuts_paused.load(std::memory_order_relaxed); }
 
@@ -151,6 +156,10 @@ bool SkipDrawList(uint32_t type) {
     const int32_t every = REXCVAR_GET(gtav_reflection_every);
     if (every > 1 && Cut() && g_dl_frame % uint32_t(every)) return true;
   }
+  if (type == kDlShadows && instance == g_cascade_instance) {
+    const int32_t every = REXCVAR_GET(gtav_sun_shadow_every);
+    if (every > 1 && Cut() && g_dl_frame % uint32_t(every)) return true;
+  }
   for (const auto& r : g_skip_rules)
     if (r.type == type && (r.instance < 0 || uint32_t(r.instance) == instance) && (!r.every || g_dl_frame % r.every))
       return true;
@@ -192,9 +201,13 @@ void ReportDrawListTimes() {
 }  // namespace
 
 bool SkipDraw(const uint8_t* base, uint32_t device) {
+  if (g_current_dl == kDlShadows) {
+    const float width = std::bit_cast<float>(Be32(base + device + native::d3d::kDevViewport + 8));
+    if (width == kSunCascadeWidth) g_cascade_instance = g_dl_instances[kDlShadows] - 1;
+    if (!Cut()) return false;
+    if (!REXCVAR_GET(gtav_light_shadow_draws)) return width <= kLightShadowMaxWidth;
+  }
   if (!Cut()) return false;
-  if (g_current_dl == kDlShadows && !REXCVAR_GET(gtav_light_shadow_draws))
-    return std::bit_cast<float>(Be32(base + device + native::d3d::kDevViewport + 8)) <= kLightShadowMaxWidth;
   return g_current_dl == kDlParaboloidReflection && !REXCVAR_GET(gtav_reflection_draws);
 }
 
