@@ -19,10 +19,12 @@ class SceneUpscale {
             uint32_t source_height);
   void Rcas(plume::RenderCommandList* list, uint32_t slot, uint32_t use, const plume::RenderTexture* source,
             const plume::RenderTextureView* view, plume::RenderFormat format, float sharpness_stops);
+  void Bilinear(plume::RenderCommandList* list, uint32_t slot, uint32_t use, const plume::RenderTexture* source,
+                const plume::RenderTextureView* view, plume::RenderFormat format, uint32_t width, uint32_t height);
 
  private:
   struct Pipelines {
-    std::unique_ptr<plume::RenderPipeline> easu, rcas;
+    std::unique_ptr<plume::RenderPipeline> easu, rcas, bilinear;
   };
 
   Pipelines& PipelinesFor(plume::RenderFormat format);
@@ -33,7 +35,7 @@ class SceneUpscale {
   plume::RenderDevice* device_ = nullptr;
   std::unique_ptr<plume::RenderSampler> sampler_;
   std::unique_ptr<plume::RenderPipelineLayout> layout_;
-  std::unique_ptr<plume::RenderShader> vertex_, easu_, rcas_;
+  std::unique_ptr<plume::RenderShader> vertex_, easu_, rcas_, bilinear_;
   std::unique_ptr<plume::RenderDescriptorSet> sets_[kSlots][kUses][2];
   std::unordered_map<uint32_t, Pipelines> pipelines_;
 };
