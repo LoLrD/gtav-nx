@@ -171,6 +171,18 @@ static void PinToCores(int) {}
 #endif
 
 namespace gtav::native {
+
+std::atomic<bool> g_sweep_gated{false}, g_sweep_restart{false};
+std::atomic<int> g_sweep_rounds{0};
+
+void GateAbSweep() { g_sweep_gated = true; }
+
+void StartAbSweep(int rounds) {
+  g_sweep_rounds = std::max(1, rounds);
+  g_sweep_restart = true;
+}
+
+bool AbSweepRunning() { return g_sweep_rounds > 0; }
 namespace {
 
 #ifdef __APPLE__
@@ -1950,6 +1962,11 @@ class Renderer {
   std::string SweepSpec() {
     const std::string spec = REXCVAR_GET(gtav_native_ab_sweep);
     const auto now = std::chrono::steady_clock::now();
+    if (g_sweep_restart.exchange(false)) {
+      sweep_spec_ = "\n";
+      ab_[0] = ab_[1] = {};
+      ab_frames_ = 0;
+    }
     if (spec != sweep_spec_) {
       sweep_spec_ = spec;
       sweep_.clear();
@@ -1967,7 +1984,7 @@ class Renderer {
       if (!sweep_.empty())
         REXLOG_INFO("[native] A/B sweep: {} settings, {} s each", sweep_.size(), REXCVAR_GET(gtav_native_ab_sweep_seconds));
     }
-    if (sweep_.empty()) return {};
+    if (sweep_.empty() || (g_sweep_gated && g_sweep_rounds <= 0)) return {};
     if (now - sweep_start_ >= std::chrono::seconds(std::max(1, REXCVAR_GET(gtav_native_ab_sweep_seconds)))) {
       if (ab_[0].n && ab_[1].n)
         REXLOG_INFO("[native] SWEEP {} {}|{}: {}: {} | {}: {}", ab_name_, ab_values_[0], ab_values_[1], ab_values_[0],
@@ -1976,6 +1993,10 @@ class Renderer {
       ab_frames_ = 0;
       sweep_at_ = (sweep_at_ + 1) % sweep_.size();
       sweep_start_ = now;
+      if (sweep_at_ == 0 && g_sweep_gated && --g_sweep_rounds <= 0) {
+        REXLOG_INFO("[native] A/B sweep done");
+        return {};
+      }
     }
     return sweep_[sweep_at_];
   }

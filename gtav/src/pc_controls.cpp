@@ -22,14 +22,24 @@
 #include <rex/ppc/func.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/runtime.h>
+#include <rex/ui/windowed_app_context.h>
 
 #include "native/safe_read.h"
+#if defined(__SWITCH__)
+extern "C" {
+#include <switch/types.h>
+extern u32 __nx_applet_exit_mode;
+NX_NORETURN void __libnx_exit(int rc);
+}
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
 #include <array>
 #include <sstream>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <bit>
@@ -37,11 +47,15 @@
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 #include <thread>
 #include <filesystem>
 #include <fstream>
 #include "native/paths.h"
+#include "native/renderer.h"
 
 REX_EXTERN(__imp__sub_82CE9CA8);  // PLAYER_PED_ID
 REX_EXTERN(sub_82C728A8);         // LOAD_STREAM(name, soundset)
@@ -92,6 +106,9 @@ REX_EXTERN(sub_82D315F8);
 REX_EXTERN(sub_82D31618);
 REX_EXTERN(sub_82CF1528);
 REX_EXTERN(sub_82CF1510);
+REX_EXTERN(sub_82CF0ED8);         // GET_NUMBER_OF_STREAMING_REQUESTS()
+REX_EXTERN(sub_82C76970);         // SET_GAMEPLAY_CAM_RELATIVE_HEADING(heading)
+REX_EXTERN(sub_82C76A08);         // SET_GAMEPLAY_CAM_RELATIVE_PITCH(pitch, rate)
 REX_EXTERN(sub_82CEBDE8);
 REX_EXTERN(sub_82C76758);
 REX_EXTERN(sub_82CD3960);
@@ -146,6 +163,10 @@ REXCVAR_DEFINE_BOOL(gtav_model_budget, true, "GTAV", "Full ped and vehicle model
 REXCVAR_DEFINE_BOOL(gtav_debug_commands, false, "GTAV",
                     "Test hook: <exe>/logs/native_cmd is run on the script thread once per second "
                     "('kill' = SET_ENTITY_HEALTH(player, 0)) and deleted");
+REXCVAR_DEFINE_STRING(gtav_bench_script, "", "GTAV",
+                      "Bench script (needs gtav_debug_commands): lines '[seconds after the player appears] command' "
+                      "run like native_cmd, plus wait <s>, settle <max s>, mark <name>, sweep <rounds>, quit; "
+                      "the A/B sweep then runs only on sweep");
 
 namespace {
 bool g_drivelog = false;  // "drivelog" debug command
@@ -233,6 +254,98 @@ uint32_t ScratchString(PPCContext& ctx, uint8_t* base, const std::string& text) 
   std::memcpy(base + at, text.data(), n);
   base[at + n] = 0;
   return at;
+}
+
+void QuitNow(rex::Runtime* runtime) {
+  if (runtime->kernel_state()) runtime->kernel_state()->TerminateTitle();
+  REXLOG_INFO("[bench] quit");
+  rex::FlushLogging();
+  std::fflush(nullptr);
+#if defined(__SWITCH__)
+  __nx_applet_exit_mode = 1;
+  __libnx_exit(0);
+#else
+  std::_Exit(0);
+#endif
+}
+
+struct BenchScript {
+  bool loaded = false;
+  std::vector<std::pair<double, std::string>> lines;
+  size_t next = 0;
+  std::chrono::steady_clock::time_point t0, resume, settle_until, settle_check;
+  bool sweeping = false, settling = false;
+  int settle_quiet = 0;
+};
+BenchScript g_bench;
+
+void LoadBench(std::chrono::steady_clock::time_point now) {
+  g_bench.loaded = true;
+  g_bench.t0 = g_bench.resume = now;
+  std::ifstream in(REXCVAR_GET(gtav_bench_script));
+  std::string line;
+  while (std::getline(in, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (line.empty() || line[0] == '#') continue;
+    char* end = nullptr;
+    const double at = std::strtod(line.c_str(), &end);
+    if (end != line.c_str() && *end == ' ')
+      g_bench.lines.emplace_back(at, std::string(end + 1));
+    else
+      g_bench.lines.emplace_back(-1.0, line);
+  }
+  gtav::native::GateAbSweep();
+  REXLOG_INFO("[bench] {}: {} lines", REXCVAR_GET(gtav_bench_script), g_bench.lines.size());
+}
+
+std::string BenchStep(PPCContext& ctx, uint8_t* base, std::chrono::steady_clock::time_point now) {
+  auto& b = g_bench;
+  if (!b.loaded) LoadBench(now);
+  if (now < b.resume) return {};
+  if (b.sweeping) {
+    if (gtav::native::AbSweepRunning()) return {};
+    b.sweeping = false;
+    REXLOG_INFO("[bench] sweep done");
+  }
+  if (b.settling) {
+    if (now < b.settle_check) return {};
+    b.settle_check = now + std::chrono::seconds(1);
+    const uint32_t requests = Call(ctx, base, sub_82CF0ED8, {});
+    b.settle_quiet = requests ? 0 : b.settle_quiet + 1;
+    if (b.settle_quiet < 3 && now < b.settle_until) return {};
+    b.settling = false;
+    REXLOG_INFO("[bench] settled ({} streaming requests)", requests);
+  }
+  if (b.next >= b.lines.size()) return {};
+  const auto& [at, text] = b.lines[b.next];
+  if (at >= 0 && now < b.t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::duration<double>(at)))
+    return {};
+  b.next++;
+  std::istringstream in(text);
+  std::string word, arg;
+  in >> word >> arg;
+  REXLOG_INFO("[bench] {:.1f} s: {}", std::chrono::duration<double>(now - b.t0).count(), text);
+  if (word == "wait") {
+    b.resume = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                         std::chrono::duration<double>(std::atof(arg.c_str())));
+  } else if (word == "settle") {
+    b.settling = true;
+    b.settle_quiet = 0;
+    b.settle_check = now;
+    b.settle_until = now + std::chrono::seconds(std::max(1, std::atoi(arg.c_str())));
+  } else if (word == "mark") {
+    REXLOG_INFO("[bench] MARK {}", arg);
+  } else if (word == "sweep") {
+    gtav::native::StartAbSweep(std::atoi(arg.c_str()));
+    b.sweeping = true;
+  } else if (word == "quit") {
+    rex::Runtime* runtime = rex::Runtime::instance();
+    if (auto* app = runtime->app_context()) app->CallInUIThread([runtime] { QuitNow(runtime); });
+  } else {
+    return text;
+  }
+  return {};
 }
 
 std::string g_pending_stream;  // debug command "stream <name>": LOAD_STREAM until it loads, play 3 s
@@ -425,19 +538,26 @@ REX_HOOK_RAW(sub_82CE9CA8) {
     }
     if (REXCVAR_GET(gtav_debug_commands)) {
       static auto next = now;
+      const auto path = gtav::native::ExeDir() / "logs" / "native_cmd";
+      std::string line;
       if (now >= next) {
         next = now + std::chrono::seconds(1);
-        const auto path = gtav::native::ExeDir() / "logs" / "native_cmd";
         std::error_code ec;
         if (std::filesystem::exists(path, ec)) {
+          std::getline(std::ifstream(path), line);
+          std::filesystem::remove(path, ec);
+        }
+      }
+      if (line.empty() && !REXCVAR_GET(gtav_bench_script).empty()) line = BenchStep(ctx, base, now);
+      {
+        if (!line.empty()) {
           std::string cmd, arg, rest;
           {
-            std::ifstream in(path);
+            std::istringstream in(line);
             in >> cmd >> arg;
             std::getline(in, rest);
             if (!rest.empty()) std::ofstream(path.string() + ".args") << rest;
           }
-          std::filesystem::remove(path, ec);
           if (cmd == "mission") {
             g_pending_mission = arg;
             g_mission_tries = 0;
@@ -450,6 +570,21 @@ REX_HOOK_RAW(sub_82CE9CA8) {
           }
           if (cmd == "model") g_pending_model = arg;  // e.g. player_zero (Michael), player_one, player_two
           if (cmd == "report") gtav::bug_report::Create("debug command");
+          if (cmd == "pos") {
+            uint32_t xyz[3];
+            CallVector(ctx, base, sub_82C9ADD8, {ped, 1}, xyz);
+            REXLOG_INFO("[controls] pos {:.1f} {:.1f} {:.1f} heading {:.1f}", std::bit_cast<float>(xyz[0]),
+                        std::bit_cast<float>(xyz[1]), std::bit_cast<float>(xyz[2]),
+                        std::bit_cast<float>(Call(ctx, base, sub_82C9AF18, {ped})));
+          }
+          if (cmd == "cam") {
+            std::istringstream r(arg + " " + rest);
+            float heading = 0, pitch = 0;
+            r >> heading >> pitch;
+            Call(ctx, base, sub_82C76970, {std::bit_cast<uint32_t>(heading)});
+            Call(ctx, base, sub_82C76A08, {std::bit_cast<uint32_t>(pitch), std::bit_cast<uint32_t>(1.0f)});
+            REXLOG_INFO("[controls] cam heading {:.1f} pitch {:.1f}", heading, pitch);
+          }
           if (cmd == "tp") {
             std::istringstream r(arg + " " + rest);
             float x = 0, y = 0, z = 0;

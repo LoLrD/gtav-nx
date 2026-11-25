@@ -26,4 +26,8 @@ void NoteGuestSwap(uint64_t frame_index);
 // the capture side reuses packets instead of regrowing a multi-MB arena every frame.
 FramePacket TakeSpare();
 
+void GateAbSweep();
+void StartAbSweep(int rounds);
+bool AbSweepRunning();
+
 }  // namespace gtav::native
