@@ -56,6 +56,11 @@ extern "C" void RexSwitchPerfSetCurrentGuestEntry(uint32_t entry, uint32_t conte
 // instead. S23 FE same-run A/B 11-22, 0 vs 50: 20.5/18.1 vs 19.4/17.8 fps: yield there too.
 REXCVAR_DEFINE_INT32(guest_sleep_zero_us, REX_GUEST_SLEEP_ZERO_US_DEFAULT, "Kernel",
                      "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
+REXCVAR_DEFINE_INT32(guest_thread_host_stack_kb, 16384, "Kernel",
+                     "Host stack of each guest thread in KB: the recompiled code runs on it, and on the Switch "
+                     "the whole stack comes out of the heap when the thread is created")
+    .range(256, 65536)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -480,7 +485,7 @@ X_STATUS XThread::Create() {
   RetainHandle();
 
   rex::thread::Thread::CreationParameters params;
-  params.stack_size = 16_MiB;  // Allocate a big host stack.
+  params.stack_size = rex::round_up(size_t(REXCVAR_GET(guest_thread_host_stack_kb)) << 10, size_t(4096));
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
@@ -1473,7 +1478,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
-    params.stack_size = 16_MiB;
+    params.stack_size = rex::round_up(size_t(REXCVAR_GET(guest_thread_host_stack_kb)) << 10, size_t(4096));
     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());
