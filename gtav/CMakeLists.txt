@@ -18,6 +18,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_compile_definitions(REX_PPC_FIXED_FLUSH_MODE)
 
+# Store cards: every guest store outside the stack marks its 4 KB page in a table at guest address 0
+# (generated code and the SDK's host writers); --gtav_native_store_cards reads them instead of hashing.
+option(GTAV_STORE_CARDS "Mark the 4 KB page of every guest store for the native renderer's write watch" ON)
+if(GTAV_STORE_CARDS)
+    add_compile_definitions(REX_STORE_CARDS)
+endif()
+
 # GTAV_GAME_DLL: the release layout. The exe holds no recompiled game code; it loads gtav_game.dll,
 # which the player's installer generates from their own discs and builds with the bundled clang
 # (fs/gtav_pch.h). The exe then needs no generated sources at all.

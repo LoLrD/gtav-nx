@@ -372,6 +372,12 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
 REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
                     "Apply the guest's scissor rectangle to draws (off: draws cover the whole target)");
+REXCVAR_DEFINE_INT32(gtav_native_watch_full_frames, 64, "GTAV",
+                     "Native renderer, with a write watch: frames after which a cached texture or buffer the watch "
+                     "keeps finding unchanged is hashed in full anyway");
+REXCVAR_DEFINE_BOOL(gtav_native_resolve_audit, false, "GTAV",
+                    "Native renderer (diagnostic): log per resolve kind how many resolves a frame overwrite a "
+                    "destination nothing read since its last resolve, and how many copy the same source again");
 REXCVAR_DEFINE_BOOL(gtav_native_write_watch_verify, false, "GTAV",
                     "Native renderer: also hash textures and buffers the write watch says are unchanged, and "
                     "log how many had changed (diagnostic)");
@@ -1568,6 +1574,10 @@ struct ResolvedTexture {
   uint32_t cube_descriptor = 0;
   std::unordered_map<uint32_t, std::pair<std::unique_ptr<RenderTextureView>, std::unique_ptr<RenderFramebuffer>>>
       subresource_targets;  // key: face << 8 | level
+  uint64_t audit_frame = ~0ull, audit_written = 0;
+  const RenderTarget* audit_src = nullptr;
+  uint32_t audit_rect[8] = {}, audit_sub = 0;
+  bool audit_read = true;
 };
 
 // Write-watch state of a cached guest resource (write_watch.h): unchanged while the pages it was
@@ -1898,7 +1908,7 @@ struct Backend::Impl {
 
   ResolvedTexture* LatestResolved(uint32_t address, bool depth_fetch, uint32_t width = 0, uint32_t height = 0) {
     ResolvedTexture* r = FindResolved(address, depth_fetch, width, height);
-    if (r) r->used_frame = frame;
+    if (r) r->used_frame = frame, r->audit_read = true;
     return r;
   }
   ResolvedTexture* FindResolved(uint32_t address, bool depth_fetch, uint32_t width, uint32_t height) {
@@ -3471,14 +3481,21 @@ struct Backend::Impl {
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
     // lookups (--gtav_native_write_watch_verify).
-    if (t.texture && watching && frame - t.full_frame < 64 && t.watch.Clean()) {  // no guest write since
+    if (t.texture && watching && frame - t.full_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_watch_full_frames))) &&
+        t.watch.Clean()) {  // no guest write since
       tprof.watched++;
-      if (REXCVAR_GET(gtav_native_write_watch_verify) && HashGuestTexture(words) != t.raw_hash)
-        (write_watch::Pending(t.watch.ranges[0], t.watch.ranges[1]) ||
-                 (t.watch.ranges[3] && write_watch::Pending(t.watch.ranges[2], t.watch.ranges[3]))
-             ? watch_late : watch_missed)++;
-      t.checked_frame = frame;
-      return t.descriptor;
+      if (!REXCVAR_GET(gtav_native_write_watch_verify) || HashGuestTexture(words) == t.raw_hash) {
+        t.checked_frame = frame;
+        return t.descriptor;
+      }
+      const bool late = write_watch::Pending(t.watch.ranges[0], t.watch.ranges[1]) ||
+                        (t.watch.ranges[3] && write_watch::Pending(t.watch.ranges[2], t.watch.ranges[3]));
+      (late ? watch_late : watch_missed)++;
+      if (!late && watch_missed_logged++ < 40)
+        REXLOG_INFO("[native] write watch missed a change: texture {:08X}+{:X} mips {:08X}+{:X} format {} {}x{} "
+                    "at frame {}, hashed at frame {}",
+                    t.watch.ranges[0], t.watch.ranges[1], t.watch.ranges[2], t.watch.ranges[3], words[1] & 0x3F,
+                    (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1, frame, t.full_frame);
     }
     if (t.texture && t.bytes > kSmallTexture &&
         frame - t.checked_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_recheck_frames))) &&
@@ -3503,6 +3520,8 @@ struct Backend::Impl {
       ScopedMs ft{tprof.full_ms};
       tprof.full++;
       tprof.full_bytes += t.bytes;
+      if (!t.watch.ranges[1] && !GuestTextureRanges(words, t.watch.ranges)) t.watch.ranges[1] = 0;
+      tprof.guest_bytes += uint64_t(t.watch.ranges[1]) + t.watch.ranges[3];
       const PreHashItem* pre = nullptr;
       if (prehash_on && t.pre_frame == frame && !std::memcmp(t.pre_words, words, sizeof(t.pre_words)))
         pre = PreHashed(t.pre_index);
@@ -4166,6 +4185,7 @@ struct Backend::Impl {
   uint64_t conv_bytes[4] = {}, conv_draws[4] = {};  // vertices converted: rect lists, inline, snapshots, rebuilt buffers
   struct TextureProfile {
     uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0, stable = 0;
+    uint64_t guest_bytes = 0;
     double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
   } tprof;
   // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
@@ -4289,6 +4309,7 @@ struct Backend::Impl {
   uint64_t stat_pipeline_binds = 0;  // vkCmdBindPipeline calls (5% of the render thread in the driver, 11-15)
   uint32_t prof_frames = 0;
   uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
+  std::atomic<uint32_t> watch_missed_logged{0};
   uint64_t hashed_bytes[2] = {};
 
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
@@ -5448,12 +5469,19 @@ struct Backend::Impl {
     if (b.checked_frame.load(std::memory_order_relaxed) == frame) return b.buffer.get();
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     if (b.buffer && watching && b.size == host_size && b.watch.ranges[0] == physical &&
-        b.watch.ranges[1] == guest_size && frame - b.full_frame < 64 && b.watch.Clean()) {  // unchanged
+        b.watch.ranges[1] == guest_size &&
+        frame - b.full_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_watch_full_frames))) &&
+        b.watch.Clean()) {  // unchanged
       rc.watched_buffers++;
-      if (REXCVAR_GET(gtav_native_write_watch_verify) && Hash(guest, guest_size) != b.content)
-        (write_watch::Pending(physical, uint32_t(guest_size)) ? rc.watch_late : rc.watch_missed)++;
-      b.checked_frame.store(frame, std::memory_order_release);
-      return b.buffer.get();
+      if (!REXCVAR_GET(gtav_native_write_watch_verify) || Hash(guest, guest_size) == b.content) {
+        b.checked_frame.store(frame, std::memory_order_release);
+        return b.buffer.get();
+      }
+      const bool late = write_watch::Pending(physical, uint32_t(guest_size));
+      (late ? rc.watch_late : rc.watch_missed)++;
+      if (!late && watch_missed_logged++ < 40)
+        REXLOG_INFO("[native] write watch missed a change: buffer {:08X}+{:X} at frame {}, hashed at frame {}",
+                    physical, uint32_t(guest_size), uint64_t(frame), b.full_frame);
     }
     // Large buffers: a sampled hash every frame and a full one every 8 frames. (It leaves the
     // watch epoch alone: only a full hash makes the copy current.)
@@ -6330,6 +6358,7 @@ struct Backend::Impl {
     if (latest == resolved_latest.end() || !memory_pipeline) return 0;
     ResolvedTexture& r = resolved[latest->second];
     r.used_frame = frame;
+    r.audit_read = true;
     GuestLayout g;
     if (!GuestLayoutOf(r, &g)) return 0;
     auto& m = memory_images[address];
@@ -6509,6 +6538,7 @@ struct Backend::Impl {
 
   void QueueWriteback(RenderCommandList* list, ResolvedTexture& r, uint32_t address, const FramePacket& f,
                       const ResolveCommand& rc) {
+    r.audit_read = true;
     if (!memory_pipeline || r.width * r.height > kWritebackMaxTexels) return;
     GuestLayout g;
     if (!GuestLayoutOf(r, &g) || (rc.dest_bytes && g.size > rc.dest_bytes)) return;
@@ -6941,6 +6971,28 @@ struct Backend::Impl {
     return target.second.get();
   }
 
+  bool resolve_audit = false;
+  std::map<std::string, std::array<uint32_t, 3>> audit_counts;  // label -> resolves, overwritten unread, same copy again
+  void AuditResolve(ResolvedTexture& dst, const RenderTarget* src, bool depth, uint32_t x1, uint32_t y1, uint32_t x2,
+                    uint32_t y2, uint32_t px, uint32_t py, uint32_t sub) {
+    const uint32_t rect[8] = {px, py, px + (x2 - x1), py + (y2 - y1), x1, y1, x2, y2};
+    auto& c = audit_counts[fmt::format("dl {:02X} {}{}x{}", cur_draw_list, depth ? "depth " : "", x2 - x1, y2 - y1)];
+    c[0]++;
+    if (dst.audit_frame == frame && dst.audit_sub == sub) {
+      const bool covers = rect[0] <= dst.audit_rect[0] && rect[1] <= dst.audit_rect[1] && rect[2] >= dst.audit_rect[2] &&
+                          rect[3] >= dst.audit_rect[3];
+      if (!dst.audit_read && covers) c[1]++;
+      if (!depth && dst.audit_src == src && dst.audit_written == src->written && std::equal(rect, rect + 8, dst.audit_rect))
+        c[2]++;
+    }
+    dst.audit_frame = frame;
+    dst.audit_sub = sub;
+    dst.audit_src = src;
+    dst.audit_written = src->written;
+    dst.audit_read = false;
+    std::copy(rect, rect + 8, dst.audit_rect);
+  }
+
   void Resolve(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
     ScopedMs timer{t_resolve};
     fetch_cache.valid = false;
@@ -7067,6 +7119,7 @@ struct Backend::Impl {
     x2 = std::min(x2, x1 + (dw > px ? dw - px : 0));
     y2 = std::min(y2, y1 + (dh > py ? dh - py : 0));
     if (x2 <= x1 || y2 <= y1) return;
+    if (resolve_audit) AuditResolve(dst, src, depth_resolve, x1, y1, x2, y2, px, py, rc.dest_face << 8 | rc.dest_level);
     if (rc.has_rect && rc.has_point) {
       if (!depth_resolve) {
         auto c = regs::Color(r, int(source));
@@ -7503,12 +7556,18 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         for (auto& [c, k] : v) REXLOG_INFO("[native]   PASSDIAG {:6.1f} per frame: {}", c / n, k);
         s.pass_reasons.clear();
       }
+      for (auto& [k, c] : s.audit_counts)
+        REXLOG_INFO("[native]   RESOLVEAUDIT {:6.2f} per frame: {} ({:.2f} overwritten unread, {:.2f} same copy again)",
+                    c[0] / n, k, c[1] / n, c[2] / n);
+      s.audit_counts.clear();
+      s.resolve_audit = REXCVAR_GET(gtav_native_resolve_audit);
       s.stat_fetch_resolves = 0;
       auto& t = s.tprof;
       REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
-                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms), {:.0f} stable ones not checked",
+                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.0f} KB of guest bytes, {:.2f} ms), {:.0f} stable "
+                  "ones not checked",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
-                  t.full_bytes / n / 1048576.0, t.full_ms / n, t.stable / n);
+                  t.full_bytes / n / 1048576.0, t.guest_bytes / n / 1024, t.full_ms / n, t.stable / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
                   "{:.0f} pipeline binds",
                   t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);

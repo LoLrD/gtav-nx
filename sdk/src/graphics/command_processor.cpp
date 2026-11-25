@@ -402,6 +402,7 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+      memory_->MarkStoreCards(0xA0000000u + (read_ptr_writeback_ptr_ & 0x1FFFFFFFu), 4);
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -540,6 +541,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      memory_->MarkStoreCards(0xA0000000u + (mem_addr & 0x1FFFFFFFu), 4);
     }
   } else {
     switch (index) {
@@ -862,6 +864,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       if (advanced >= step) {
         memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                          now);
+        memory_->MarkStoreCards(0xA0000000u + (read_ptr_writeback_ptr_ & 0x1FFFFFFFu), 4);
         published = now;
       }
     }
@@ -1340,6 +1343,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  memory_->MarkStoreCards(0xA0000000u + (mem_addr & 0x1FFFFFFFu), 4);
 
   return true;
 }
@@ -1354,6 +1358,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
     memory::store(memory_->TranslatePhysical(addr), write_data);
+    memory_->MarkStoreCards(0xA0000000u + (addr & 0x1FFFFFFFu), 4);
     write_addr += 4;
   }
 
@@ -1415,6 +1420,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      memory_->MarkStoreCards(0xA0000000u + (write_reg_addr & 0x1FFFFFFFu), 4);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1464,6 +1470,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   if (fence_hook) data_value = fence_hook(address, data_value, uint32_t(endianness));
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
+  memory_->MarkStoreCards(0xA0000000u + (address & 0x1FFFFFFFu), 4);
   return true;
 }
 
@@ -1492,6 +1499,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   assert_true(endianness == xenos::Endian::k8in16);
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
+  memory_->MarkStoreCards(0xA0000000u + (address & 0x1FFFFFFFu), uint32_t(sizeof(extents)));
   return true;
 }
 

@@ -832,6 +832,9 @@ bool XmaContext::Work() {
     }
   }
 
+  if (output_rb.write_offset() != ring_start_write) {
+    memory()->MarkStoreCards(0xA0000000u + (data.output_buffer_ptr & 0x1FFFFFFFu), uint32_t(output_rb.capacity()));
+  }
   if (initial_data.IsAnyInputBufferValid() || flushed || output_rb.write_offset() != ring_start_write) {
     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
   } else if (REXCVAR_GET(xma_starved_reset) &&

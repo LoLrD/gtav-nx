@@ -82,6 +82,9 @@ struct pm_scan_arg {
 REXCVAR_DEFINE_BOOL(gtav_native_write_watch, GTAV_WRITE_WATCH_DEFAULT, "GTAV",
                     "Native renderer: let the kernel track guest writes to cached textures and vertex/index "
                     "buffers instead of hashing them every frame");
+REXCVAR_DEFINE_BOOL(gtav_native_store_cards, false, "GTAV",
+                    "Native renderer: track guest writes with the store cards of the generated code (a byte per "
+                    "4 KB page, built with REX_STORE_CARDS) instead of the kernel's write watch or hashing");
 
 namespace gtav::native::write_watch {
 namespace {
@@ -267,11 +270,143 @@ void Init() {
 void Init() {}
 #endif
 
+#if defined(REX_STORE_CARDS)
+constexpr uint8_t kCardSeen = 0x01;
+constexpr uint32_t kBlockPages = 64;
+
+struct CardView {
+  uint32_t card_first;
+  uint32_t first_page, end_page;
+};
+CardView g_card_views[4];
+uint32_t g_card_view_count = 0;
+uint8_t* g_cards = nullptr;
+bool g_cards_on = false;
+std::vector<uint32_t> g_recheck, g_recheck_next;
+
+uint64_t SeenBits(const uint8_t* cards) {
+  uint64_t bits = 0;
+  for (uint32_t i = 0; i < kBlockPages; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, cards + i, 8);
+    bits |= (((w & 0x0101010101010101ull) * 0x0102040810204080ull) >> 56) << i;
+  }
+  return bits;
+}
+
+uint64_t WrittenBits(uint32_t block) {
+  const uint32_t first = block * kBlockPages, end = first + kBlockPages;
+  uint64_t written = 0;
+  for (uint32_t i = 0; i < g_card_view_count; i++) {
+    const CardView& v = g_card_views[i];
+    if (end <= v.first_page || first >= v.end_page) continue;
+    if (first >= v.first_page && end <= v.end_page) {
+      written |= ~SeenBits(g_cards + v.card_first + (first - v.first_page));
+      continue;
+    }
+    for (uint32_t p = std::max(first, v.first_page); p < std::min(end, v.end_page); p++)
+      if (!(g_cards[v.card_first + (p - v.first_page)] & kCardSeen)) written |= uint64_t(1) << (p - first);
+  }
+  return written;
+}
+
+void ArmPage(uint32_t p) {
+  for (uint32_t i = 0; i < g_card_view_count; i++) {
+    const CardView& v = g_card_views[i];
+    if (p >= v.first_page && p < v.end_page)
+      std::atomic_ref<uint8_t>(g_cards[v.card_first + (p - v.first_page)]).store(kCardSeen, std::memory_order_relaxed);
+  }
+}
+
+bool InitCards() {
+  auto* mem = REX_KERNEL_MEMORY();
+  if (!mem) return false;
+  g_cards = mem->virtual_membase();
+  static constexpr struct {
+    uint32_t guest, size, physical;
+  } kViews[] = {{0xA0000000, 0x20000000, ~0u}, {0xC0000000, 0x20000000, ~0u}, {0xE0000000, 0x1FD00000, ~0u},
+                {0x7F000000, 0x01000000, 0}};
+  for (const auto& v : kViews) {
+    uint32_t physical = v.physical;
+    if (physical == ~0u) {
+      constexpr uint32_t kProbe = 1 << 20;
+      physical = mem->GetPhysicalAddress(v.guest + kProbe) - kProbe;
+    }
+    uint32_t size = std::min<uint32_t>(v.size, kPhysicalSize - std::min(physical, kPhysicalSize));
+    g_card_views[g_card_view_count++] = {v.guest >> kPageShift, physical >> kPageShift, (physical + size) >> kPageShift};
+    REXLOG_INFO("[native] store cards view {:08X}: physical {:08X}, {} MB", v.guest, physical, size >> 20);
+  }
+  g_interest = std::make_unique<uint64_t[]>(kPages / 64);
+  std::memset(g_interest.get(), 0, kPages / 8);
+  g_page_epoch = std::make_unique<std::atomic<uint64_t>[]>(kPages);
+  for (uint32_t p = 0; p < kPages; p++) g_page_epoch[p].store(0, std::memory_order_relaxed);
+  g_cards_on = true;
+  REXLOG_INFO("[native] write watch on: store cards of the generated code");
+  return true;
+}
+
+void HarvestCards(uint64_t epoch) {
+  std::lock_guard lock(g_watch_mutex);
+  for (uint32_t p : g_recheck) g_page_epoch[p].store(epoch, std::memory_order_release);
+  g_recheck.swap(g_recheck_next);
+  g_recheck_next.clear();
+  for (uint32_t w = 0; w < kPages / 64; w++) {
+    const uint64_t interest = g_interest[w];
+    if (!interest) continue;
+    uint64_t written = WrittenBits(w) & interest;
+    while (written) {
+      const uint32_t p = w * 64 + uint32_t(__builtin_ctzll(written));
+      written &= written - 1;
+      g_page_epoch[p].store(epoch, std::memory_order_release);
+      ArmPage(p);
+      g_recheck.push_back(p);
+      g_pages.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+uint64_t WatchCards(uint32_t physical, uint32_t size) {
+  std::lock_guard lock(g_watch_mutex);
+  const uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
+  bool armed = false;
+  for (uint32_t p = first; p <= last; p++) {
+    if (Interesting(p)) continue;
+    g_interest[p >> 6] |= uint64_t(1) << (p & 63);
+    ArmPage(p);
+    g_recheck.push_back(p);
+    armed = true;
+  }
+  if (armed) std::atomic_thread_fence(std::memory_order_seq_cst);
+  return g_epoch.load(std::memory_order_acquire);
+}
+
+bool PendingCards(uint32_t physical, uint32_t size) {
+  const uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
+  for (uint32_t b = first / kBlockPages; b <= last / kBlockPages; b++) {
+    uint64_t written = WrittenBits(b);
+    const uint32_t lo = b * kBlockPages;
+    if (first > lo) written &= ~uint64_t(0) << (first - lo);
+    if (last < lo + kBlockPages - 1) written &= ~uint64_t(0) >> (lo + kBlockPages - 1 - last);
+    if (written) return true;
+  }
+  return false;
+}
+#endif
+
 }  // namespace
 
 bool Enabled() {
   if (!REXCVAR_GET(gtav_native_write_watch)) return false;
-  std::call_once(g_init, Init);
+  std::call_once(g_init, [] {
+#if defined(REX_STORE_CARDS)
+    if (REXCVAR_GET(gtav_native_store_cards) && InitCards()) {
+      g_ready = true;
+      return;
+    }
+#endif
+    Init();
+  });
   return g_ready;
 }
 
@@ -419,6 +554,15 @@ inline void Settle() {}
 
 void Harvest() {
   if (!Enabled()) return;
+#if defined(REX_STORE_CARDS)
+  if (g_cards_on) {
+    auto start = std::chrono::steady_clock::now();
+    HarvestCards(g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1);
+    g_harvests++;
+    g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return;
+  }
+#endif
 #if GTAV_WW_UFFD
   auto start = std::chrono::steady_clock::now();
   uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -437,6 +581,9 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
   if (!g_ready || !size) return 0;
   physical &= kPhysicalSize - 1;
   if (uint64_t(physical) + size > kPhysicalSize) return 0;
+#if defined(REX_STORE_CARDS)
+  if (g_cards_on) return WatchCards(physical, size);
+#endif
 #if GTAV_WW_UFFD
   Settle();  // the scans read g_interest and store page epochs: no new interest while they run
   std::lock_guard lock(g_watch_mutex);
@@ -495,6 +642,13 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
 }
 
 bool Pending(uint32_t physical, uint32_t size) {
+#if defined(REX_STORE_CARDS)
+  if (g_cards_on) {
+    if (!size) return false;
+    physical &= kPhysicalSize - 1;
+    return PendingCards(physical, uint32_t(std::min<uint64_t>(size, kPhysicalSize - physical)));
+  }
+#endif
 #if GTAV_WW_UFFD
   if (!g_ready || !size) return false;
   Settle();
@@ -543,6 +697,14 @@ void Touch(uint32_t physical, uint32_t size) {
 }
 
 Stats TakeStats() {
+#if defined(REX_STORE_CARDS)
+  if (g_cards_on) {
+    Stats s{g_harvests, g_pages.exchange(0), g_ms};
+    g_harvests = 0;
+    g_ms = 0;
+    return s;
+  }
+#endif
 #if GTAV_WW_PAGEPROT
   Stats s{g_faults.exchange(0), g_pages.exchange(0), g_ms};
 #else
