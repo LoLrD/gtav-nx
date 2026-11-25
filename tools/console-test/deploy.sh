@@ -8,6 +8,7 @@ SPIRV="${GTAV_SPIRV:-$ROOT/out/spirv}"
 
 ftp_put "$NRO" "gtav-nx.nro"
 ftp_put "$ROOT/gtav/gtav_switch.toml" "gtav.toml"
+ftp_put "$ROOT/tools/console-test/bench.txt" "bench.txt"
 mkdir -p "$ROOT/out/console-test/deployed"
 cp -f "$NX_OUT/gtav" "$ROOT/out/console-test/deployed/gtav.elf"
 echo "nro + config uploaded"
