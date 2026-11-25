@@ -1,7 +1,11 @@
 40 settle 60
 cam 0 0
 wait 2
+set gtav_native_ab_sweep gtav_native_vertex_inputs_used=true|false;gtav_sun_shadow_every=2|1;gtav_native_early_depth_tests=2|0;gtav_light_shadow_draws=false|true;gtav_native_pass_gpu_times=true|false
 mark bank
+sweep 1
+set gtav_native_ab_sweep gtav_native_diag_no_pixels=|12;gtav_native_diag_const_ps=|12;gtav_native_diag_no_draws=|12;gtav_native_diag_half_draws=|12;gtav_native_diag_no_pixels=|01;gtav_native_diag_const_ps=|01;gtav_native_diag_no_draws=|01;gtav_native_diag_no_draws=|07;gtav_native_diag_no_draws=|17;gtav_native_diag_no_draws=|0C
+mark bank_split
 sweep 1
 killscript flow_controller
 killscript replay_controller
@@ -15,7 +19,11 @@ settle 60
 cam 0 0
 wait 2
 pos
+set gtav_native_ab_sweep gtav_native_vertex_inputs_used=true|false;gtav_sun_shadow_every=2|1;gtav_native_early_depth_tests=2|0;gtav_light_shadow_draws=false|true;gtav_native_pass_gpu_times=true|false
 mark street
+sweep 1
+set gtav_native_ab_sweep gtav_native_diag_no_pixels=|12;gtav_native_diag_const_ps=|12;gtav_native_diag_no_draws=|12;gtav_native_diag_half_draws=|12;gtav_native_diag_no_pixels=|01;gtav_native_diag_const_ps=|01;gtav_native_diag_no_draws=|01;gtav_native_diag_no_draws=|07;gtav_native_diag_no_draws=|17;gtav_native_diag_no_draws=|0C
+mark street_split
 sweep 1
 tp 195 -933 31
 wait 5
@@ -28,6 +36,7 @@ settle 60
 cam 0 0
 wait 2
 pos
+set gtav_native_ab_sweep gtav_native_vertex_inputs_used=true|false;gtav_sun_shadow_every=2|1;gtav_native_early_depth_tests=2|0;gtav_light_shadow_draws=false|true;gtav_native_pass_gpu_times=true|false
 mark city
 sweep 1
 tp 790 -1000 26
@@ -36,6 +45,7 @@ settle 60
 cam 0 0
 wait 2
 pos
+set gtav_native_ab_sweep gtav_native_vertex_inputs_used=true|false;gtav_sun_shadow_every=2|1;gtav_native_early_depth_tests=2|0;gtav_light_shadow_draws=false|true;gtav_native_pass_gpu_times=true|false
 mark road
 sweep 1
 quit
