@@ -35,12 +35,15 @@ REXCVAR_DEFINE_DOUBLE(gtav_audio_silence_db, 0, "GTAV",
                       "Sources whose loudest voice route gain is below this level in dB (e.g. -48) are treated as "
                       "silent: not generated or mixed, their XMA parsed without decoding; 6 dB lower to stay audible; "
                       "0 = only zero gains");
+REXCVAR_DEFINE_BOOL(gtav_audio_compact_channels, false, "GTAV",
+                    "Mix a voice into a 6-channel submix only on the channels it has gain on (4, 2 or 1 of them, same "
+                    "samples): the speakers it is silent on are moved behind the ones it plays on for that call");
 REXCVAR_DEFINE_BOOL(gtav_audio_batch_kicks, false, "GTAV",
                     "Wake the XMA decoder thread once after the mixer has generated all sources instead of on every "
                     "kick (audio_xma_in_worker 1 or 2)");
 REXCVAR_DEFINE_STRING(gtav_audio_ab_file, "", "GTAV",
                       "Diagnostic: while this file exists, the settings it names (quiet, loop, controller, filters, "
-                      "silence, batch; all when empty) are ignored (A/B runs)");
+                      "silence, batch, compact; all when empty) are ignored (A/B runs)");
 REXCVAR_DECLARE(bool, gtav_audio_diag);
 
 namespace {
@@ -78,7 +81,8 @@ std::array<std::atomic<uint64_t>, 6> g_loud_db{};
 std::array<std::atomic<uint64_t>, 64> g_route_dest{};
 std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now();
 std::chrono::steady_clock::time_point g_ab_check = std::chrono::steady_clock::now();
-constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16, kAbBatch = 32;
+constexpr uint32_t kAbQuiet = 1, kAbLoop = 2, kAbController = 4, kAbFilters = 8, kAbSilence = 16, kAbBatch = 32,
+                   kAbCompact = 64;
 std::atomic<uint32_t> g_ab_off{0};
 
 bool AbOff(uint32_t what) { return (g_ab_off.load(std::memory_order_relaxed) & what) != 0; }
@@ -152,8 +156,9 @@ void CheckAb() {
              : word == "filters"    ? kAbFilters
              : word == "silence"    ? kAbSilence
              : word == "batch"      ? kAbBatch
+             : word == "compact"    ? kAbCompact
                                     : 0;
-    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch;
+    if (!off) off = kAbQuiet | kAbLoop | kAbController | kAbFilters | kAbSilence | kAbBatch | kAbCompact;
   }
   if (off != g_ab_off.exchange(off)) REXLOG_INFO("[audio-ab] off {}", off);
 }
@@ -387,6 +392,72 @@ void CountRoutes(const uint8_t* base, uint32_t v) {
   }
 }
 
+struct Compacted {
+  uint32_t info_at, info, dest, gains, width;
+  std::array<uint8_t, 6> order;
+  std::array<uint16_t, 6> ids;
+};
+
+void Permute(uint8_t* p, const std::array<uint8_t, 6>& order) {
+  uint16_t v[6];
+  std::memcpy(v, p, sizeof(v));
+  for (uint32_t c = 0; c < 6; ++c) std::memcpy(p + 2 * c, &v[order[c]], 2);
+}
+
+void Unpermute(uint8_t* p, const std::array<uint8_t, 6>& order) {
+  uint16_t v[6];
+  std::memcpy(v, p, sizeof(v));
+  for (uint32_t c = 0; c < 6; ++c) std::memcpy(p + 2 * order[c], &v[c], 2);
+}
+
+uint32_t Compact(uint8_t* base, uint32_t v, std::array<Compacted, 8>& done) {
+  const uint32_t mixer = L32(base, kMixerPtr);
+  const uint32_t table = L32(base, kRouteTablePtr);
+  uint32_t n = 0, wide_n = 0;
+  std::array<uint32_t, 8> wide;
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint16_t id = L16(base, v + 308 + 2 * i);
+    if (id >= 512) continue;
+    const uint32_t info_at = table + (id + 388) * 8 + 4;
+    const uint32_t info = L32(base, info_at);
+    if (((info >> 3) & 7) != 5) continue;
+    const uint32_t dest = mixer + 16 + 208 * ((info >> 6) & 0x3FF);
+    for (uint32_t k = 0; k < wide_n; ++k)
+      if (wide[k] == dest) return 0;
+    wide[wide_n++] = dest;
+    if (int32_t(L32(base, dest + 184)) < 0 || !base[dest + 200] || L32(base, dest + 192) != 1) continue;
+    const uint32_t gains = v + 48 + 32 * i;
+    Compacted c{info_at, info, dest, gains, 0, {}, {}};
+    uint32_t used = 0;
+    for (uint32_t ch = 0; ch < 6; ++ch)
+      if (L16(base, gains + 2 * ch) | L16(base, gains + 16 + 2 * ch)) c.order[used++] = uint8_t(ch);
+    c.width = used <= 1 ? 1 : used <= 2 ? 2 : used <= 4 ? 4 : 6;
+    if (c.width == 6) continue;
+    for (uint32_t ch = 0, k = used; ch < 6; ++ch)
+      if (!(L16(base, gains + 2 * ch) | L16(base, gains + 16 + 2 * ch))) c.order[k++] = uint8_t(ch);
+    done[n++] = c;
+  }
+  for (uint32_t k = 0; k < n; ++k) {
+    Compacted& c = done[k];
+    std::memcpy(c.ids.data(), base + c.dest + 148, 12);
+    Permute(base + c.dest + 148, c.order);
+    Permute(base + c.gains, c.order);
+    Permute(base + c.gains + 16, c.order);
+    S32(base, c.info_at, (c.info & ~(7u << 3)) | ((c.width - 1) << 3));
+  }
+  return n;
+}
+
+void Restore(uint8_t* base, const std::array<Compacted, 8>& done, uint32_t n) {
+  for (uint32_t k = 0; k < n; ++k) {
+    const Compacted& c = done[k];
+    S32(base, c.info_at, c.info);
+    std::memcpy(base + c.dest + 148, c.ids.data(), 12);
+    Unpermute(base + c.gains, c.order);
+    Unpermute(base + c.gains + 16, c.order);
+  }
+}
+
 REX_EXTERN(__imp__sub_831CAF88);
 REX_HOOK_RAW(sub_831CAF88) {
   const uint32_t v = ctx.r3.u32;
@@ -395,7 +466,13 @@ REX_HOOK_RAW(sub_831CAF88) {
     Count(g_mix_run);
     CountRoutes(base, v);
     const auto start = Now();
+    std::array<Compacted, 8> done;
+    const uint32_t n = REXCVAR_GET(gtav_audio_compact_channels) && !AbOff(kAbCompact) &&
+                               L32(base, v + 304) < 0xFFFF
+                           ? Compact(base, v, done)
+                           : 0;
     __imp__sub_831CAF88(ctx, base);
+    Restore(base, done, n);
     AddTime(g_ns_mix, start);
     return;
   }
