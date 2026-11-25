@@ -279,6 +279,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_keep_targets, false, "GTAV",
                     "Native renderer: draws into some of the bound pass's attachments (fewer colour targets, or no "
                     "depth) keep the pass and leave the others unwritten, instead of starting a pass with the "
                     "smaller set (live)");
+REXCVAR_DEFINE_INT32(gtav_native_idle_target_frames, 0, "GTAV",
+                     "Native renderer: render targets not drawn, cleared or resolved for this many frames are "
+                     "released (recreated empty when the game uses them again), and so are resolve copies of guest "
+                     "memory the CPU has rewritten since (0: both kept for good)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -1528,6 +1532,7 @@ struct RenderTarget {
   std::unique_ptr<RenderTextureView> view;
   uint32_t stencil_descriptor = 0;  // depth targets: R8_UINT view of the stencil aspect
   std::unique_ptr<RenderTextureView> stencil_view;
+  uint64_t used_frame = 0;
 };
 
 struct ResolvedTexture {
@@ -1545,6 +1550,7 @@ struct ResolvedTexture {
   uint32_t fill_rect[6] = {};
   float scale = 1.0f;       // of the source target: the texture is width * scale by height * scale
   uint64_t serial = 0;  // last write order
+  uint64_t used_frame = 0;
   // Cube faces and mip levels (resolves with a destination level/face): 6 layers for cubes,
   // the fetch constant's mip count, one render view + framebuffer per written (face, level).
   uint32_t mips = 1, layers = 1;
@@ -1883,6 +1889,11 @@ struct Backend::Impl {
   }
 
   ResolvedTexture* LatestResolved(uint32_t address, bool depth_fetch, uint32_t width = 0, uint32_t height = 0) {
+    ResolvedTexture* r = FindResolved(address, depth_fetch, width, height);
+    if (r) r->used_frame = frame;
+    return r;
+  }
+  ResolvedTexture* FindResolved(uint32_t address, bool depth_fetch, uint32_t width, uint32_t height) {
     if (depth_fetch) {
       auto d = resolved_depth.find(address);
       if (d != resolved_depth.end()) return &resolved[d->second];
@@ -2658,6 +2669,90 @@ struct Backend::Impl {
                 targets_sum.Text(), resolves.Text(), present.Text(), resolve_memory.Text(), guest_buffers.Text(),
                 upload_chunks.Text(), vertex_caches.Text(), pending.Text(), pipelines.size(), shaders.size());
     REXLOG_INFO("[native] device memory: {}", VulkanMemoryReport(device));
+    MemorySum target_idle[3], resolve_idle[3];
+    auto idle_slot = [&](uint64_t used) { return frame - used >= 1800 ? 2 : frame - used >= 300 ? 1 : 0; };
+    for (const auto& [key, t] : targets) target_idle[idle_slot(t.used_frame)].Add(t.texture.get());
+    for (const auto& [key, r] : resolved) resolve_idle[idle_slot(r.used_frame)].Add(r.texture.get());
+    REXLOG_INFO("[native] idle: render targets used in the last 300 frames {}, 300-1799 frames ago {}, 1800+ {}; "
+                "resolves {}, {}, {}",
+                target_idle[0].Text(), target_idle[1].Text(), target_idle[2].Text(), resolve_idle[0].Text(),
+                resolve_idle[1].Text(), resolve_idle[2].Text());
+  }
+
+  void RetireTarget(RenderTarget& t) {
+    if (auto it = fetch_input_sets.find(t.texture.get()); it != fetch_input_sets.end()) {
+      dead_fetch_sets.push_back(std::move(it->second));
+      fetch_input_sets.erase(it);
+    }
+    if (t.descriptor) pending_free_descriptors.push_back(t.descriptor);
+    if (t.stencil_descriptor) pending_free_descriptors.push_back(t.stencil_descriptor);
+    if (t.view) dead_views.push_back(std::move(t.view));
+    if (t.stencil_view) dead_views.push_back(std::move(t.stencil_view));
+    if (t.alias_fb) dead_framebuffers.push_back(std::move(t.alias_fb));
+    layouts.erase(t.texture.get());
+    dead_textures.push_back(std::move(t.texture));
+    for (auto*& c : bound_color)
+      if (c == &t) c = nullptr;
+    if (bound_depth == &t) bound_depth = nullptr;
+  }
+
+  void RetireResolve(ResolvedTexture& r) {
+    if (r.descriptor >= kFirstTextureDescriptor) pending_free_descriptors.push_back(r.descriptor);
+    if (r.cube_descriptor >= kFirstTextureDescriptor) pending_free_descriptors.push_back(r.cube_descriptor);
+    if (r.view) dead_views.push_back(std::move(r.view));
+    if (r.cube_view) dead_views.push_back(std::move(r.cube_view));
+    if (r.framebuffer) dead_framebuffers.push_back(std::move(r.framebuffer));
+    if (r.discard_framebuffer) dead_framebuffers.push_back(std::move(r.discard_framebuffer));
+    for (auto& [key, sub] : r.subresource_targets) {
+      if (sub.first) dead_views.push_back(std::move(sub.first));
+      if (sub.second) dead_framebuffers.push_back(std::move(sub.second));
+    }
+    if (r.texture) {
+      layouts.erase(r.texture.get());
+      dead_textures.push_back(std::move(r.texture));
+    }
+  }
+
+  uint32_t idle_logs = 0;
+  void EvictIdleTargets() {
+    const int32_t idle = REXCVAR_GET(gtav_native_idle_target_frames);
+    if (idle <= 0 || frame % 60 || !pending_writebacks.empty()) return;
+    MemorySum freed_targets, freed_resolves;
+    const size_t targets_before = targets.size();
+    for (auto it = targets.begin(); it != targets.end();) {
+      RenderTarget& t = it->second;
+      if (t.texture && (frame - t.used_frame < uint64_t(idle) || pending_clears.count(&t))) {
+        ++it;
+        continue;
+      }
+      if (t.texture) {
+        freed_targets.Add(t.texture.get());
+        RetireTarget(t);
+      }
+      it = targets.erase(it);
+    }
+    std::unordered_set<uint64_t> reachable;
+    for (const auto& [base, key] : resolved_latest) reachable.insert(key);
+    for (const auto& [base, key] : resolved_depth) reachable.insert(key);
+    for (const auto& [base, keys] : resolved_by_address) reachable.insert(keys.begin(), keys.end());
+    for (auto it = resolved.begin(); it != resolved.end();) {
+      ResolvedTexture& r = it->second;
+      if (frame - r.used_frame < uint64_t(idle) || r.storage_index != ~0u || reachable.count(it->first)) {
+        ++it;
+        continue;
+      }
+      freed_resolves.Add(r.texture.get());
+      RetireResolve(r);
+      it = resolved.erase(it);
+    }
+    if (targets.size() != targets_before) target_memo.fill({});
+    if (!freed_targets.count && !freed_resolves.count) return;
+    if (freed_targets.count) RetireFramebuffers();
+    resolve_seen.fill(++resolve_count);
+    if (idle_logs++ < 40 || idle_logs % 100 == 0)
+      REXLOG_INFO("[native] released render targets {} and resolves {} unused for {} frames; {} targets and {} "
+                  "resolves kept",
+                  freed_targets.Text(), freed_resolves.Text(), idle, targets.size(), resolved.size());
   }
 
   void EvictTextures() {
@@ -3214,6 +3309,7 @@ struct Backend::Impl {
     auto& memo = target_memo[(key ^ key >> 12 ^ key >> 17) & (target_memo.size() - 1)];
     if (memo.first != key || !memo.second) memo = {key, &targets[key]};
     auto& t = *memo.second;
+    t.used_frame = frame;
     if (t.texture && t.height >= height) return &t;
     const bool zcull = depth && REXCVAR_GET(gtav_native_depth_zcull);
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
@@ -6042,6 +6138,7 @@ struct Backend::Impl {
     auto& variants = resolved_by_address[base];
     if (std::find(variants.begin(), variants.end(), variant) == variants.end()) variants.push_back(variant);
     dst.serial = ++resolve_serial;
+    dst.used_frame = frame;
     if (!dst.texture) {
       dst.texture = device->createTexture(RenderTextureDesc::ColorTarget(Sz(dw, s), Sz(dh, s), RenderFormat::R8G8B8A8_UNORM));
       dst.view = dst.texture->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8G8B8A8_UNORM));
@@ -6220,6 +6317,7 @@ struct Backend::Impl {
     auto latest = resolved_latest.find(address);
     if (latest == resolved_latest.end() || !memory_pipeline) return 0;
     ResolvedTexture& r = resolved[latest->second];
+    r.used_frame = frame;
     GuestLayout g;
     if (!GuestLayoutOf(r, &g)) return 0;
     auto& m = memory_images[address];
@@ -6890,6 +6988,7 @@ struct Backend::Impl {
     auto& variants = resolved_by_address[base];
     if (std::find(variants.begin(), variants.end(), variant) == variants.end()) variants.push_back(variant);
     dst.serial = ++resolve_serial;
+    dst.used_frame = frame;
     std::memcpy(dst.fetch_words, words, sizeof(dst.fetch_words));
     if (depth_resolve) resolved_depth[base] = variant;
     StampResolve(base, dw, dh);
@@ -7181,6 +7280,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.slot_generation++;
   s.frame_generation++;
   s.EvictTextures();
+  s.EvictIdleTargets();
   s.EvictRectCache();
   s.EvictSnapCache();
   s.InvalidateDrawState();
