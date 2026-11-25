@@ -346,6 +346,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_compute_resolves, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_hold_lost_frames, true, "GTAV",
                     "Show the previous frame again instead of a frame that lost draws to pipelines still "
                     "compiling");
+REXCVAR_DEFINE_BOOL(gtav_native_preload_all_shaders, true, "GTAV",
+                    "Read every SPIR-V file at start and create its shader module ahead of use (the modules stay "
+                    "in memory); off: only the shaders of the pipelines from earlier runs (shader_cache/pipelines.bin), "
+                    "the others are read when first drawn");
 REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
                     "Create new pipelines on worker threads (the draw is skipped until ready) instead of "
                     "stalling the frame");
@@ -749,14 +753,22 @@ extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void* thread, i
 
 class SpirvPreload {
  public:
-  void Start(const std::string& dir, RenderDevice* device) {
+  void Start(const std::string& dir, RenderDevice* device, std::unordered_set<std::string> only) {
     std::call_once(started_, [&] {
-      std::thread([this, dir, device] {
+      std::thread([this, dir, device, only = std::move(only)] {
         auto start = std::chrono::steady_clock::now();
         size_t count = 0, bytes = 0;
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
           if (!entry.is_regular_file(ec)) continue;
+          if (!only.empty()) {
+            std::string name = entry.path().filename().string();
+            if (!only.count(name) && entry.path().extension() == ".spv") {
+              std::lock_guard lock(mutex_);
+              names_.insert(std::move(name));
+              continue;
+            }
+          }
           std::vector<uint8_t> data;
           if (FILE* f = std::fopen(entry.path().string().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
@@ -1256,6 +1268,10 @@ class PipelineWarmer {
       records_[rec->key] = rec;
       queue_.push_back(rec);
     }
+    for (const auto& [key, rec] : records_) {
+      shader_files_.insert(fmt::format("vs_{:016X}.spv", rec->vs));
+      if (rec->ps) shader_files_.insert(fmt::format("ps_{:016X}.spv", rec->ps));
+    }
     file_ = std::fopen(file.string().c_str(), valid == data.size() ? "ab" : "wb");
     if (file_ && valid != data.size() && valid) std::fwrite(data.data(), 1, valid, file_);
     total_ = uint32_t(queue_.size());
@@ -1284,6 +1300,8 @@ class PipelineWarmer {
   }
 
   bool Active() const { return remaining_.load(std::memory_order_acquire) != 0; }
+
+  const std::unordered_set<std::string>& ShaderFiles() const { return shader_files_; }
 
   // The warmed pipeline for `key` if its description equals `bytes`. *busy: it is compiling right
   // now and did not finish within `budget_ms` (the caller skips the draw this frame, as for its own
@@ -1422,6 +1440,7 @@ class PipelineWarmer {
   std::deque<std::shared_ptr<Record>> queue_;
   std::mutex shader_mutex_, names_mutex_;
   std::unordered_map<std::string, std::unique_ptr<RenderShader>> shaders_;
+  std::unordered_set<std::string> shader_files_;
   std::set<std::string> names_;
   std::atomic<int> workers_{0};
   std::atomic<uint32_t> remaining_{0};  // records not yet taken
@@ -3065,7 +3084,9 @@ struct Backend::Impl {
     std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
     if (dir.empty())
       dir = DefaultSpirvDir();
-    g_spirv_preload.Start(dir, device);
+    g_spirv_preload.Start(dir, device,
+                          REXCVAR_GET(gtav_native_preload_all_shaders) ? std::unordered_set<std::string>{}
+                                                                       : pipeline_warmer.ShaderFiles());
     // The tile override is <hash>_tiles2.spv, a variant the shader compiler makes from the game's own
     // shader (shader_compiler.cpp kVariants).
     std::string name = fmt::format("{}_{:016X}{}.spv", pixel ? "ps" : "vs", hash, tile_override ? "_tiles2" : "");
