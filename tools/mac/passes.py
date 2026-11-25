@@ -18,7 +18,7 @@ for i, l in enumerate(lines):
         cur = {'line': i + 1, 'total': float(m.group(1)), 'rows': []}
         reports.append(cur)
         continue
-    m = re.search(r'GPUPASS +([\d.]+) ms  (.*) \(([\d.]+) passes, (\d+) draws\)', l)
+    m = re.search(r'GPUPASS +([\d.]+) ms  (.*) \(([\d.]+) passes, (\d+) draws[,)]', l)
     if m and cur:
         cur['rows'].append((m.group(2), float(m.group(1)), float(m.group(3)), int(m.group(4))))
 fps = [(i + 1, float(m.group(1))) for i, l in enumerate(lines) for m in [re.search(r'\] fps=([\d.]+)', l)] if m]

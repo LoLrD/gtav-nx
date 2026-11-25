@@ -63,6 +63,11 @@ class Backend {
   };
   FrameStats LastStats() const;
 
+  // GPU ms of the frame FrameComplete just read, by pass group (--gtav_native_pass_gpu_times):
+  // dl 12, dl 01, dl 07, dl 0C, resolve copies, the rest. False when that frame had no pass times.
+  static constexpr uint32_t kPassGroups = 6;
+  bool LastPassGroups(double ms[kPassGroups]);
+
   // One line per draw of the last executed frame, for the glitch inspector (--gtav_native_flicker_catch).
   struct DrawNote {
     uint64_t vs, ps;

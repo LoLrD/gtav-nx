@@ -393,7 +393,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
 
 namespace plume {
 extern bool g_colorInputAttachments;  // plume-gtav.patch
-extern std::atomic<uint32_t> g_statRenderPasses;   // plume-gtav.patch
+extern std::atomic<uint32_t> g_statRenderPasses, g_statBarriers;   // plume-gtav.patch
 extern std::atomic<uint64_t> g_statDeviceMemoryAllocs, g_statDeviceMemoryFrees, g_statDeviceMemoryBytes;
 uint64_t VulkanMemorySize(const RenderBuffer* buffer);
 uint64_t VulkanMemorySize(const RenderTexture* texture);
@@ -2835,11 +2835,22 @@ struct Backend::Impl {
   bool pass_times = false;
   std::unique_ptr<RenderQueryPool> pass_pools[Backend::kFramesInFlight];
   std::vector<std::string> pass_labels[Backend::kFramesInFlight];
-  std::map<std::string, uint64_t> pass_label_draws;
+  std::map<std::string, uint64_t> pass_label_draws, pass_label_indices, pass_label_pixels;
+  uint64_t dl_passes[256] = {}, dl_barriers[256] = {};
+  double pass_groups[Backend::kPassGroups] = {};
+  bool pass_groups_valid = false;
   std::string cur_pass_label;
   uint8_t cur_draw_list = kNoDrawList;
   std::unordered_map<std::string, std::pair<double, uint32_t>> pass_gpu;  // label -> ms, passes
   uint32_t pass_gpu_frames = 0;
+  static uint32_t PassGroup(const std::string& label) {
+    if (label.find("resolve copy") != std::string::npos) return 4;
+    if (label.compare(0, 3, "dl ") != 0) return 5;
+    static constexpr const char* kGroups[4] = {"12", "01", "07", "0C"};
+    for (uint32_t g = 0; g < 4; g++)
+      if (label.compare(3, 2, kGroups[g]) == 0) return g;
+    return 5;
+  }
   void PassStamp(RenderCommandList* list, std::string label) {
     if (!pass_times) return;
     auto& labels = pass_labels[slot];
@@ -3706,11 +3717,13 @@ struct Backend::Impl {
     MaybeCutStream();  // a new command list from here, when the frame is recorded in chunks
     list->setFramebuffer(fb.get());
     if (pass_times) {
-      cur_pass_label = fmt::format("dl {:02X} targets {}x{} {}c fmt {}{}{}", cur_draw_list,
-                                   count ? color[0]->width : depth ? depth->width : 0,
-                                   count ? color[0]->height : depth ? depth->height : 0, count,
+      const RenderTarget* first = count ? color[0] : depth;
+      const uint32_t real_w = first ? Sz(first->width, first->scale) : 0, real_h = first ? Sz(first->height, first->scale) : 0;
+      cur_pass_label = fmt::format("dl {:02X} targets {}x{} px {}x{} {}c fmt {}{}{}", cur_draw_list,
+                                   first ? first->width : 0, first ? first->height : 0, real_w, real_h, count,
                                    count ? uint32_t(color[0]->format) : 0, depth ? " +depth" : "",
                                    count && color[0]->msaa ? " msaa" : "");
+      pass_label_pixels[cur_pass_label] += uint64_t(real_w) * real_h;
       PassStamp(list, cur_pass_label);
     }
     bound_fb = fb.get();
@@ -7615,9 +7628,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   };
   size_t next_draw = 0;  // index in f.commands of the first kDraw after the current command
   s.MarkCubeSkips(f);
+  const bool dl_stats = s.pass_times && !s.stream;
   for (size_t ci = 0; ci < f.commands.size(); ci++) {
     const auto& c = f.commands[ci];
     s.cur_draw_list = c.draw_list;
+    const uint32_t passes_before = plume::g_statRenderPasses, barriers_before = plume::g_statBarriers;
     if (ci == s.full_size_from) s.BeginFullSize(list);
     if (!s.skip_commands.empty() && s.skip_commands[ci]) {
       if (c.kind == CommandKind::kDraw) {
@@ -7640,7 +7655,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         s.Draw(list, f, f.draws[c.index]);
         s.cur_draw = c.index + 1;
         s.pass_draws++;
-        if (s.pass_times) s.pass_label_draws[s.cur_pass_label]++;
+        if (s.pass_times) {
+          s.pass_label_draws[s.cur_pass_label]++;
+          s.pass_label_indices[s.cur_pass_label] += f.draws[c.index].count;
+        }
         if (!s.stream) DrawsRecorded(c.index + 1);  // (stream mode: when its record is played)
         if (s.seqdiag) {
           if (!s.seq_passes.empty()) flush_draws(), seq += s.seq_passes, s.seq_passes.clear();
@@ -7657,6 +7675,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         if (s.seqdiag) flush_draws(), seq += s.seq_passes + "  " + s.seq_note + "\n", s.seq_passes.clear();
         break;
       case CommandKind::kQuery: s.Query(list, f.queries[c.index]); break;
+    }
+    if (dl_stats) {
+      s.dl_passes[c.draw_list] += plume::g_statRenderPasses - passes_before;
+      s.dl_barriers[c.draw_list] += plume::g_statBarriers - barriers_before;
     }
   }
   if (s.seqdiag) {
@@ -7853,6 +7875,13 @@ void Backend::RequestDump() { impl_->dump_request = true; }
 
 const std::vector<Backend::DrawNote>& Backend::LastNotes() const { return impl_->notes; }
 
+bool Backend::LastPassGroups(double ms[kPassGroups]) {
+  if (!impl_->pass_groups_valid) return false;
+  std::copy(std::begin(impl_->pass_groups), std::end(impl_->pass_groups), ms);
+  impl_->pass_groups_valid = false;
+  return true;
+}
+
 Backend::FrameStats Backend::LastStats() const {
   return {impl_->stat_draws, impl_->stat_skipped, impl_->stat_pipelines_created, impl_->stat_textures,
           impl_->stat_rewritten, impl_->t_shader, impl_->t_pipeline, impl_->t_texture, impl_->t_resolve};
@@ -7864,28 +7893,44 @@ void Backend::FrameComplete(uint32_t slot) {
     auto& s = *impl_;
     s.pass_pools[slot]->queryResults();
     const uint64_t* t = s.pass_pools[slot]->getResults();  // ns
+    std::fill(std::begin(s.pass_groups), std::end(s.pass_groups), 0.0);
     for (size_t i = 0; i + 1 < labels.size(); i++) {
       if (t[i + 1] < t[i] || t[i + 1] - t[i] > 1000000000ull) continue;
       auto& e = s.pass_gpu[labels[i]];
-      e.first += (t[i + 1] - t[i]) / 1e6;
+      const double ms = (t[i + 1] - t[i]) / 1e6;
+      e.first += ms;
       e.second++;
+      s.pass_groups[Impl::PassGroup(labels[i])] += ms;
     }
+    s.pass_groups_valid = true;
     labels.clear();
     if (++s.pass_gpu_frames == 300) {
       std::vector<std::pair<double, std::string>> v;
       double total = 0;
       for (auto& [k, e] : s.pass_gpu) {
-        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes, {:.0f} draws)", k, e.second / 300.0,
-                                            s.pass_label_draws[k] / 300.0));
+        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes, {:.0f} draws, {:.1f}k indices, {:.3f} Mpx)", k,
+                                            e.second / 300.0, s.pass_label_draws[k] / 300.0,
+                                            s.pass_label_indices[k] / 300.0 / 1000.0,
+                                            s.pass_label_pixels[k] / 300.0 / 1e6));
         total += e.first;
       }
       std::sort(v.rbegin(), v.rend());
       REXLOG_INFO("[native] GPU by pass kind, ms per frame over 300 frames (total {:.2f}):", total / 300);
       for (size_t i = 0; i < v.size() && i < 30; i++)
         REXLOG_INFO("[native]   GPUPASS {:6.2f} ms  {}", v[i].first / 300, v[i].second);
+      std::string by_dl;
+      for (uint32_t dl = 0; dl < 256; dl++)
+        if (s.dl_passes[dl] || s.dl_barriers[dl])
+          by_dl += fmt::format(" {}{:.1f}/{:.1f}", dl == kNoDrawList ? std::string("none ") : fmt::format("dl {:02X} ", dl),
+                               s.dl_passes[dl] / 300.0, s.dl_barriers[dl] / 300.0);
+      REXLOG_INFO("[native]   render passes / barriers per frame by draw list:{}", by_dl);
       s.pass_gpu.clear();
       s.pass_gpu_frames = 0;
       s.pass_label_draws.clear();
+      s.pass_label_indices.clear();
+      s.pass_label_pixels.clear();
+      std::fill(std::begin(s.dl_passes), std::end(s.dl_passes), 0);
+      std::fill(std::begin(s.dl_barriers), std::end(s.dl_barriers), 0);
     }
   }
   if (auto& records = impl_->query_records[slot]; !records.empty()) {

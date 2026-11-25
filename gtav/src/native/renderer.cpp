@@ -99,6 +99,11 @@ REXCVAR_DEFINE_BOOL(gtav_native_load_clears, GTAV_LOAD_CLEARS_DEFAULT, "GTAV",
                     "GPUs skip loading the old contents)");
 REXCVAR_DEFINE_STRING(gtav_native_ab, "", "GTAV",
                       "Native renderer benchmark: name=a|b flips cvar name between a and b every 60 frames, logs averages");
+REXCVAR_DEFINE_STRING(gtav_native_ab_sweep, "", "GTAV",
+                      "Native renderer benchmark: name=a|b;other=c|d;... runs each as gtav_native_ab for "
+                      "gtav_native_ab_sweep_seconds, logs one SWEEP line per setting, restores it, then the next (wraps)");
+REXCVAR_DEFINE_INT32(gtav_native_ab_sweep_seconds, 12, "GTAV",
+                     "Native renderer: seconds each gtav_native_ab_sweep setting is flipped");
 REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
                     "Native renderer: detect one-frame glitches (a frame unlike both neighbours), save them to "
                     "logs/flicker and log them");
@@ -1055,7 +1060,15 @@ class Renderer {
         if (ab_slot_phase_[slot] >= 0) ab_[ab_slot_phase_[slot]].gpu += (t[1] - t[0]) / 1e6, ab_[ab_slot_phase_[slot]].gpu_n++;
       }
     }
-    if (backend_ok_) backend_.FrameComplete(slot);
+    if (backend_ok_) {
+      backend_.FrameComplete(slot);
+      double groups[Backend::kPassGroups];
+      if (backend_.LastPassGroups(groups) && ab_slot_phase_[slot] >= 0) {
+        auto& a = ab_[ab_slot_phase_[slot]];
+        for (uint32_t g = 0; g < Backend::kPassGroups; g++) a.groups[g] += groups[g];
+        a.groups_n++;
+      }
+    }
     FlickerAnalyze(slot);
   }
 
@@ -1890,25 +1903,69 @@ class Renderer {
     std::vector<float> intervals;  // per frame, for the median and the 90th percentile
     // What was recorded, per side: a change that should draw the same picture keeps these equal.
     uint64_t draws = 0, skipped = 0, passes = 0, barriers = 0;
+    double groups[Backend::kPassGroups] = {};  // GPU ms by pass group (Backend::LastPassGroups)
+    uint32_t groups_n = 0;
   };
   uint32_t ab_passes_before_ = 0, ab_barriers_before_ = 0;
   AbStats ab_[2];
   int ab_phase_ = -1;  // -1: off or warming up
   int ab_slot_phase_[Backend::kFramesInFlight] = {-1, -1};
-  std::string ab_spec_, ab_name_, ab_values_[2];
+  std::string ab_spec_, ab_name_, ab_values_[2], ab_saved_;
   struct AbMore {
-    std::string name, values[2];
+    std::string name, values[2], saved;
   };
+  std::string sweep_spec_;
+  std::vector<std::string> sweep_;
+  size_t sweep_at_ = 0;
+  bool ab_from_sweep_ = false;
+  std::chrono::steady_clock::time_point sweep_start_;
   std::vector<AbMore> ab_more_;  // further settings flipped with the first
   std::chrono::steady_clock::time_point ab_last_;
   uint64_t ab_frames_ = 0;
   double last_record_ms_ = 0, last_record_cpu_ms_ = 0, last_idle_ms_ = 0;
   uint64_t fence_released_ = 0;  // frame index + 1 of the frame Present already released (early fence)
+  std::string SweepSpec() {
+    const std::string spec = REXCVAR_GET(gtav_native_ab_sweep);
+    const auto now = std::chrono::steady_clock::now();
+    if (spec != sweep_spec_) {
+      sweep_spec_ = spec;
+      sweep_.clear();
+      sweep_at_ = 0;
+      sweep_start_ = now;
+      size_t at = 0;
+      while (at < spec.size()) {
+        size_t end = spec.find(';', at);
+        if (end == std::string::npos) end = spec.size();
+        std::string one = spec.substr(at, end - at);
+        at = end + 1;
+        auto eq = one.find('='), bar = one.find('|');
+        if (eq != std::string::npos && bar != std::string::npos && bar > eq) sweep_.push_back(std::move(one));
+      }
+      if (!sweep_.empty())
+        REXLOG_INFO("[native] A/B sweep: {} settings, {} s each", sweep_.size(), REXCVAR_GET(gtav_native_ab_sweep_seconds));
+    }
+    if (sweep_.empty()) return {};
+    if (now - sweep_start_ >= std::chrono::seconds(std::max(1, REXCVAR_GET(gtav_native_ab_sweep_seconds)))) {
+      if (ab_[0].n && ab_[1].n)
+        REXLOG_INFO("[native] SWEEP {} {}|{}: {}: {} | {}: {}", ab_name_, ab_values_[0], ab_values_[1], ab_values_[0],
+                    AbLine(ab_[0]), ab_values_[1], AbLine(ab_[1]));
+      ab_[0] = ab_[1] = {};
+      ab_frames_ = 0;
+      sweep_at_ = (sweep_at_ + 1) % sweep_.size();
+      sweep_start_ = now;
+    }
+    return sweep_[sweep_at_];
+  }
   void AbStep(uint64_t presented) {
     std::string spec = REXCVAR_GET(gtav_native_ab);
+    ab_from_sweep_ = spec.empty();
+    if (ab_from_sweep_) spec = SweepSpec();
     if (spec != ab_spec_) {
-      for (const auto& more : ab_more_) rex::cvar::SetFlagByName(more.name, more.values[0]);
-      if (!ab_name_.empty()) rex::cvar::SetFlagByName(ab_name_, ab_values_[0]);
+      for (const auto& more : ab_more_) rex::cvar::SetFlagByName(more.name, more.saved);
+      if (!ab_name_.empty()) {
+        rex::cvar::SetFlagByName(ab_name_, ab_saved_);
+        REXLOG_INFO("[native] A/B {} back to {}", ab_name_, rex::cvar::GetFlagByName(ab_name_));
+      }
       ab_spec_ = spec;
       ab_name_.clear();
       ab_more_.clear();
@@ -1927,8 +1984,10 @@ class Renderer {
           ab_name_ = one.substr(0, eq);
           ab_values_[0] = one.substr(eq + 1, bar - eq - 1);
           ab_values_[1] = one.substr(bar + 1);
+          ab_saved_ = rex::cvar::GetFlagByName(ab_name_);
         } else {
-          ab_more_.push_back({one.substr(0, eq), {one.substr(eq + 1, bar - eq - 1), one.substr(bar + 1)}});
+          const std::string name = one.substr(0, eq);
+          ab_more_.push_back({name, {one.substr(eq + 1, bar - eq - 1), one.substr(bar + 1)}, rex::cvar::GetFlagByName(name)});
         }
         REXLOG_INFO("[native] A/B {}", one);
       }
@@ -1944,6 +2003,25 @@ class Renderer {
     if (k % 60 >= 8) ab_phase_ = phase;
     ab_passes_before_ = plume::g_statRenderPasses;
     ab_barriers_before_ = plume::g_statBarriers;
+  }
+  // "cpu": the render thread's own CPU time while recording (wall time on a loaded machine is
+  // mostly waiting for a core). "idle": the render thread waiting for the game's next frame.
+  // Median and 90th percentile of the frame time: steps of a display refresh show a frame paced by
+  // something other than the work.
+  static std::string AbLine(AbStats& a) {
+    std::sort(a.intervals.begin(), a.intervals.end());
+    const float median = a.intervals[a.intervals.size() / 2], p90 = a.intervals[a.intervals.size() * 9 / 10];
+    std::string groups;
+    if (a.groups_n) {
+      static constexpr const char* kNames[Backend::kPassGroups] = {"dl 12", "dl 01", "dl 07", "dl 0C", "copies", "other"};
+      groups = "; GPU by group";
+      for (uint32_t g = 0; g < Backend::kPassGroups; g++) groups += fmt::format(" {} {:.2f}", kNames[g], a.groups[g] / a.groups_n);
+    }
+    return fmt::format("{:.1f} fps (frame {:.2f} ms, median {:.1f}, p90 {:.1f}; record {:.2f}, cpu {:.2f}, idle {:.2f}, "
+                       "GPU {:.2f}; per frame {:.1f} draws, {:.2f} skipped, {:.2f} passes, {:.2f} barriers{})",
+                       1000.0 * a.n / a.interval, a.interval / a.n, median, p90, a.record / a.n, a.record_cpu / a.n,
+                       a.idle / a.n, a.gpu_n ? a.gpu / a.gpu_n : 0.0, double(a.draws) / a.n, double(a.skipped) / a.n,
+                       double(a.passes) / a.n, double(a.barriers) / a.n, groups);
   }
   void AbRecord(uint64_t presented) {
     auto now = std::chrono::steady_clock::now();
@@ -1963,23 +2041,9 @@ class Renderer {
       a.barriers += plume::g_statBarriers - ab_barriers_before_;
     }
     ab_last_ = now;
-    if (!ab_name_.empty() && ab_frames_ % 1200 == 0 && ab_[0].n && ab_[1].n) {
-      auto line = [](AbStats& a) {
-        // "cpu": the render thread's own CPU time while recording (wall time on a loaded machine
-        // is mostly waiting for a core). "idle": the render thread waiting for the game's next
-        // frame. Median and 90th percentile of the frame time: steps of a display refresh show a
-        // frame paced by something other than the work.
-        std::sort(a.intervals.begin(), a.intervals.end());
-        const float median = a.intervals[a.intervals.size() / 2], p90 = a.intervals[a.intervals.size() * 9 / 10];
-        return fmt::format("{:.1f} fps (frame {:.2f} ms, median {:.1f}, p90 {:.1f}; record {:.2f}, cpu {:.2f}, idle {:.2f}, "
-                           "GPU {:.2f}; per frame {:.1f} draws, {:.2f} skipped, {:.2f} passes, {:.2f} barriers)",
-                           1000.0 * a.n / a.interval, a.interval / a.n, median, p90, a.record / a.n, a.record_cpu / a.n,
-                           a.idle / a.n, a.gpu_n ? a.gpu / a.gpu_n : 0.0,
-                           double(a.draws) / a.n, double(a.skipped) / a.n, double(a.passes) / a.n,
-                           double(a.barriers) / a.n);
-      };
-      REXLOG_INFO("[native] A/B {} = {}: {} | = {}: {}", ab_name_, ab_values_[0], line(ab_[0]), ab_values_[1],
-                  line(ab_[1]));
+    if (!ab_from_sweep_ && !ab_name_.empty() && ab_frames_ % 1200 == 0 && ab_[0].n && ab_[1].n) {
+      REXLOG_INFO("[native] A/B {} = {}: {} | = {}: {}", ab_name_, ab_values_[0], AbLine(ab_[0]), ab_values_[1],
+                  AbLine(ab_[1]));
       ab_[0] = ab_[1] = {};
     }
   }
