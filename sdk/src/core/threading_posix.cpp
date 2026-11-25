@@ -34,6 +34,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <cstdio>
 
 #include <fcntl.h>
+#include <os/clock.h>
+#include <os/os_sync_wait_on_address.h>
+#endif
+#if REX_PLATFORM_LINUX && !defined(__SWITCH__)
+#include <linux/futex.h>
 #endif
 #if defined(__SWITCH__)
 // Horizon has no sys/syscall.h. The shim provides affinity, priority, cpu_set_t
@@ -63,7 +68,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/string.h>
 #endif
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !defined(__SWITCH__)
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
 #define REX_HAS_SIGEV_THREAD_ID 1
 #ifdef __GLIBC__
@@ -90,6 +95,12 @@ REXCVAR_DEFINE_INT32(thread_multiwait_safety_ms, 20, "Threading",
 REXCVAR_DEFINE_BOOL(thread_wake_one, true, "Threading",
                     "Setting an auto-reset event, releasing a semaphore by one or a mutant wakes one blocked "
                     "waiter instead of all of them. false = wake every waiter (the original behaviour)");
+REXCVAR_DEFINE_BOOL(thread_address_waits, false, "Threading",
+                    "Events, semaphores, mutants, timers and the WaitMultiple/alertable wake points wait on an "
+                    "address (svcWaitForAddress on Switch, os_sync on macOS, futex on Linux) instead of a "
+                    "mutex and condition variable: Set/Release change the state without a lock and make a "
+                    "system call only when a thread is waiting. Read when each object is created")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::thread {
 
@@ -275,19 +286,86 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
+static void AddressWait(std::atomic<uint32_t>& word, uint32_t expected,
+                        std::chrono::steady_clock::time_point deadline) {
+  int64_t timeout_ns = -1;
+  if (deadline != std::chrono::steady_clock::time_point::max()) {
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      return;
+    }
+    timeout_ns = std::max<int64_t>(
+        1, std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count());
+  }
+  auto* address = reinterpret_cast<uint32_t*>(&word);
+#if defined(__SWITCH__)
+  RexSwitchWaitForAddress(address, expected, timeout_ns);
+#elif defined(__APPLE__)
+  if (timeout_ns < 0) {
+    os_sync_wait_on_address(address, expected, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
+  } else {
+    os_sync_wait_on_address_with_timeout(address, expected, sizeof(uint32_t),
+                                         OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                         static_cast<uint64_t>(timeout_ns));
+  }
+#else
+  timespec ts = DurationToTimeSpec(std::chrono::nanoseconds(timeout_ns));
+  syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, expected, timeout_ns < 0 ? nullptr : &ts, nullptr, 0);
+#endif
+}
+
+static void AddressWake(std::atomic<uint32_t>& word, bool all) {
+  auto* address = reinterpret_cast<uint32_t*>(&word);
+#if defined(__SWITCH__)
+  RexSwitchSignalToAddress(address, all ? -1 : 1);
+#elif defined(__APPLE__)
+  if (all) {
+    os_sync_wake_by_address_all(address, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  } else {
+    os_sync_wake_by_address_any(address, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+  }
+#else
+  syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, all ? std::numeric_limits<int>::max() : 1, nullptr, nullptr, 0);
+#endif
+}
+
 // A thread parked in a blocking WaitMultiple (or an alertable wait) sleeps on one of these. Handles that
 // change state poke the wake points registered on them; QueueUserCallback pokes the one of the target thread.
 // Lifetime: owned by the waiter's stack; it is unregistered from every handle (which takes that handle's
 // registration mutex, so it also waits for a poker that is inside Poke) before it is destroyed.
 struct WakePoint {
+  const bool address_wait = REXCVAR_GET(thread_address_waits);
   std::mutex m;
   std::condition_variable cv;
-  std::atomic<uint64_t> seq{0};
+  std::atomic<uint32_t> seq{0};
 
   void Poke() {
+    if (address_wait) {
+      seq.fetch_add(1, std::memory_order_seq_cst);
+      AddressWake(seq, false);
+      return;
+    }
     std::lock_guard<std::mutex> lock(m);
     seq.fetch_add(1, std::memory_order_relaxed);
     cv.notify_all();
+  }
+
+  bool Park(uint32_t seen, std::chrono::steady_clock::time_point deadline, const std::atomic<bool>* interrupt) {
+    const auto woken = [&] {
+      return seq.load(std::memory_order_seq_cst) != seen ||
+             (interrupt && interrupt->load(std::memory_order_acquire));
+    };
+    if (!address_wait) {
+      std::unique_lock<std::mutex> park(m);
+      return cv.wait_until(park, deadline, woken);
+    }
+    while (!woken()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      AddressWait(seq, seen, deadline);
+    }
+    return true;
   }
 };
 
@@ -341,6 +419,11 @@ class PosixConditionBase {
   // Wakes a thread blocked in Wait() on this condition without signalling it (alertable wait interrupted by
   // a queued callback). The waiter's predicate sees its interrupt flag.
   void InterruptWaiters() {
+    if (address_wait_) {
+      wake_seq_.fetch_add(1, std::memory_order_seq_cst);
+      AddressWake(wake_seq_, true);
+      return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     cond_.notify_all();
   }
@@ -349,6 +432,9 @@ class PosixConditionBase {
   // then returns kTimeout early (the caller dispatches the callback and decides what to do next).
   WaitResult Wait(std::chrono::milliseconds timeout,
                   const std::atomic<bool>* interrupt = nullptr) {
+    if (address_wait_) {
+      return WaitOnAddress(timeout, interrupt);
+    }
     bool executed;
     auto predicate = [this, interrupt] {
       return this->signaled() || (interrupt && interrupt->load(std::memory_order_acquire));
@@ -469,7 +555,7 @@ class PosixConditionBase {
     while (true) {
       // Sampled BEFORE the poll: a handle signalled after this point bumps the sequence, so the park
       // below returns at once instead of missing it.
-      const uint64_t seen = wake ? wake->seq.load(std::memory_order_acquire) : 0;
+      const uint32_t seen = wake ? wake->seq.load(std::memory_order_seq_cst) : 0;
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -571,13 +657,7 @@ class PosixConditionBase {
           wake_deadline = end_time;
         }
         REX_SYS_COUNT(rex::syscount::kMultiBlock, 1);
-        std::unique_lock<std::mutex> park(wake->m);
-        const bool woke = wake->cv.wait_until(park, wake_deadline, [&] {
-          return wake->seq.load(std::memory_order_relaxed) != seen ||
-                 (interrupt && interrupt->load(std::memory_order_acquire));
-        });
-        park.unlock();
-        if (woke) {
+        if (wake->Park(seen, wake_deadline, interrupt)) {
           if (interrupt && interrupt->load(std::memory_order_acquire)) {
             return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
           }
@@ -610,6 +690,75 @@ class PosixConditionBase {
  protected:
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
+  virtual bool maybe_signaled() const { return true; }
+
+  bool TryAcquire() {
+    if (!maybe_signaled()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!signaled()) {
+      return false;
+    }
+    post_execution();
+    return true;
+  }
+
+  void WakeAddressWaiters(bool all) {
+    if (addr_waiters_.load(std::memory_order_seq_cst) == 0) {
+      REX_SYS_COUNT(rex::syscount::kAddrNoWaiter, 1);
+      return;
+    }
+    wake_seq_.fetch_add(1, std::memory_order_seq_cst);
+    REX_SYS_COUNT(rex::syscount::kAddrWake, 1);
+    AddressWake(wake_seq_, all);
+  }
+
+  WaitResult WaitOnAddress(std::chrono::milliseconds timeout, const std::atomic<bool>* interrupt) {
+    if (TryAcquire()) {
+      return WaitResult::kSuccess;
+    }
+    if (timeout == std::chrono::milliseconds::zero()) {
+      return WaitResult::kTimeout;
+    }
+    const auto deadline = timeout == std::chrono::milliseconds::max()
+                              ? std::chrono::steady_clock::time_point::max()
+                              : std::chrono::steady_clock::now() + timeout;
+    addr_waiters_.fetch_add(1, std::memory_order_seq_cst);
+    bool acquired = false;
+    while (true) {
+      const uint32_t seen = wake_seq_.load(std::memory_order_seq_cst);
+      if (TryAcquire()) {
+        acquired = true;
+        break;
+      }
+      if (interrupt && interrupt->load(std::memory_order_acquire)) {
+        break;
+      }
+      if (deadline != std::chrono::steady_clock::time_point::max() &&
+          std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      REX_SYS_COUNT(rex::syscount::kAddrPark, 1);
+      AddressWait(wake_seq_, seen, deadline);
+    }
+    addr_waiters_.fetch_sub(1, std::memory_order_seq_cst);
+    if (acquired) {
+      return WaitResult::kSuccess;
+    }
+    if (maybe_signaled()) {
+      WakeAddressWaiters(false);
+    }
+    return WaitResult::kTimeout;
+  }
+
+  uint32_t waiter_count() const {
+    return addr_waiters_.load(std::memory_order_seq_cst) + multi_count_.load(std::memory_order_seq_cst);
+  }
+
+  const bool address_wait_ = REXCVAR_GET(thread_address_waits);
+  std::atomic<uint32_t> wake_seq_{0};
+  std::atomic<uint32_t> addr_waiters_{0};
   // Must be called with mutex_ held, in the same critical section that changed the state: true when a thread is
   // blocked (or about to block) in Wait() on cond_. Lets a state change skip cond_.notify_all() when nobody can be
   // waiting on it; on Horizon a notify is a system call even with no waiter (svcSignalProcessWideKey).
@@ -640,10 +789,17 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
+    if (address_wait_) {
+      if (AddSignal()) {
+        WakeAddressWaiters(manual_reset_ || !REXCVAR_GET(thread_wake_one));
+      }
+      NotifyMulti();
+      return true;
+    }
     bool notify;
     {
       auto lock = std::unique_lock<std::mutex>(mutex_);
-      signal_ = true;
+      signal_.store(1, std::memory_order_relaxed);
       notify = has_cond_waiters();
     }
     // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
@@ -660,18 +816,37 @@ class PosixCondition<Event> : public PosixConditionBase {
   }
 
   void Reset() {
+    if (address_wait_) {
+      signal_.store(0, std::memory_order_seq_cst);
+      return;
+    }
     auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = false;
+    signal_.store(0, std::memory_order_relaxed);
   }
 
  private:
-  inline bool signaled() const override { return signal_; }
+  bool AddSignal() {
+    uint32_t current = signal_.load(std::memory_order_seq_cst);
+    do {
+      if (current != 0 && (manual_reset_ || current > waiter_count())) {
+        return false;
+      }
+    } while (!signal_.compare_exchange_weak(current, current + 1, std::memory_order_seq_cst,
+                                            std::memory_order_seq_cst));
+    return true;
+  }
+  inline bool signaled() const override { return signal_.load(std::memory_order_relaxed) != 0; }
+  bool maybe_signaled() const override { return signal_.load(std::memory_order_seq_cst) != 0; }
   inline void post_execution() override {
-    if (!manual_reset_) {
-      signal_ = false;
+    if (manual_reset_) {
+      return;
+    }
+    uint32_t current = signal_.load(std::memory_order_relaxed);
+    while (current != 0 && !signal_.compare_exchange_weak(current, current - 1, std::memory_order_seq_cst,
+                                                          std::memory_order_relaxed)) {
     }
   }
-  bool signal_;
+  std::atomic<uint32_t> signal_;
   const bool manual_reset_;
 };
 
@@ -684,14 +859,30 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   bool Signal() override { return Release(1, nullptr); }
 
   bool Release(uint32_t release_count, int* out_previous_count) {
+    if (address_wait_) {
+      uint32_t current = count_.load(std::memory_order_relaxed);
+      do {
+        if (release_count > maximum_count_ - current) {
+          return false;
+        }
+      } while (!count_.compare_exchange_weak(current, current + release_count, std::memory_order_seq_cst,
+                                             std::memory_order_relaxed));
+      if (out_previous_count) {
+        *out_previous_count = current;
+      }
+      WakeAddressWaiters(release_count != 1 || !REXCVAR_GET(thread_wake_one));
+      NotifyMulti();
+      return true;
+    }
     auto lock = std::unique_lock<std::mutex>(mutex_);
-    if (release_count > maximum_count_ - count_) {
+    const uint32_t count = count_.load(std::memory_order_relaxed);
+    if (release_count > maximum_count_ - count) {
       return false;
     }
     if (out_previous_count) {
-      *out_previous_count = count_;
+      *out_previous_count = count;
     }
-    count_ += release_count;
+    count_.store(count + release_count, std::memory_order_relaxed);
     const bool notify = has_cond_waiters();
     lock.unlock();
     if (notify) {
@@ -706,20 +897,21 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   }
 
  private:
-  inline bool signaled() const override { return count_ > 0; }
+  inline bool signaled() const override { return count_.load(std::memory_order_relaxed) > 0; }
+  bool maybe_signaled() const override { return count_.load(std::memory_order_seq_cst) > 0; }
   inline void post_execution() override {
-    count_--;
+    const uint32_t left = count_.fetch_sub(1, std::memory_order_relaxed) - 1;
     // Runs with mutex_ held (Wait and WaitMultiple).
-    if (!has_cond_waiters()) {
+    if (address_wait_ || !has_cond_waiters()) {
       return;
     }
     if (!REXCVAR_GET(thread_wake_one)) {
       cond_.notify_all();
-    } else if (count_ > 0) {
+    } else if (left > 0) {
       cond_.notify_one();
     }
   }
-  uint32_t count_;
+  std::atomic<uint32_t> count_;
   const uint32_t maximum_count_;
 };
 
@@ -746,7 +938,11 @@ class PosixCondition<Mutant> : public PosixConditionBase {
         released = count_ == 0;
         notify = released && has_cond_waiters();
       }
-      if (notify) {
+      if (address_wait_) {
+        if (released) {
+          WakeAddressWaiters(!REXCVAR_GET(thread_wake_one));
+        }
+      } else if (notify) {
         if (REXCVAR_GET(thread_wake_one)) {
           cond_.notify_one();
         } else {
@@ -784,10 +980,17 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
+    if (address_wait_) {
+      if (!signal_.exchange(true, std::memory_order_seq_cst)) {
+        WakeAddressWaiters(true);
+      }
+      NotifyMulti();
+      return true;
+    }
     bool notify;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      signal_ = true;
+      signal_.store(true, std::memory_order_relaxed);
       notify = has_cond_waiters();
     }
     if (notify) {
@@ -803,7 +1006,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
 
     callback_ = std::move(opt_callback);
-    signal_ = false;
+    signal_.store(false, std::memory_order_seq_cst);
     wait_item_ = QueueTimerOnce(&CompletionRoutine, this, due_time);
   }
 
@@ -814,7 +1017,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
     std::lock_guard<std::mutex> lock(mutex_);
 
     callback_ = std::move(opt_callback);
-    signal_ = false;
+    signal_.store(false, std::memory_order_seq_cst);
     wait_item_ = QueueTimerRecurring(&CompletionRoutine, this, due_time, period);
   }
 
@@ -846,15 +1049,16 @@ class PosixCondition<Timer> : public PosixConditionBase {
   }
 
  private:
-  inline bool signaled() const override { return signal_; }
+  inline bool signaled() const override { return signal_.load(std::memory_order_relaxed); }
+  bool maybe_signaled() const override { return signal_.load(std::memory_order_seq_cst); }
   inline void post_execution() override {
     if (!manual_reset_) {
-      signal_ = false;
+      signal_.store(false, std::memory_order_relaxed);
     }
   }
   std::weak_ptr<TimerQueueWaitItem> wait_item_;
   std::function<void()> callback_;
-  bool signal_;  // Protected by mutex_
+  std::atomic<bool> signal_;
   const bool manual_reset_;
 };
 
@@ -1285,6 +1489,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       signaled_ = true;
       cond_.notify_all();
     }
+    WakeAddressWaiters(true);
     NotifyMulti();
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
@@ -1685,10 +1890,7 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
     auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
     const auto nap = std::min(remaining, slice);
     if (blocking && interrupt) {
-      std::unique_lock<std::mutex> park(wake_point.m);
-      wake_point.cv.wait_until(park, now + nap, [&] {
-        return interrupt->load(std::memory_order_acquire);
-      });
+      wake_point.Park(wake_point.seq.load(std::memory_order_seq_cst), now + nap, interrupt);
     } else {
       Sleep(nap);
     }
@@ -1927,6 +2129,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
   }
+  thread->handle_.WakeAddressWaiters(true);
   thread->handle_.NotifyMulti();
 
   current_thread_ = nullptr;

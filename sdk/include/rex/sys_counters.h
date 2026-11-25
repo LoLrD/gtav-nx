@@ -29,7 +29,10 @@ enum : unsigned {
   kAudioNative = 53,      // native audio DSP replacements run (app)
   kAudioMismatch = 54,    // ... validate mode mismatches (app)
   kCritSecWait = 55,      // RtlEnterCriticalSection fell into a full host wait
-  kCount = 56,
+  kAddrPark = 59,
+  kAddrWake = 60,
+  kAddrNoWaiter = 61,
+  kCount = 62,
 };
 
 }  // namespace rex::syscount

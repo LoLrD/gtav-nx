@@ -331,6 +331,15 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
  */
 int RexSwitchCurrentCore(void) { return int(svcGetCurrentProcessorNumber()); }
 
+void RexSwitchWaitForAddress(const uint32_t* address, uint32_t expected, int64_t timeout_ns) {
+  svcWaitForAddress(const_cast<uint32_t*>(address), ArbitrationType_WaitIfEqual,
+                    static_cast<s64>(static_cast<s32>(expected)), timeout_ns);
+}
+
+void RexSwitchSignalToAddress(const uint32_t* address, int32_t count) {
+  svcSignalToAddress(const_cast<uint32_t*>(address), SignalType_Signal, 0, count);
+}
+
 }  // extern "C"
 
 #endif  /* REX_PLATFORM_SWITCH */

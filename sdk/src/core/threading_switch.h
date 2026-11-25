@@ -169,6 +169,9 @@ bool RexSwitchPinCurrentThreadToCore(int core);
 /* Which core the calling thread is running on right now. It can only be asked about oneself. */
 int RexSwitchCurrentCore(void);
 
+void RexSwitchWaitForAddress(const uint32_t* address, uint32_t expected, int64_t timeout_ns);
+void RexSwitchSignalToAddress(const uint32_t* address, int32_t count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -139,7 +139,7 @@ constexpr u64 kReportSeconds = 10;
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
-// 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h);
+// 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 and 59-61 host-runtime overhead (include/rex/sys_counters.h);
 // 56-58 XMA stuck-voice diagnostics (xma_context.cpp, audio_xma_diag).
 constexpr unsigned kCounterCount = 64;
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
@@ -773,11 +773,13 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                "WaitMultiple: %.0f parked, %.0f woken by signal, %.0f safety re-polls, %.0f legacy 1 ms polls | "
                "timestamp timer ticks %.0f | UpdateGuestClock %.0f calls, %.0f contended | ObjectTable lookups "
                "%.0f, %.0f contended | VolumeChangeMask %.0f | vblank thread wakes %.0f | native audio DSP calls "
-               "%.0f, %.0f mismatches | critical-section host waits %.0f\n",
+               "%.0f, %.0f mismatches | critical-section host waits %.0f | address waits: %.0f parked, %.0f "
+               "wakes, %.0f signals without a waiter\n",
                delta(40) / seconds, delta(41) / seconds, delta(42) / seconds, delta(43) / seconds,
                delta(44) / seconds, delta(45) / seconds, delta(46) / seconds, delta(47) / seconds,
                delta(48) / seconds, delta(49) / seconds, delta(50) / seconds, delta(51) / seconds,
-               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds);
+               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds,
+               delta(59) / seconds, delta(60) / seconds, delta(61) / seconds);
   if (RexSwitchMallocCacheStats) {
     uint64_t cache[6];
     RexSwitchMallocCacheStats(cache);
