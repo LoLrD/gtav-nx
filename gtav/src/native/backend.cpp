@@ -372,6 +372,9 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
 REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
                     "Apply the guest's scissor rectangle to draws (off: draws cover the whole target)");
+REXCVAR_DEFINE_INT32(gtav_native_watch_full_frames, 64, "GTAV",
+                     "Native renderer, with a write watch: frames after which a cached texture or buffer the watch "
+                     "keeps finding unchanged is hashed in full anyway");
 REXCVAR_DEFINE_BOOL(gtav_native_write_watch_verify, false, "GTAV",
                     "Native renderer: also hash textures and buffers the write watch says are unchanged, and "
                     "log how many had changed (diagnostic)");
@@ -3471,14 +3474,21 @@ struct Backend::Impl {
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
     // lookups (--gtav_native_write_watch_verify).
-    if (t.texture && watching && frame - t.full_frame < 64 && t.watch.Clean()) {  // no guest write since
+    if (t.texture && watching && frame - t.full_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_watch_full_frames))) &&
+        t.watch.Clean()) {  // no guest write since
       tprof.watched++;
-      if (REXCVAR_GET(gtav_native_write_watch_verify) && HashGuestTexture(words) != t.raw_hash)
-        (write_watch::Pending(t.watch.ranges[0], t.watch.ranges[1]) ||
-                 (t.watch.ranges[3] && write_watch::Pending(t.watch.ranges[2], t.watch.ranges[3]))
-             ? watch_late : watch_missed)++;
-      t.checked_frame = frame;
-      return t.descriptor;
+      if (!REXCVAR_GET(gtav_native_write_watch_verify) || HashGuestTexture(words) == t.raw_hash) {
+        t.checked_frame = frame;
+        return t.descriptor;
+      }
+      const bool late = write_watch::Pending(t.watch.ranges[0], t.watch.ranges[1]) ||
+                        (t.watch.ranges[3] && write_watch::Pending(t.watch.ranges[2], t.watch.ranges[3]));
+      (late ? watch_late : watch_missed)++;
+      if (!late && watch_missed_logged++ < 40)
+        REXLOG_INFO("[native] write watch missed a change: texture {:08X}+{:X} mips {:08X}+{:X} format {} {}x{} "
+                    "at frame {}, hashed at frame {}",
+                    t.watch.ranges[0], t.watch.ranges[1], t.watch.ranges[2], t.watch.ranges[3], words[1] & 0x3F,
+                    (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1, frame, t.full_frame);
     }
     if (t.texture && t.bytes > kSmallTexture &&
         frame - t.checked_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_recheck_frames))) &&
@@ -4289,6 +4299,7 @@ struct Backend::Impl {
   uint64_t stat_pipeline_binds = 0;  // vkCmdBindPipeline calls (5% of the render thread in the driver, 11-15)
   uint32_t prof_frames = 0;
   uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
+  std::atomic<uint32_t> watch_missed_logged{0};
   uint64_t hashed_bytes[2] = {};
 
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
@@ -5448,12 +5459,19 @@ struct Backend::Impl {
     if (b.checked_frame.load(std::memory_order_relaxed) == frame) return b.buffer.get();
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     if (b.buffer && watching && b.size == host_size && b.watch.ranges[0] == physical &&
-        b.watch.ranges[1] == guest_size && frame - b.full_frame < 64 && b.watch.Clean()) {  // unchanged
+        b.watch.ranges[1] == guest_size &&
+        frame - b.full_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_watch_full_frames))) &&
+        b.watch.Clean()) {  // unchanged
       rc.watched_buffers++;
-      if (REXCVAR_GET(gtav_native_write_watch_verify) && Hash(guest, guest_size) != b.content)
-        (write_watch::Pending(physical, uint32_t(guest_size)) ? rc.watch_late : rc.watch_missed)++;
-      b.checked_frame.store(frame, std::memory_order_release);
-      return b.buffer.get();
+      if (!REXCVAR_GET(gtav_native_write_watch_verify) || Hash(guest, guest_size) == b.content) {
+        b.checked_frame.store(frame, std::memory_order_release);
+        return b.buffer.get();
+      }
+      const bool late = write_watch::Pending(physical, uint32_t(guest_size));
+      (late ? rc.watch_late : rc.watch_missed)++;
+      if (!late && watch_missed_logged++ < 40)
+        REXLOG_INFO("[native] write watch missed a change: buffer {:08X}+{:X} at frame {}, hashed at frame {}",
+                    physical, uint32_t(guest_size), uint64_t(frame), b.full_frame);
     }
     // Large buffers: a sampled hash every frame and a full one every 8 frames. (It leaves the
     // watch epoch alone: only a full hash makes the copy current.)
