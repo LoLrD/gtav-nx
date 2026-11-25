@@ -44,6 +44,12 @@ REXCVAR_DEFINE_INT32(gtav_nr_check, 0, "GTAV",
                      "original version and compares them, with timings, logged every 10 s (0 = off)");
 
 REXCVAR_DEFINE_INT32(gtav_nr_check_delay, 0, "GTAV", "Seconds after start before gtav_nr_check begins");
+REXCVAR_DEFINE_BOOL(gtav_nr_lzx, false, "GTAV", "Native LZX aligned-offset block decoder of XCompress (sub_837A0D88)");
+REXCVAR_DEFINE_INT32(gtav_nr_lzx_check, 0, "GTAV",
+                     "Every Nth sub_837A0D88 call runs both the native and the original decoder on the same input "
+                     "and compares the window bytes, the decoder state and the result (0 = off)");
+REXCVAR_DEFINE_BOOL(gtav_nr_lzx_stats, false, "GTAV",
+                    "Time every sub_837A0D88 call and log calls, bytes and ns per byte every 10 s");
 
 REX_EXTERN(__imp__sub_8378DEF8);
 REX_EXTERN(__imp__sub_83773B60);
@@ -61,6 +67,7 @@ REX_EXTERN(__imp__sub_834260A0);
 REX_EXTERN(__imp__sub_8358AE80);
 REX_EXTERN(__imp__sub_83442200);
 REX_EXTERN(__imp__sub_822F4E48);
+REX_EXTERN(__imp__sub_837A0D88);
 REX_EXTERN(sub_822174F8);
 REX_EXTERN(sub_82303FC0);
 REX_EXTERN(sub_824FEFF0);
@@ -131,10 +138,12 @@ Stat g_vm{"vm sub_834260A0"};
 Stat g_pack{"pack sub_8358AE80"};
 Stat g_gather{"gather sub_83442200"};
 Stat g_pow{"pow sub_822F4E48"};
+Stat g_lzx{"lzx sub_837A0D88"};
 std::atomic<uint64_t> g_vm_unchecked{0};
 
-std::array<Stat*, 15> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack, &g_volume, &g_quat,
-                              &g_cull,   &g_blend,   &g_bound,  &g_vm,        &g_pack,   &g_gather, &g_pow};
+std::array<Stat*, 16> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack,
+                              &g_volume, &g_quat,    &g_cull,   &g_blend,     &g_bound,  &g_vm,
+                              &g_pack,   &g_gather,  &g_pow,    &g_lzx};
 
 std::mutex g_report_mutex;
 Clock::time_point g_report_at = Clock::now();
@@ -2848,4 +2857,247 @@ REX_HOOK_RAW(sub_822F4E48) {
   }
 #endif
   __imp__sub_822F4E48(ctx, base);
+}
+
+namespace {
+
+constexpr uint32_t kLzxStateSize = 12288;
+constexpr uint32_t kLzxSlack = 512;
+constexpr uint32_t kLzxWrittenState = 11964;
+constexpr uint32_t kLzxWrittenTail = 288;
+
+struct LzxBits {
+  uint32_t buf;
+  int8_t count;
+  const uint8_t* in;
+
+  void Drop(uint32_t n) {
+    count = int8_t(count - int32_t(n));
+    buf = n & 0x20 ? 0 : buf << (n & 0x1F);
+    if (count > 0) return;
+    const uint32_t word = uint32_t(in[0]) | uint32_t(in[1]) << 8;
+    const uint32_t shift = uint32_t(-int32_t(count)) & 0xFF;
+    in += 2;
+    buf |= shift & 0x20 ? 0 : word << (shift & 0x1F);
+    count = int8_t(count + 16);
+  }
+};
+
+inline uint32_t LzxTop(uint32_t buf, uint32_t n) {
+  const uint32_t shift = (32 - n) & 0xFF;
+  return shift & 0x20 ? 0 : buf >> (shift & 0x1F);
+}
+
+inline int32_t LzxEntry(const uint8_t* s, uint32_t off) {
+  uint16_t v;
+  std::memcpy(&v, s + off, 2);
+  return int16_t(__builtin_bswap16(v));
+}
+
+inline int32_t LzxDecode(const uint8_t* s, uint32_t buf, uint32_t table, uint32_t bits, uint32_t tree) {
+  int32_t sym = LzxEntry(s, table + ((buf >> (32 - bits)) << 1));
+  for (uint32_t m = 1u << (31 - bits); sym < 0; m >>= 1)
+    sym = LzxEntry(s, tree + (uint32_t((buf & m ? 1 : 0) - 2 * sym) << 1));
+  return sym;
+}
+
+inline void LzxStore32(uint8_t* s, uint32_t off, uint32_t v) {
+  v = __builtin_bswap32(v);
+  std::memcpy(s + off, &v, 4);
+}
+
+template <uint32_t N>
+inline void LzxMove(uint8_t* dst, const uint8_t* src) {
+  uint8_t chunk[N];
+  std::memcpy(chunk, src, N);
+  std::memcpy(dst, chunk, N);
+}
+
+inline void LzxCopyBehind(uint8_t* dst, const uint8_t* src, uint32_t len) {
+  if (len >= 16) {
+    for (uint32_t i = 0; i + 16 <= len; i += 16) LzxMove<16>(dst + i, src + i);
+    LzxMove<16>(dst + len - 16, src + len - 16);
+  } else if (len >= 8) {
+    LzxMove<8>(dst, src);
+    LzxMove<8>(dst + len - 8, src + len - 8);
+  } else if (len >= 4) {
+    LzxMove<4>(dst, src);
+    LzxMove<4>(dst + len - 4, src + len - 4);
+  } else {
+    LzxMove<2>(dst, src);
+    dst[len - 1] = src[len - 1];
+  }
+}
+
+inline void LzxCopy(uint8_t* dst, const uint8_t* src, uint32_t len, uint32_t dist, bool behind) {
+  if (behind && dist >= 16) {
+    LzxCopyBehind(dst, src, len);
+    return;
+  }
+  if (dist >= len) {
+    std::memmove(dst, src, len);
+    return;
+  }
+  for (uint32_t i = 0; i < len; ++i) dst[i] = src[i];
+}
+
+bool LzxRunnable(const PPCContext& ctx, uint8_t* base) {
+  const uint32_t st = ctx.r3.u32;
+  if (!Flat(st, kLzxStateSize)) return false;
+  const uint32_t win = Be32(Host(base, st), 0), mask = Be32(Host(base, st), 8);
+  const uint32_t in = Be32(Host(base, st), 11012), in_end = Be32(Host(base, st), 11016);
+  const uint64_t reach = std::max<uint64_t>(uint64_t(mask) + 1, uint64_t(ctx.r4.u32) + ctx.r5.u32) + kLzxSlack;
+  return reach <= 0x10000000u && Flat(win, uint32_t(reach)) && in_end - in < 0x10000000u &&
+         Flat(in, in_end - in + kLzxSlack);
+}
+
+void Lzx837A0D88(PPCContext& ctx, uint8_t* base) {
+  const uint32_t st = ctx.r3.u32;
+  uint8_t* s = Host(base, st);
+  const uint32_t win = Be32(s, 0), mask = Be32(s, 8);
+  uint8_t* w = Host(base, win);
+  const uint32_t in0 = Be32(s, 11012), in_end = Be32(s, 11016);
+  const uint8_t* in_base = Host(base, in0);
+  LzxBits bits{Be32(s, 11952), int8_t(s[11956]), in_base};
+  uint32_t r0 = Be32(s, 12), r1 = Be32(s, 16), r2 = Be32(s, 20);
+  uint64_t pos = ctx.r4.u64;
+  const uint64_t end = ctx.r4.u64 + ctx.r5.u64;
+  bool failed = false;
+  while (int32_t(uint32_t(pos)) < int32_t(uint32_t(end))) {
+    const int32_t sym = LzxDecode(s, bits.buf, 24, 10, 3644);
+    if (in0 + uint32_t(bits.in - in_base) >= in_end) {
+      failed = true;
+      break;
+    }
+    bits.Drop(s[2584 + uint32_t(sym)]);
+    const int32_t code = sym - 256;
+    if (code < 0) {
+      w[uint32_t(pos)] = uint8_t(code);
+      ++pos;
+      continue;
+    }
+    uint32_t header = uint32_t(code) & 7;
+    if (header == 7) {
+      const int32_t extra = LzxDecode(s, bits.buf, 2072, 8, 9020);
+      bits.Drop(s[3256 + uint32_t(extra)]);
+      header = uint32_t(extra) + 7;
+    }
+    const int32_t slot = int8_t(code >> 3);
+    uint32_t offset;
+    if (slot > 2) {
+      const uint32_t footer = s[12004 + uint32_t(slot)];
+      const uint32_t slot_base = Be32(s, 12056 + 4 * uint32_t(slot));
+      if (footer >= 3) {
+        const uint32_t verbatim_bits = (footer - 3) & 0xFF;
+        uint32_t verbatim = 0;
+        if (verbatim_bits) {
+          verbatim = LzxTop(bits.buf, verbatim_bits);
+          bits.Drop(verbatim_bits);
+        }
+        const int32_t aligned = int8_t(s[3508 + (bits.buf >> 25)]);
+        bits.Drop(s[3636 + uint32_t(aligned)]);
+        offset = slot_base + (verbatim << 3) + uint32_t(aligned);
+      } else if (footer) {
+        const uint32_t verbatim = LzxTop(bits.buf, footer);
+        bits.Drop(footer);
+        offset = slot_base + verbatim;
+      } else {
+        offset = slot_base;
+      }
+      r2 = r1;
+      r1 = r0;
+    } else if (slot == 0) {
+      offset = r0;
+    } else if (slot == 1) {
+      offset = r1;
+      r1 = r0;
+    } else {
+      offset = r2;
+      r2 = r0;
+    }
+    r0 = offset;
+    const uint32_t len = header + 2;
+    const uint32_t src = (uint32_t(pos) - offset) & mask;
+    LzxCopy(w + uint32_t(pos), w + src, len, uint32_t(pos) - src,
+            src < uint32_t(pos));
+    pos += len;
+  }
+  LzxStore32(s, 12, r0);
+  LzxStore32(s, 16, r1);
+  LzxStore32(s, 20, r2);
+  if (failed) {
+    ctx.r3.s64 = -1;
+    return;
+  }
+  s[11956] = uint8_t(bits.count);
+  LzxStore32(s, 11952, bits.buf);
+  LzxStore32(s, 11012, in0 + uint32_t(bits.in - in_base));
+  LzxStore32(s, 11960, uint32_t(pos) & mask);
+  ctx.r3.u64 = pos - end;
+}
+
+struct LzxTiming {
+  std::atomic<uint64_t> calls{0}, bytes{0}, ns{0};
+};
+
+LzxTiming g_lzx_native, g_lzx_original;
+std::mutex g_lzx_report_mutex;
+Clock::time_point g_lzx_report_at = Clock::now();
+
+void LzxReport() {
+  std::unique_lock lock(g_lzx_report_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  const auto now = Clock::now();
+  const uint64_t wall = Ns(g_lzx_report_at, now);
+  if (wall < 10'000'000'000ull) return;
+  g_lzx_report_at = now;
+  for (auto [name, t] : {std::pair{"native", &g_lzx_native}, std::pair{"original", &g_lzx_original}}) {
+    const uint64_t calls = t->calls.exchange(0, std::memory_order_relaxed);
+    const uint64_t bytes = t->bytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t ns = t->ns.exchange(0, std::memory_order_relaxed);
+    if (!calls) continue;
+    REXLOG_INFO("[lzx] {}: {} calls, {} bytes, {:.0f} ns/call, {:.3f} ns/byte, {:.2f}% of one core", name, calls,
+                bytes, double(ns) / calls, bytes ? double(ns) / bytes : 0.0, 100.0 * double(ns) / double(wall));
+  }
+}
+
+thread_local uint32_t t_lzx_tick = 0;
+
+inline bool LzxCheckNow() {
+  const int32_t every = REXCVAR_GET(gtav_nr_lzx_check);
+  return every > 0 && ++t_lzx_tick % uint32_t(every) == 0 &&
+         Clock::now() - g_started >= std::chrono::seconds(REXCVAR_GET(gtav_nr_check_delay));
+}
+
+bool LzxRun(PPCContext& ctx, uint8_t* base) {
+  if (Enabled(REXCVAR_GET(gtav_nr_lzx)) && LzxRunnable(ctx, base)) {
+    if (LzxCheckNow()) [[unlikely]] {
+      const uint32_t st = ctx.r3.u32, win = Be32(Host(base, st), 0);
+      Differential(g_lzx, ctx, base, __imp__sub_837A0D88,
+                   {{st, kLzxWrittenState}, {win + ctx.r4.u32, ctx.r5.u32 + kLzxWrittenTail}}, SameResult, Lzx837A0D88);
+      return false;
+    }
+    Lzx837A0D88(ctx, base);
+    return true;
+  }
+  __imp__sub_837A0D88(ctx, base);
+  return true;
+}
+
+}  // namespace
+
+REX_HOOK_RAW(sub_837A0D88) {
+  if (!REXCVAR_GET(gtav_nr_lzx_stats)) {
+    LzxRun(ctx, base);
+    return;
+  }
+  const uint32_t bytes = ctx.r5.u32;
+  const bool native = Enabled(REXCVAR_GET(gtav_nr_lzx));
+  const auto t0 = Clock::now();
+  if (!LzxRun(ctx, base)) return;
+  LzxTiming& t = native ? g_lzx_native : g_lzx_original;
+  t.ns.fetch_add(Ns(t0, Clock::now()), std::memory_order_relaxed);
+  t.calls.fetch_add(1, std::memory_order_relaxed);
+  t.bytes.fetch_add(bytes, std::memory_order_relaxed);
+  LzxReport();
 }
