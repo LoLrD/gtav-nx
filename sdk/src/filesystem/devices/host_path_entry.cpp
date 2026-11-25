@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cerrno>
+#include <cstring>
+
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
 #include "startup_trace.h"
@@ -87,6 +90,8 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
         host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
   }
   if (!file_handle) {
+    REXFS_WARN("HostPathEntry: open of '{}' with access {:08X} failed: {} ({})", host_path_.string(),
+               static_cast<uint32_t>(desired_access), std::strerror(errno), errno);
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
   }
@@ -143,7 +148,7 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
     return removed >= 1 && removed != static_cast<std::uintmax_t>(-1);
   } else {
     // Delete file.
-    return !std::filesystem::is_directory(full_path) && std::filesystem::remove(full_path, ec);
+    return !std::filesystem::is_directory(full_path, ec) && std::filesystem::remove(full_path, ec);
   }
 }
 
