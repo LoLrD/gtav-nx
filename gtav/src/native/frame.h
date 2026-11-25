@@ -164,27 +164,60 @@ struct Command {
 // Append-only bytes without std::vector's zero fill: a frame pushes tens of MB of register
 // shadows and constants, and packets are recycled (TakeSpare), so the capacity is kept.
 inline std::atomic<uint64_t> g_arena_grows{0}, g_arena_grow_bytes{0};  // stats: reallocations, bytes moved
-// Largest capacity any arena reached: a new arena starts there instead of doubling up from 4 MB
-// (each growth copied tens of MB in the open world: a hitch whenever a new packet was made).
-inline std::atomic<size_t> g_arena_peak{0};
+// Largest size an arena of each kind needed: a new arena starts there instead of growing up from
+// 1 MB (each growth copied tens of MB in the open world: a hitch whenever a new packet was made).
+inline std::atomic<size_t> g_arena_peak{0}, g_fence_arena_peak{0};
+inline std::atomic<int64_t> g_arena_bytes{0}, g_arena_count{0};
 inline std::atomic<uint32_t> g_writeback_epoch{0};
 
 class ByteArena {
  public:
+  ByteArena() = default;
+  explicit ByteArena(std::atomic<size_t>* peak) : peak_(peak) {}
+  ByteArena(ByteArena&& o) noexcept
+      : buf_(std::move(o.buf_)), size_(o.size_), cap_(o.cap_), recent_(o.recent_), peak_(o.peak_) {
+    o.size_ = o.cap_ = o.recent_ = 0;
+  }
+  ByteArena& operator=(ByteArena&& o) noexcept {
+    if (this != &o) {
+      Release();
+      buf_ = std::move(o.buf_), size_ = o.size_, cap_ = o.cap_, recent_ = o.recent_, peak_ = o.peak_;
+      o.size_ = o.cap_ = o.recent_ = 0;
+    }
+    return *this;
+  }
+  ~ByteArena() { Release(); }
   uint8_t* data() { return buf_.get(); }
   const uint8_t* data() const { return buf_.get(); }
   size_t size() const { return size_; }
   void clear() { size_ = 0; }
+  void Recycle() {
+    constexpr size_t kStep = size_t(1) << 20;
+    recent_ = std::max(size_, recent_ - recent_ / 32);
+    size_ = 0;
+    if (cap_ <= 2 * recent_ + kStep) return;
+    const size_t cap = (recent_ + recent_ / 4 + kStep - 1) & ~(kStep - 1);
+    buf_.reset();
+    if (cap) buf_ = std::make_unique_for_overwrite<uint8_t[]>(cap);
+    g_arena_bytes += int64_t(cap) - int64_t(cap_);
+    if (!cap) g_arena_count--;
+    cap_ = cap;
+  }
   void Shrink(size_t n) { size_ -= std::min(n, size_); }
   uint8_t* Grow(size_t n) {
     if (size_ + n > cap_) {
-      size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : std::max(size_t(4) << 20, g_arena_peak.load()));
+      constexpr size_t kStep = size_t(1) << 20;
+      const size_t need = size_ + n;
+      size_t cap = std::max(need, cap_ ? cap_ + cap_ / 2 : std::max(kStep, peak_->load()));
+      cap = (cap + kStep - 1) & ~(kStep - 1);
       auto buf = std::make_unique_for_overwrite<uint8_t[]>(cap);
       if (size_) std::memcpy(buf.get(), buf_.get(), size_);
       g_arena_grows++, g_arena_grow_bytes += size_;
+      g_arena_bytes += int64_t(cap) - int64_t(cap_);
+      if (!cap_) g_arena_count++;
       buf_ = std::move(buf);
       cap_ = cap;
-      for (size_t peak = g_arena_peak.load(); cap > peak && !g_arena_peak.compare_exchange_weak(peak, cap);) {}
+      for (size_t peak = peak_->load(); need > peak && !peak_->compare_exchange_weak(peak, need);) {}
     }
     uint8_t* p = buf_.get() + size_;
     size_ += n;
@@ -192,8 +225,12 @@ class ByteArena {
   }
 
  private:
+  void Release() {
+    if (cap_) g_arena_bytes -= int64_t(cap_), g_arena_count--;
+  }
   std::unique_ptr<uint8_t[]> buf_;
-  size_t size_ = 0, cap_ = 0;
+  size_t size_ = 0, cap_ = 0, recent_ = 0;
+  std::atomic<size_t>* peak_ = &g_arena_peak;
 };
 
 struct FramePacket {
@@ -206,7 +243,7 @@ struct FramePacket {
   ByteArena arena;
   // Draw data the command processor copied at GPU fences (capture.cpp ApplyFenceCopies): handed
   // over whole, addressed with kFenceBit set in the offset.
-  ByteArena fence_arena;
+  ByteArena fence_arena{&g_fence_arena_peak};
   static constexpr uint32_t kFenceBit = 0x80000000u;
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
   uint32_t end_fence = 0;  // the device's next GPU fence value at Swap: every fence below it was issued in the frame
@@ -224,8 +261,8 @@ struct FramePacket {
     clears.clear();
     resolves.clear();
     queries.clear();
-    arena.clear();
-    fence_arena.clear();
+    arena.Recycle();
+    fence_arena.Recycle();
     front_buffer = 0;
     end_fence = 0;
   }

@@ -651,7 +651,7 @@ static void FenceReached(uint32_t value) {
       std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
       auto found = g_fence_arenas.find(p.frame);
       if (found == g_fence_arenas.end()) {
-        found = g_fence_arenas.emplace(p.frame, ByteArena{}).first;
+        found = g_fence_arenas.emplace(p.frame, ByteArena{&g_fence_arena_peak}).first;
         if (!g_spare_fence_arenas.empty()) {
           found->second = std::move(g_spare_fence_arenas.back());
           g_spare_fence_arenas.pop_back();
@@ -686,7 +686,7 @@ void ApplyFenceCopies(FramePacket& f) {
   for (auto it = g_fence_arenas.begin(); it != g_fence_arenas.end() && it->first <= f.index;
        it = g_fence_arenas.erase(it)) {
     if (it->first == f.index) std::swap(f.fence_arena, it->second);
-    it->second.clear();
+    it->second.Recycle();
     if (g_spare_fence_arenas.size() < 4) g_spare_fence_arenas.push_back(std::move(it->second));
   }
   constexpr uint32_t kFenceBit = FramePacket::kFenceBit;
@@ -746,9 +746,11 @@ void FenceCopiesRecorded(uint64_t frame) {
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
       REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "
-                  "({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} times ({} MB moved)",
+                  "({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} times ({} MB moved), {} arenas hold "
+                  "{} MB (largest packet {} KB, largest fence copies {} KB)",
                   st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
-                  g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
+                  g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20, g_arena_count.load(),
+                  g_arena_bytes.load() >> 20, g_arena_peak.load() >> 10, g_fence_arena_peak.load() >> 10);
       st = {};
       if (ReleaseMode()) {
         auto& rs = g_release_stats;
