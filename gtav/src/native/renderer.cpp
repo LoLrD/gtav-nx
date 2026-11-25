@@ -128,6 +128,7 @@ extern std::atomic<uint32_t> g_statLoadClears, g_statClearsInPass, g_statClearsP
 extern bool g_colorInputAttachments;
 extern uint64_t g_preferredBlockSize;
 extern uint64_t g_heapSizeOverride;
+extern double g_timestampScale;
 }
 
 
@@ -902,6 +903,7 @@ class Renderer {
       acquires_[i] = device_->createCommandSemaphore();
       gpu_times_[i] = device_->createQueryPool(2);
     }
+    REXLOG_INFO("[native] GPU timestamps scaled by {:.4f} (driver period times this)", plume::g_timestampScale);
     CreateFramebuffers();
     REXLOG_INFO("[native] init: framebuffers created, backend init");
     backend_ok_ = backend_.Init(device_.get());

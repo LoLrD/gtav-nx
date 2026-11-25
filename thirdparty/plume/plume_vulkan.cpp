@@ -47,6 +47,11 @@ namespace plume {
     std::atomic<uint64_t> g_statDeviceMemoryAllocs{0}, g_statDeviceMemoryFrees{0}, g_statDeviceMemoryBytes{0};
     uint64_t g_preferredBlockSize = 0;
     uint64_t g_heapSizeOverride = 0;
+#if defined(__SWITCH__)
+    double g_timestampScale = 625.0 / 384.0;
+#else
+    double g_timestampScale = 1.0;
+#endif
     static void VKAPI_PTR getMemoryPropertiesForAllocator(VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *properties) {
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, properties);
         for (uint32_t i = 0; i < properties->memoryHeapCount; i++) {
@@ -3036,7 +3041,7 @@ namespace plume {
 
         // Convert results to timestamps.
         constexpr uint64_t shift_bits = 16;
-        double timestampPeriod = double(device->physicalDeviceProperties.limits.timestampPeriod);
+        double timestampPeriod = double(device->physicalDeviceProperties.limits.timestampPeriod) * g_timestampScale;
         uint64_t h = 0, l = 0;
         for (uint64_t &result : results) {
             mult64to128(result, uint64_t(timestampPeriod * double(1 << shift_bits)), h, l);
