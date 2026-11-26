@@ -260,8 +260,8 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_fsr_sharpness, 0.25, "GTAV",
                       "Native renderer (live): --gtav_native_fsr sharpening (RCAS) in stops of reduction, 0 = "
                       "sharpest, 2 = soft; negative skips RCAS (EASU only, cheaper)");
 REXCVAR_DEFINE_BOOL(gtav_native_fsr_bilinear, false, "GTAV",
-                    "Native renderer (live), with --gtav_native_fsr: upscale with a bilinear filter instead of FSR "
-                    "(one texture fetch a pixel: cheaper, softer; no RCAS)");
+                    "Native renderer (live), with --gtav_native_fsr: upscale with a bilinear filter instead of EASU "
+                    "(one texture fetch a pixel: cheaper, softer); RCAS still follows unless the sharpness is negative");
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
@@ -7512,7 +7512,18 @@ struct Backend::Impl {
     const float sharpness = float(REXCVAR_GET(gtav_native_fsr_sharpness));
     const float ratio = float(source_width) / float(width);
     Transition(list, source, RenderTextureLayout::SHADER_READ);
-    if (REXCVAR_GET(gtav_native_fsr_bilinear)) {
+    if (REXCVAR_GET(gtav_native_fsr_bilinear) && sharpness >= 0.0f) {
+      UpscaleImage& stretched = UpscaleTarget(format, width, height);
+      Transition(list, stretched.texture.get(), RenderTextureLayout::COLOR_WRITE);
+      list->setFramebuffer(stretched.framebuffer.get());
+      bound_fb = nullptr;
+      UpscaleStamp(list, "bilinear upscale", width, height);
+      upscale.Bilinear(list, slot, use, source, view, format, width, height);
+      Transition(list, stretched.texture.get(), RenderTextureLayout::SHADER_READ);
+      bind();
+      UpscaleStamp(list, "fsr rcas", width, height);
+      upscale.Rcas(list, slot, use, stretched.texture.get(), stretched.view.get(), format, sharpness);
+    } else if (REXCVAR_GET(gtav_native_fsr_bilinear)) {
       bind();
       UpscaleStamp(list, "bilinear upscale", width, height);
       upscale.Bilinear(list, slot, use, source, view, format, width, height);
