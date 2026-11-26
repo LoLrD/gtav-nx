@@ -437,8 +437,12 @@ std::string DiscSwapMovieReplacement(const std::string_view path, rex::filesyste
   return std::string(path.substr(0, name_at)) + "BWLogo.bik";
 }
 
+REXCVAR_DEFINE_INT32(io_read_delay_us, 0, "IO", "Diagnostic: sleep this long after every guest file read");
+
 inline void NoteRead(uint64_t us, uint32_t bytes, const std::string_view path,
                           uint64_t displacement) {
+  if (const int32_t delay = REXCVAR_GET(io_read_delay_us); delay > 0)
+    std::this_thread::sleep_for(std::chrono::microseconds(delay + int64_t(bytes) / 10));
   g_io.reads.fetch_add(1, std::memory_order_relaxed);
   g_io.bytes_read.fetch_add(bytes, std::memory_order_relaxed);
   g_io.us_reads.fetch_add(us, std::memory_order_relaxed);
