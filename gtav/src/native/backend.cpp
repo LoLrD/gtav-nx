@@ -289,6 +289,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize_verify, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_kill_skip, false, "GTAV",
                     "Native renderer (live): pixel shaders skip the rest of their work in 2x2 quads that their first "
                     "kill discards entirely");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_color_mask, false, "GTAV",
+                    "Native renderer (live): pixel shaders write 0 to colour channels that no target writes and no "
+                    "blend, alpha test or alpha to mask reads");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1160,6 +1163,8 @@ constexpr uint32_t kSpecPlainMoves = 1u << 12;
 constexpr uint32_t kSpecTexcoordMask32 = 1u << 14;
 constexpr uint32_t kSpecTextureSize = 1u << 11;
 constexpr uint32_t kSpecKillSkip = 1u << 13;
+constexpr uint32_t kUnusedColorShift = 16;
+constexpr uint32_t kSpecUnusedColorOpt = 1u << 31;
 constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
@@ -1168,6 +1173,7 @@ uint32_t ShaderOpts() {
   if (REXCVAR_GET(gtav_native_shader_opt_texcoord32)) opts |= kSpecTexcoordMask32;
   if (REXCVAR_GET(gtav_native_shader_opt_texsize)) opts |= kSpecTextureSize;
   if (REXCVAR_GET(gtav_native_shader_opt_kill_skip)) opts |= kSpecKillSkip;
+  if (REXCVAR_GET(gtav_native_shader_opt_color_mask)) opts |= kSpecUnusedColorOpt;
   if (REXCVAR_GET(gtav_native_shader_opt_texsize_verify)) opts |= kSpecTextureSizeVerify;
   return opts;
 }
@@ -3429,6 +3435,23 @@ struct Backend::Impl {
     return front || back;
   }
 
+  static uint32_t UnusedColor(const uint8_t* r, uint32_t count, bool colorless, uint32_t spec, uint32_t alpha_to_mask) {
+    const uint32_t mask = colorless ? 0 : regs::Read(r, regs::RB_COLOR_MASK);
+    uint32_t unused = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+      uint32_t channels = i < count ? (mask >> (4 * i)) & 0xF : 0;
+      if (i < count && (channels & 7)) {
+        const uint32_t b = i == 0 ? regs::Read(r, regs::RB_BLENDCONTROL0) : regs::Read(r, regs::RB_BLENDCONTROL1 + i - 1);
+        for (RenderBlend f : {Blend(b & 0x1F), Blend((b >> 8) & 0x1F)})
+          if (f == RenderBlend::SRC_ALPHA || f == RenderBlend::INV_SRC_ALPHA || f == RenderBlend::SRC_ALPHA_SAT)
+            channels |= 8;
+      }
+      if (i == 0 && ((spec & 2) || alpha_to_mask)) channels |= 8;
+      unused |= (~channels & 0xFu) << (kUnusedColorShift + 4 * i);
+    }
+    return unused;
+  }
+
   bool EarlyTests(const uint8_t* r, const DrawCommand& d, const RenderTarget* depth, uint32_t spec,
                   uint32_t alpha_to_mask) const {
     const int32_t mode = REXCVAR_GET(gtav_native_early_depth_tests);
@@ -5630,7 +5653,7 @@ struct Backend::Impl {
     }
     spec = (colorcontrol & 8) ? 2u : 0u;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
-    spec |= shader_opts;
+    spec |= shader_opts & ~kSpecUnusedColorOpt;
     }
     const uint32_t spec_words = spec;
 
@@ -5733,6 +5756,7 @@ struct Backend::Impl {
         stat_early++;
         early = true;
       }
+    if ((shader_opts & kSpecUnusedColorOpt) && diag == kDiagOff) spec |= UnusedColor(r, bind_count, colorless, spec, *word(133));
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     if (auto pi = pipeline_inputs.find(pkey); pi != pipeline_inputs.end())
       input_stat_draws++, input_stat_inputs += pi->second;

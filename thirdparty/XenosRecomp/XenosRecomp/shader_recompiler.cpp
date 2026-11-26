@@ -2055,6 +2055,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         out += '}';
                     }
 
+                    for (uint32_t i = 0; i < 4; i++)
+                    {
+                        if (pixelOutputs & (PIXEL_SHADER_OUTPUT_COLOR0 << i))
+                        {
+                            indent();
+                            println("oC{0} = select(xenosUnusedColor({0}), 0.0, oC{0});", i);
+                        }
+                    }
+
                     // GTA V: per-target output scale (render-target exponent bias and the 1/32
                     // of the Xenos fixed-point 16-bit formats, stored as SNORM on the host).
                     for (uint32_t i = 0; i < 4; i++)

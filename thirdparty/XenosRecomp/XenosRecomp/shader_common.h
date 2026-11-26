@@ -7,6 +7,7 @@
 #define SPEC_CONSTANT_CONSTANTS_UBO         (1 << 10)
 #define SPEC_CONSTANT_PLAIN_MOVES           (1 << 12)
 #define SPEC_CONSTANT_KILL_SKIP             (1 << 13)
+#define SPEC_CONSTANT_UNUSED_COLOR_SHIFT    16
 #define SPEC_CONSTANT_TEXCOORD_MASK32       (1 << 14)
 #define SPEC_CONSTANT_TEXTURE_SIZE          (1 << 11)
 #define SPEC_CONSTANT_TEXTURE_SIZE_VERIFY   (1 << 15)
@@ -81,6 +82,7 @@ uint g_SpecConstants();
 
 #endif
 
+#define xenosUnusedColor(INDEX) (((g_SpecConstants() >> (SPEC_CONSTANT_UNUSED_COLOR_SHIFT + 4 * (INDEX))) & uint4(1, 2, 4, 8)) != 0)
 #define maxSelf(a) ((g_SpecConstants() & SPEC_CONSTANT_PLAIN_MOVES) ? (a) : max(a, a))
 #define minSelf(a) ((g_SpecConstants() & SPEC_CONSTANT_PLAIN_MOVES) ? (a) : min(a, a))
 
