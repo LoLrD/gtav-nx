@@ -2042,7 +2042,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     if (pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
                     {
                         indent();
-                        out += "[branch] if (g_AlphaToMask != 0)";
+                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_MASK)";
                         indent();
                         out += '{';
                         indent();

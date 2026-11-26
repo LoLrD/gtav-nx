@@ -1174,6 +1174,7 @@ constexpr uint32_t kSpecKillSkip = 1u << 13;
 constexpr uint32_t kUnusedColorShift = 16;
 constexpr uint32_t kSpecUnusedColorOpt = 1u << 31;
 constexpr uint32_t kSpecBlendSkip = 1u << 5;
+constexpr uint32_t kSpecAlphaToMask = 1u << 6;
 constexpr uint32_t kSpecBlendSkipOpt = 1u << 30;
 constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
 uint32_t ShaderOpts() {
@@ -5828,6 +5829,7 @@ struct Backend::Impl {
       std::memcpy(word(140 + 4 * i), v, sizeof(v));
     }
     spec = (colorcontrol & 8) ? 2u : 0u;
+    if (*word(133)) spec |= kSpecAlphaToMask;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
     spec |= shader_opts & ~(kSpecUnusedColorOpt | kSpecBlendSkipOpt);
     }
