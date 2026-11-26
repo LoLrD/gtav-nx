@@ -183,6 +183,10 @@ void StartAbSweep(int rounds) {
 }
 
 bool AbSweepRunning() { return g_sweep_rounds > 0; }
+
+std::atomic<uint32_t> g_last_skipped{0};
+
+uint32_t LastSkippedDraws() { return g_last_skipped.load(std::memory_order_relaxed); }
 namespace {
 
 #ifdef __APPLE__
@@ -2069,6 +2073,7 @@ class Renderer {
   }
   void AbRecord(uint64_t presented) {
     auto now = std::chrono::steady_clock::now();
+    g_last_skipped.store(backend_.LastStats().skipped, std::memory_order_relaxed);
     if (ab_phase_ >= 0) {
       auto& a = ab_[ab_phase_];
       const double interval = std::chrono::duration<double, std::milli>(now - ab_last_).count();

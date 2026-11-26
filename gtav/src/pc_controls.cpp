@@ -274,8 +274,9 @@ struct BenchScript {
   std::vector<std::pair<double, std::string>> lines;
   size_t next = 0;
   std::chrono::steady_clock::time_point t0, resume, settle_until, settle_check;
-  bool sweeping = false, settling = false;
+  bool sweeping = false, settling = false, drawing = false;
   int settle_quiet = 0;
+  uint32_t drawn_skipped = 0;
 };
 BenchScript g_bench;
 
@@ -307,6 +308,16 @@ std::string BenchStep(PPCContext& ctx, uint8_t* base, std::chrono::steady_clock:
     b.sweeping = false;
     REXLOG_INFO("[bench] sweep done");
   }
+  if (b.drawing) {
+    if (now < b.settle_check) return {};
+    b.settle_check = now + std::chrono::milliseconds(500);
+    const uint32_t skipped = gtav::native::LastSkippedDraws();
+    b.settle_quiet = skipped == b.drawn_skipped ? b.settle_quiet + 1 : 0;
+    b.drawn_skipped = skipped;
+    if ((skipped ? b.settle_quiet < 10 : b.settle_quiet < 6) && now < b.settle_until) return {};
+    b.drawing = false;
+    REXLOG_INFO("[bench] drawn ({} draws skipped)", skipped);
+  }
   if (b.settling) {
     if (now < b.settle_check) return {};
     b.settle_check = now + std::chrono::seconds(1);
@@ -332,6 +343,12 @@ std::string BenchStep(PPCContext& ctx, uint8_t* base, std::chrono::steady_clock:
   } else if (word == "settle") {
     b.settling = true;
     b.settle_quiet = 0;
+    b.settle_check = now;
+    b.settle_until = now + std::chrono::seconds(std::max(1, std::atoi(arg.c_str())));
+  } else if (word == "drawn") {
+    b.drawing = true;
+    b.settle_quiet = 0;
+    b.drawn_skipped = ~0u;
     b.settle_check = now;
     b.settle_until = now + std::chrono::seconds(std::max(1, std::atoi(arg.c_str())));
   } else if (word == "mark") {

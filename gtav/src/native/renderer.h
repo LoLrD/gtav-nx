@@ -29,5 +29,6 @@ FramePacket TakeSpare();
 void GateAbSweep();
 void StartAbSweep(int rounds);
 bool AbSweepRunning();
+uint32_t LastSkippedDraws();
 
 }  // namespace gtav::native

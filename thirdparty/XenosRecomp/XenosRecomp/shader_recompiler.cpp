@@ -453,11 +453,15 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += "Bicubic";
 #endif
 
+    const bool sized = instr.dimension == TextureDimension::Texture1D || instr.dimension == TextureDimension::Texture2D;
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    if (sized)
+        print("{}_TextureSize, ", constNamePtr);
     // GTA V: unnormalized (texel-space) coordinates are divided by the texture's size.
     bool denorm = instr.texCoordDenorm && instr.dimension != TextureDimension::TextureCube;
     if (denorm)
-        print("denorm{0}({1}_Texture{0}DescriptorIndex, ", dimension, constNamePtr);
+        print("denorm{0}({1}_Texture{0}DescriptorIndex, {2}", dimension, constNamePtr,
+              sized ? fmt::format("{}_TextureSize, ", constNamePtr) : std::string());
     printSrcRegister(componentCount);
     if (denorm)
         out += ")";
@@ -840,12 +844,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluVectorOpcode::Max:
         case AluVectorOpcode::MaxA:
-            print("max({}, {})", op(VECTOR_0), op(VECTOR_1));
+        {
+            const std::string a = op(VECTOR_0), b = op(VECTOR_1);
+            if (a == b)
+                print("maxSelf({})", a);
+            else
+                print("max({}, {})", a, b);
             break;
+        }
 
         case AluVectorOpcode::Min:
-            print("min({}, {})", op(VECTOR_0), op(VECTOR_1));
+        {
+            const std::string a = op(VECTOR_0), b = op(VECTOR_1);
+            if (a == b)
+                print("minSelf({})", a);
+            else
+                print("min({}, {})", a, b);
             break;
+        }
 
         case AluVectorOpcode::Seq:
             print("{} == {}", op(VECTOR_0), op(VECTOR_1));
@@ -1014,12 +1030,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluScalarOpcode::Maxs:
         case AluScalarOpcode::MaxAs:
         case AluScalarOpcode::MaxAsf:
-            print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
+        {
+            const std::string a = op(SCALAR_0), b = op(SCALAR_1);
+            if (a == b)
+                print("maxSelf({})", a);
+            else
+                print("max({}, {})", a, b);
             break;
+        }
 
         case AluScalarOpcode::Mins:
-            print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
+        {
+            const std::string a = op(SCALAR_0), b = op(SCALAR_1);
+            if (a == b)
+                print("minSelf({})", a);
+            else
+                print("min({}, {})", a, b);
             break;
+        }
 
         case AluScalarOpcode::Seqs:
             print("{} == 0.0", op(SCALAR_0));
@@ -1294,13 +1322,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+                println("#define {0}(INDEX) select((INDEX) < {1}, (XENOS_UBO ? g_Ubo{2}.v[{3} + min(INDEX, {4})] : vk::RawBufferLoad<float4>(g_PushConstants.{2}ShaderConstants + ({3} + min(INDEX, {4})) * 16, 0x10)), 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
-                    constantName, shaderName, constantInfo->registerIndex * 16);
+                println("#define {} (XENOS_UBO ? g_Ubo{}.v[{}] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
+                    constantName, shaderName, constantInfo->registerIndex.get(), shaderName, constantInfo->registerIndex * 16);
             }
             
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
@@ -1322,14 +1350,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
         {
-            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+            println("#define s{0}_Texture{1}DescriptorIndex (XENOS_UBO ? XENOS_SHARED_UINT({2}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {2}))",
                 slot, TEXTURE_DIMENSIONS[j], (j * FETCH_SLOT_COUNT + slot) * 4);
         }
         println("#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
-        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+        println("#define s{0}_SamplerDescriptorIndex (XENOS_UBO ? XENOS_SHARED_UINT({1}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {1}))",
             slot, (std::size(TEXTURE_DIMENSIONS) * FETCH_SLOT_COUNT + slot) * 4);
-        println("#define s{}_ExpScale vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
+        println("#define s{0}_ExpScale (XENOS_UBO ? XENOS_SHARED_FLOAT({1}) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {1}))",
             slot, 640 + slot * 4);
+        println("#define s{0}_TextureSize (XENOS_UBO ? XENOS_SHARED_FLOAT2({1}) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {1}))",
+            slot, 1792 + slot * 8);
     }
 
     out += "\n#else\n\n";
@@ -1377,6 +1407,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         uint32_t index = uint32_t(std::size(TEXTURE_DIMENSIONS)) * FETCH_SLOT_COUNT + slot;
         println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});", slot, index / 4, SWIZZLES[index % 4]);
         println("\tfloat s{}_ExpScale : packoffset(c{}.{});", slot, 40 + slot / 4, SWIZZLES[slot % 4]);
+        println("\tfloat2 s{}_TextureSize : packoffset(c{}.{});", slot, 112 + slot / 2, slot % 2 ? "z" : "x");
         println("\t#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
     }
 
@@ -2024,6 +2055,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         out += '}';
                     }
 
+                    for (uint32_t i = 0; i < 4; i++)
+                    {
+                        if (pixelOutputs & (PIXEL_SHADER_OUTPUT_COLOR0 << i))
+                        {
+                            indent();
+                            println("oC{0} = select(xenosUnusedColor({0}), 0.0, oC{0});", i);
+                        }
+                    }
+
                     // GTA V: per-target output scale (render-target exponent bias and the 1/32
                     // of the Xenos fixed-point 16-bit formats, stored as SNORM on the host).
                     for (uint32_t i = 0; i < 4; i++)
@@ -2033,6 +2073,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                             indent();
                             println("oC{0} *= g_ColorScale({0});", i);
                         }
+                    }
+
+                    if (pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
+                    {
+                        indent();
+                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_BLEND_SKIP)\n";
+                        indent();
+                        out += "\tclip(oC0.w <= 0.0 ? -1 : 1);\n";
                     }
 
                 #ifdef UNLEASHED_RECOMP
@@ -2112,5 +2160,67 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
 #endif
 
+    if (isPixelShader && simpleControlFlow)
+        addKillSkip();
+
     out += "}";
+}
+
+void ShaderRecompiler::addKillSkip()
+{
+    const size_t body = out.find("void main(");
+    if (body == std::string::npos)
+        return;
+
+    static constexpr std::string_view KILL_END = " ? -1 : 1);\n";
+    static constexpr std::string_view PREDICATED[] = { "\n\tif (p0)\n\t{\n\t\tclip(", "\n\tif (!p0)\n\t{\n\t\tclip(" };
+    static constexpr std::string_view PLAIN = "\n\tclip(";
+
+    size_t start = std::string::npos, condition = 0;
+    std::string predicate;
+    for (size_t i = 0; i < std::size(PREDICATED); i++)
+    {
+        const size_t at = out.find(PREDICATED[i], body);
+        if (at < start)
+        {
+            start = at;
+            condition = at + PREDICATED[i].size();
+            predicate = i == 0 ? "p0 && " : "!p0 && ";
+        }
+    }
+    const size_t plain = out.find(PLAIN, body);
+    if (plain < start)
+    {
+        start = plain;
+        condition = plain + PLAIN.size();
+        predicate.clear();
+    }
+    if (start == std::string::npos)
+        return;
+
+    const size_t conditionEnd = out.find(KILL_END, condition);
+    if (conditionEnd == std::string::npos || out.find('\n', condition) < conditionEnd)
+        return;
+
+    size_t end = conditionEnd + KILL_END.size();
+    if (!predicate.empty())
+    {
+        static constexpr std::string_view CLOSE = "\t}\n";
+        if (out.compare(end, CLOSE.size(), CLOSE) != 0)
+            return;
+        end += CLOSE.size();
+    }
+
+    specConstantsMask |= SPEC_CONSTANT_KILL_SKIP;
+
+    std::string live = "\n\tuint killLive = 1;\n";
+    live += "\t[branch] if (g_SpecConstants() & SPEC_CONSTANT_KILL_SKIP)\n\t{\n";
+    live += fmt::format("\t\tkillLive = ({}({})) ? 0u : 1u;\n", predicate, out.substr(condition, conditionEnd - condition));
+    live += "\t\tkillLive |= QuadReadAcrossX(killLive);\n";
+    live += "\t\tkillLive |= QuadReadAcrossY(killLive);\n";
+    live += "\t}";
+
+    out.insert(end, "\t[branch] if (killLive != 0)\n\t{\n");
+    out.insert(start, live);
+    out += "\t}\n";
 }

@@ -27,6 +27,7 @@
 #include <imgui.h>
 #include <xxhash.h>
 #include "byteswap_simd.h"
+#include <plume_vulkan.h>
 
 #include <algorithm>
 #include <bitset>
@@ -273,6 +274,27 @@ REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
                      "not shaded): 1 = draws whose pixel shader can kill pixels and that write neither depth nor "
                      "stencil, 2 = also every draw whose pixel shader cannot kill (no texkill, alpha test or "
                      "alpha-to-mask)");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_ubo, false, "GTAV",
+                    "Native renderer (live): translated shaders read their constants from dynamic uniform buffers "
+                    "(set 4) instead of buffer device address loads");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_moves, false, "GTAV",
+                    "Native renderer (live): Xenos moves (max/min of a value with itself) as plain copies");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texcoord32, false, "GTAV",
+                    "Native renderer (live): vertex shaders test the swapped-texcoord mask with 32-bit integers");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize, false, "GTAV",
+                    "Native renderer (live): 1D/2D texture sizes from the shared constants instead of size queries");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize_verify, false, "GTAV",
+                    "Native renderer (live, diagnostic): query texture sizes and draw magenta where the shared "
+                    "constants' size differs");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_kill_skip, false, "GTAV",
+                    "Native renderer (live): pixel shaders skip the rest of their work in 2x2 quads that their first "
+                    "kill discards entirely");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_color_mask, false, "GTAV",
+                    "Native renderer (live): pixel shaders write 0 to colour channels that no target writes and no "
+                    "blend, alpha test or alpha to mask reads");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_blend_skip, false, "GTAV",
+                    "Native renderer (live): alpha-blended pixels with alpha 0 or less, which leave an 8-bit target "
+                    "unchanged, are discarded before the blend");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -520,7 +542,9 @@ uint64_t g_upload_chunk = uint64_t(GTAV_UPLOAD_CHUNK_DEFAULT) << 20;
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
 constexpr uint32_t kMaxTargetRows = 4096;
-constexpr uint32_t kSharedConstantsSize = 1792;  // see shader_common.h + xenosrecomp-gtav.patch
+constexpr uint32_t kSharedConstantsSize = 2048;
+constexpr uint32_t kSlotWords = 256;
+constexpr uint32_t kTextureSizeOffset = 1792;  // see shader_common.h + xenosrecomp-gtav.patch
 // Indirect vertex fetch records (vfetchIndirect): 32 bytes per input location from byte 768.
 constexpr uint32_t kIndirectFetchRecords = 768;
 constexpr uint32_t kDummyStream = 15;  // vertex slot feeding zeros to inputs a declaration lacks
@@ -1137,6 +1161,28 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 // keys them apart) and get spec constant 1 = 1 / scale, which the shaders' vPos is multiplied by.
 constexpr uint32_t kSpecScaled = 1u << 8;
 constexpr uint32_t kSpecEarlyTests = 1u << 9;
+constexpr uint32_t kSpecConstantsUbo = 1u << 10;
+constexpr uint32_t kSpecPlainMoves = 1u << 12;
+constexpr uint32_t kSpecTexcoordMask32 = 1u << 14;
+constexpr uint32_t kSpecTextureSize = 1u << 11;
+constexpr uint32_t kSpecKillSkip = 1u << 13;
+constexpr uint32_t kUnusedColorShift = 16;
+constexpr uint32_t kSpecUnusedColorOpt = 1u << 31;
+constexpr uint32_t kSpecBlendSkip = 1u << 5;
+constexpr uint32_t kSpecBlendSkipOpt = 1u << 30;
+constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
+uint32_t ShaderOpts() {
+  uint32_t opts = 0;
+  if (REXCVAR_GET(gtav_native_shader_opt_ubo)) opts |= kSpecConstantsUbo;
+  if (REXCVAR_GET(gtav_native_shader_opt_moves)) opts |= kSpecPlainMoves;
+  if (REXCVAR_GET(gtav_native_shader_opt_texcoord32)) opts |= kSpecTexcoordMask32;
+  if (REXCVAR_GET(gtav_native_shader_opt_texsize)) opts |= kSpecTextureSize;
+  if (REXCVAR_GET(gtav_native_shader_opt_kill_skip)) opts |= kSpecKillSkip;
+  if (REXCVAR_GET(gtav_native_shader_opt_color_mask)) opts |= kSpecUnusedColorOpt;
+  if (REXCVAR_GET(gtav_native_shader_opt_blend_skip)) opts |= kSpecBlendSkipOpt;
+  if (REXCVAR_GET(gtav_native_shader_opt_texsize_verify)) opts |= kSpecTextureSizeVerify;
+  return opts;
+}
 float g_pixel_scale_inv = 1.0f;
 uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
   out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
@@ -1879,7 +1925,6 @@ struct Backend::Impl {
   }
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
-#if GTAV_MOBILE
   // Constant uniform-buffer sets (layout set 4), one per combination of upload-ring buffers the
   // three constant blocks of a draw live in (almost always one chunk).
   static constexpr uint32_t kConstantSet = 4;
@@ -1890,7 +1935,6 @@ struct Backend::Impl {
   RenderDescriptorSet* ConstantSet(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     return ConstantSetImpl(vs, ps, shared);
   }
-#endif
   std::unique_ptr<RenderTexture> null_textures[3];
   std::unique_ptr<RenderTextureView> null_views[3];
   std::unique_ptr<RenderBuffer> zero_buffer;  // dummy vertex stream
@@ -2353,7 +2397,7 @@ struct Backend::Impl {
                                                                      RenderFormat::R8G8B8A8_UNORM));
       menu_font_view = menu_font->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8G8B8A8_UNORM));
       menu_font_descriptor = AllocDescriptor();
-      texture_set->setTexture(menu_font_descriptor, menu_font.get(), RenderTextureLayout::SHADER_READ,
+      SetTexture(menu_font_descriptor, menu_font.get(), RenderTextureLayout::SHADER_READ,
                               menu_font_view.get());
       uint64_t size = uint64_t(fw) * uint64_t(fh) * 4;
       auto staging = upload.AllocateShared(size, 512);
@@ -2896,6 +2940,13 @@ struct Backend::Impl {
                 available(), released, kMinIdleFrames, freed, textures_evicted, textures.size());
   }
 
+  std::vector<std::array<float, 2>> descriptor_size = std::vector<std::array<float, 2>>(kTextureDescriptors, {1.0f, 1.0f});
+  void SetTexture(uint32_t descriptor, RenderTexture* texture, RenderTextureLayout layout, RenderTextureView* view) {
+    texture_set->setTexture(descriptor, texture, layout, view);
+    const auto* v = static_cast<const plume::VulkanTextureView*>(view);
+    descriptor_size[descriptor] = {float(std::max(1u, v->texture->desc.width >> v->desc.mipSlice)),
+                                   float(std::max(1u, v->texture->desc.height >> v->desc.mipSlice))};
+  }
   uint32_t AllocDescriptor() {
     if (!free_descriptors.empty()) {
       uint32_t d = free_descriptors.back();
@@ -3031,7 +3082,6 @@ struct Backend::Impl {
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
 
-#if GTAV_MOBILE
   RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     auto key = std::make_tuple(vs, ps, shared);
     auto it = ubo_sets.find(key);
@@ -3044,7 +3094,6 @@ struct Backend::Impl {
     }
     return (ubo_sets[key] = std::move(set)).get();
   }
-#endif
 
   bool fragment_barriers = true;  // --gtav_native_fragment_barriers (live)
 
@@ -3072,7 +3121,6 @@ struct Backend::Impl {
     set.end(true, kSamplerDescriptors);
     sampler_set = set.create(device);
     lb.addDescriptorSet(set);
-#if GTAV_MOBILE
     // Set 4: the draw's constants as dynamic uniform buffers (tools/android/ubo_constants.py):
     // VS ALU, PS ALU and shared constants, at the upload-ring offsets the push constants address.
     ubo_builder.begin();
@@ -3081,7 +3129,6 @@ struct Backend::Impl {
     ubo_builder.addConstantBufferDynamic(2);
     ubo_builder.end();
     lb.addDescriptorSet(ubo_builder);
-#endif
     lb.addPushConstant(0, 4, 24, RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
     lb.end();
     layout = lb.create(device);
@@ -3105,10 +3152,10 @@ struct Backend::Impl {
                                 : RenderTextureViewDimension::TEXTURE_CUBE;
       null_textures[i] = device->createTexture(desc);
       null_views[i] = null_textures[i]->createTextureView(view);
-      texture_set->setTexture(uint32_t(i), null_textures[i].get(), RenderTextureLayout::SHADER_READ,
+      SetTexture(uint32_t(i), null_textures[i].get(), RenderTextureLayout::SHADER_READ,
                               null_views[i].get());
     }
-    texture_set->setTexture(kOverflow, null_textures[0].get(), RenderTextureLayout::SHADER_READ, null_views[0].get());
+    SetTexture(kOverflow, null_textures[0].get(), RenderTextureLayout::SHADER_READ, null_views[0].get());
     writeback_resolves = REXCVAR_GET(gtav_native) == "on";
     if (writeback_resolves)
       for (auto& pool : query_pools) pool = device->createOcclusionQueryPool(kMaxQueries);
@@ -3394,6 +3441,39 @@ struct Backend::Impl {
     return front || back;
   }
 
+  bool BlendSkip(const uint8_t* r, RenderTarget* const color[4], uint32_t count, bool colorless, uint32_t spec,
+                 uint32_t alpha_to_mask) const {
+    if (count != 1 || colorless || (spec & 2) || alpha_to_mask || active_query >= 0) return false;
+    const RenderFormat format = color[0]->format;
+    if (format != RenderFormat::R8G8B8A8_UNORM && format != RenderFormat::B8G8R8A8_UNORM) return false;
+    const uint32_t dc = regs::Read(r, regs::RB_DEPTHCONTROL);
+    if ((dc & 4) || ((dc & 1) && ((regs::Read(r, regs::RB_STENCILREFMASK) >> 16) & 0xFF))) return false;
+    const uint32_t b = regs::Read(r, regs::RB_BLENDCONTROL0);
+    auto keeps = [](RenderBlendOperation op) {
+      return op == RenderBlendOperation::ADD || op == RenderBlendOperation::REV_SUBTRACT;
+    };
+    auto one = [](RenderBlend f) { return f == RenderBlend::ONE || f == RenderBlend::INV_SRC_ALPHA; };
+    return Blend(b & 0x1F) == RenderBlend::SRC_ALPHA && one(Blend((b >> 8) & 0x1F)) && keeps(BlendOp((b >> 5) & 7)) &&
+           one(Blend((b >> 24) & 0x1F)) && keeps(BlendOp((b >> 21) & 7));
+  }
+
+  static uint32_t UnusedColor(const uint8_t* r, uint32_t count, bool colorless, uint32_t spec, uint32_t alpha_to_mask) {
+    const uint32_t mask = colorless ? 0 : regs::Read(r, regs::RB_COLOR_MASK);
+    uint32_t unused = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+      uint32_t channels = i < count ? (mask >> (4 * i)) & 0xF : 0;
+      if (i < count && (channels & 7)) {
+        const uint32_t b = i == 0 ? regs::Read(r, regs::RB_BLENDCONTROL0) : regs::Read(r, regs::RB_BLENDCONTROL1 + i - 1);
+        for (RenderBlend f : {Blend(b & 0x1F), Blend((b >> 8) & 0x1F)})
+          if (f == RenderBlend::SRC_ALPHA || f == RenderBlend::INV_SRC_ALPHA || f == RenderBlend::SRC_ALPHA_SAT)
+            channels |= 8;
+      }
+      if (i == 0 && ((spec & 2) || alpha_to_mask)) channels |= 8;
+      unused |= (~channels & 0xFu) << (kUnusedColorShift + 4 * i);
+    }
+    return unused;
+  }
+
   bool EarlyTests(const uint8_t* r, const DrawCommand& d, const RenderTarget* depth, uint32_t spec,
                   uint32_t alpha_to_mask) const {
     const int32_t mode = REXCVAR_GET(gtav_native_early_depth_tests);
@@ -3512,12 +3592,12 @@ struct Backend::Impl {
     if (msaa == 0) {  // sampled by resolves (depth through its depth aspect)
       t.view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(t.format));
       t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(),
+      SetTexture(t.descriptor, t.texture.get(),
                               depth ? RenderTextureLayout::DEPTH_READ : RenderTextureLayout::SHADER_READ, t.view.get());
       if (depth) {
         t.stencil_view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8_UINT));
         t.stencil_descriptor = AllocDescriptor();
-        texture_set->setTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
+        SetTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
                                 t.stencil_view.get());
       }
     }
@@ -3703,7 +3783,7 @@ struct Backend::Impl {
       view.componentMapping = dec.swizzle;
       t.view = t.texture->createTextureView(view);
       if (t.descriptor < kFirstTextureDescriptor) t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+      SetTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     auto staging = upload.AllocateShared(dec.data.size(), 512);
     std::memcpy(staging.cpu, dec.data.data(), dec.data.size());
@@ -4684,10 +4764,8 @@ struct Backend::Impl {
     // Upload memory is taken from the frame's ring a span at a time.
     UploadAllocation span{};
     uint64_t span_size = 0, span_at = 0;
-#if GTAV_MOBILE
     const RenderBuffer* ubo_key[3] = {};
     RenderDescriptorSet* ubo_set = nullptr;
-#endif
     DrawProfile prof;  // consts, streams, submit
     uint32_t draws = 0, skipped = 0;
     uint64_t pipeline_binds = 0;
@@ -4711,7 +4789,6 @@ struct Backend::Impl {
   std::array<std::mutex, 256> cache_locks;
   std::mutex& CacheLock(uint64_t key) { return cache_locks[(key * 0x9E3779B97F4A7C15ull) >> 56]; }
   std::mutex snap_mutex;  // snap_cache's map (entries: CacheLock)
-#if GTAV_MOBILE
   std::mutex ubo_mutex;
   RenderDescriptorSet* ConstantSet(RecordContext& rc, const RenderBuffer* vs, const RenderBuffer* ps,
                                    const RenderBuffer* shared) {
@@ -4720,7 +4797,6 @@ struct Backend::Impl {
     rc.ubo_key[0] = vs, rc.ubo_key[1] = ps, rc.ubo_key[2] = shared;
     return rc.ubo_set = ConstantSetImpl(vs, ps, shared);
   }
-#endif
   RecordContext main_ctx;  // the render thread's
 
   // What DrawFront decided about a draw. Plain data; the pointers stay valid until the frame is
@@ -4857,9 +4933,9 @@ struct Backend::Impl {
   uint32_t* NewSlotBlock() {
     const uint32_t chunk = slot_blocks_used / kSlotBlocksPerChunk, at = slot_blocks_used % kSlotBlocksPerChunk;
     if (chunk == slot_block_chunks.size())
-      slot_block_chunks.push_back(std::make_unique_for_overwrite<uint32_t[]>(size_t(kSlotBlocksPerChunk) * 192));
+      slot_block_chunks.push_back(std::make_unique_for_overwrite<uint32_t[]>(size_t(kSlotBlocksPerChunk) * kSlotWords));
     slot_blocks_used++;
-    uint32_t* block = slot_block_chunks[chunk].get() + size_t(at) * 192;
+    uint32_t* block = slot_block_chunks[chunk].get() + size_t(at) * kSlotWords;
     std::memset(block + 128, 0, 32 * 4);  // words 128-159 come from the record
     return block;
   }
@@ -5199,6 +5275,7 @@ struct Backend::Impl {
   std::array<DrawMemo, kDrawMemos> draw_memos;
   uint64_t draw_memo_uses = 0;
   bool draw_memo_on = false, draw_memo_verify = false;
+  uint32_t shader_opts = 0;
   uint64_t draw_memo_hits = 0, draw_memo_new_shaders = 0, draw_memo_regs = 0,
            draw_memo_targets = 0, draw_memo_mismatches = 0;
   uint32_t draw_memo_logged = 0;
@@ -5503,6 +5580,8 @@ struct Backend::Impl {
         memo.generation = 0;  // a per-call view: never reused
       }
     }
+    if (sc)
+      for (uint32_t slot = 0; slot < 32; slot++) std::memcpy(&sc[192 + 2 * slot], descriptor_size[sc[slot]].data(), 8);
     if (!fetch_cached && prof.on)
       tprof.descriptor_ms +=
           8 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
@@ -5596,6 +5675,7 @@ struct Backend::Impl {
     }
     spec = (colorcontrol & 8) ? 2u : 0u;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
+    spec |= shader_opts & ~(kSpecUnusedColorOpt | kSpecBlendSkipOpt);
     }
     const uint32_t spec_words = spec;
 
@@ -5698,6 +5778,9 @@ struct Backend::Impl {
         stat_early++;
         early = true;
       }
+    if ((shader_opts & kSpecUnusedColorOpt) && diag == kDiagOff) spec |= UnusedColor(r, bind_count, colorless, spec, *word(133));
+    if ((shader_opts & kSpecBlendSkipOpt) && diag == kDiagOff && BlendSkip(r, bind_color, bind_count, colorless, spec, *word(133)))
+      spec |= kSpecBlendSkip;
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     if (auto pi = pipeline_inputs.find(pkey); pi != pipeline_inputs.end())
       input_stat_draws++, input_stat_inputs += pi->second;
@@ -6128,6 +6211,7 @@ struct Backend::Impl {
         std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
         rc.last_shared.records[building] = false;
       }
+      std::memcpy(shared_cpu + kTextureSizeOffset, rec.slots + 192, (kSlotWords - 192) * 4);
     }
     rc.prof.Mark(rc.prof.consts);
 
@@ -6277,7 +6361,9 @@ struct Backend::Impl {
     } else {
       const bool records = rc.last_shared.records[0] || rc.last_shared.records[1];
       if (const_reuse && rc.last_shared.valid &&
-          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0) {
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0 &&
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur] + kTextureSizeOffset, shared_cpu + kTextureSizeOffset,
+                      kSharedConstantsSize - kTextureSizeOffset) == 0) {
         shared = rc.last_shared.gpu;
       } else {
         shared = ContextUpload(rc, kSharedConstantsSize);
@@ -6296,12 +6382,10 @@ struct Backend::Impl {
       std::memcpy(ds.push, push, sizeof(push));
       ds.push_set = true;
     }
-#if GTAV_MOBILE
     if (RenderDescriptorSet* cs = ConstantSet(rc, vsc.buffer, psc.buffer, shared.buffer)) {
       const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
       list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
     }
-#endif
     if (ds.viewports != rec.viewports || std::memcmp(&ds.vp, &rec.vp, sizeof(rec.vp)) != 0 ||
         std::memcmp(&ds.scissor, &rec.scissor, sizeof(rec.scissor)) != 0) {
       RenderViewport vps[4] = {rec.vp, rec.vp, rec.vp, rec.vp};
@@ -6599,7 +6683,7 @@ struct Backend::Impl {
       dst.scale = s;
       ZeroTexture(list, dst.texture.get(), dst.format, Sz(dw, s), Sz(dh, s));
       dst.descriptor = AllocDescriptor();
-      texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      SetTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }
     Transition(list, src->texture.get(), RenderTextureLayout::DEPTH_READ);
     Transition(list, dst.texture.get(), RenderTextureLayout::COLOR_WRITE);
@@ -6695,7 +6779,7 @@ struct Backend::Impl {
       u.texture = device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, r.format));
       u.view = u.texture->createTextureView(RenderTextureViewDesc::Texture2D(r.format));
       u.descriptor = AllocDescriptor();
-      texture_set->setTexture(u.descriptor, u.texture.get(), RenderTextureLayout::SHADER_READ, u.view.get());
+      SetTexture(u.descriptor, u.texture.get(), RenderTextureLayout::SHADER_READ, u.view.get());
       u.width = w, u.height = h, u.format = r.format;
     }
     u.pitch = pitch;
@@ -7015,7 +7099,7 @@ struct Backend::Impl {
       t.texture = device->createTexture(RenderTextureDesc::ColorTarget(t.width, t.height, t.format));
       t.view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(t.format));
       t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+      SetTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     return t;
   }
@@ -7227,7 +7311,7 @@ struct Backend::Impl {
           RenderTextureDesc::Texture2D(Sz(front.width, front.scale), Sz(front.height, front.scale), 1, front.format));
       held_view = held->createTextureView(RenderTextureViewDesc::Texture2D(front.format));
       if (!held_descriptor) held_descriptor = AllocDescriptor();
-      texture_set->setTexture(held_descriptor, held.get(), RenderTextureLayout::SHADER_READ, held_view.get());
+      SetTexture(held_descriptor, held.get(), RenderTextureLayout::SHADER_READ, held_view.get());
       held_width = front.width, held_height = front.height, held_format = front.format;
     }
     Transition(list, front.texture.get(), RenderTextureLayout::COPY_SOURCE);
@@ -7345,7 +7429,7 @@ struct Backend::Impl {
       const RenderTexture* color = out.texture.get();
       out.framebuffer = device->createFramebuffer(RenderFramebufferDesc(&color, 1));
       if (!out.descriptor) out.descriptor = AllocDescriptor();
-      texture_set->setTexture(out.descriptor, out.texture.get(), RenderTextureLayout::SHADER_READ, out.view.get());
+      SetTexture(out.descriptor, out.texture.get(), RenderTextureLayout::SHADER_READ, out.view.get());
       out.format = front.format;
       out.width = front.width;
       out.height = front.height;
@@ -7521,7 +7605,7 @@ struct Backend::Impl {
       if (cube) {
         dst.cube_view = dst.texture->createTextureView(RenderTextureViewDesc::TextureCube(dst_format));
         dst.cube_descriptor = AllocDescriptor();
-        texture_set->setTexture(dst.cube_descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ,
+        SetTexture(dst.cube_descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ,
                                 dst.cube_view.get());
       }
       dst.render_target = shader_copy;
@@ -7539,7 +7623,7 @@ struct Backend::Impl {
       dst.scale = s;
       ZeroTexture(list, dst.texture.get(), dst_format, Sz(dw, s), Sz(dh, s), mips, layers);
       dst.descriptor = AllocDescriptor();
-      texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      SetTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
       dst.cube_faces = 0;
     }
     if (cube && rc.dest_level == 0) dst.cube_faces |= 1u << rc.dest_face;
@@ -7781,6 +7865,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   write_watch::Harvest();  // before this frame's texture and buffer lookups
   s.fetch_cache.valid = false;
   s.draw_memo_on = REXCVAR_GET(gtav_native_draw_memo);
+  s.shader_opts = ShaderOpts();
   s.draw_memo_verify = s.draw_memo_on && REXCVAR_GET(gtav_native_draw_memo_verify);
   s.slot_generation++;
   s.frame_generation++;

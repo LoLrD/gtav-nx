@@ -191,6 +191,9 @@ bool CompileHlsl(const fs::path& hlsl, const std::string& name, bool pixel) {
   std::vector<std::string> args = {dxc.string(), "-T", pixel ? "ps_6_0" : "vs_6_0", "-HV", "2021",
                                    "-all-resources-bound", "-spirv", "-fvk-use-dx-layout",
                                    "-Wno-ignored-attributes", "-Qstrip_debug"};
+  std::stringstream text;
+  text << std::ifstream(hlsl).rdbuf();
+  if (text.str().find("QuadReadAcross") != std::string::npos) args.push_back("-fspv-target-env=vulkan1.1");
   if (!pixel) args.push_back("-fvk-invert-y");
   args.insert(args.end(), {"-Fo", tmp.string(), hlsl.string()});
   if (!Run(args)) return false;
@@ -212,12 +215,7 @@ bool CompileHlsl(const fs::path& hlsl, const std::string& name, bool pixel) {
   }
 #endif
   // Vertex shaders with computed-index fetches need the raw streams (see Backend::Shader).
-  if (!pixel) {
-    std::ifstream f(hlsl);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    if (ss.str().find("= vfetchIndirect(") != std::string::npos) std::ofstream(spirv / (name + ".indirect"));
-  }
+  if (!pixel && text.str().find("= vfetchIndirect(") != std::string::npos) std::ofstream(spirv / (name + ".indirect"));
   std::error_code ec;
   fs::rename(tmp, out, ec);  // the marker exists before the backend can see the .spv
   return !ec;
