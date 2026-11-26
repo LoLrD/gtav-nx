@@ -14,18 +14,19 @@ cp -f "$NX_OUT/gtav" "$ROOT/out/console-test/deployed/gtav.elf"
 echo "nro + config uploaded"
 
 if [[ "${1:-}" == "--spirv" ]]; then
+  manifest="$DEPLOYED_DIR/spirv.md5"
   existing=$(ftp_list "$SD_DIR/spirv" | sort)
-  local_files=()
-  while IFS= read -r f; do local_files+=("$f"); done < <(cd "$SPIRV" && ls | sort)
+  current=$(cd "$SPIRV" && ls | sort | xargs md5 -r | sort -k2)
   todo=()
-  for f in "${local_files[@]}"; do
-    grep -qxF "$f" <<<"$existing" || todo+=("$f")
-  done
-  echo "spirv: ${#todo[@]} of ${#local_files[@]} to upload"
+  while read -r sum f; do
+    if ! grep -qxF "$f" <<<"$existing" || ! grep -qxF "$sum $f" "$manifest" 2>/dev/null; then todo+=("$f"); fi
+  done <<<"$current"
+  echo "spirv: ${#todo[@]} of $(wc -l <<<"$current" | tr -d ' ') to upload"
   for ((i = 0; i < ${#todo[@]}; i += 200)); do
     batch=("${todo[@]:i:200}")
     list=$(printf "$SPIRV/%s," "${batch[@]}")
     ftp_curl --ftp-create-dirs -T "{${list%,}}" "${FTP_BASE}${SD_DIR}/spirv/" > /dev/null
     echo "spirv: $((i + ${#batch[@]})) / ${#todo[@]}"
   done
+  printf '%s\n' "$current" > "$manifest"
 fi
