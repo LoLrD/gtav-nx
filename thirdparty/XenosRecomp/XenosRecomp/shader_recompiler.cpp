@@ -2075,6 +2075,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         }
                     }
 
+                    if (pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
+                    {
+                        indent();
+                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_BLEND_SKIP)\n";
+                        indent();
+                        out += "\tclip(oC0.w <= 0.0 ? -1 : 1);\n";
+                    }
+
                 #ifdef UNLEASHED_RECOMP
                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
 

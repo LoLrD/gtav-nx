@@ -292,6 +292,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_kill_skip, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_color_mask, false, "GTAV",
                     "Native renderer (live): pixel shaders write 0 to colour channels that no target writes and no "
                     "blend, alpha test or alpha to mask reads");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_blend_skip, false, "GTAV",
+                    "Native renderer (live): alpha-blended pixels with alpha 0 or less, which leave an 8-bit target "
+                    "unchanged, are discarded before the blend");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1165,6 +1168,8 @@ constexpr uint32_t kSpecTextureSize = 1u << 11;
 constexpr uint32_t kSpecKillSkip = 1u << 13;
 constexpr uint32_t kUnusedColorShift = 16;
 constexpr uint32_t kSpecUnusedColorOpt = 1u << 31;
+constexpr uint32_t kSpecBlendSkip = 1u << 5;
+constexpr uint32_t kSpecBlendSkipOpt = 1u << 30;
 constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
@@ -1174,6 +1179,7 @@ uint32_t ShaderOpts() {
   if (REXCVAR_GET(gtav_native_shader_opt_texsize)) opts |= kSpecTextureSize;
   if (REXCVAR_GET(gtav_native_shader_opt_kill_skip)) opts |= kSpecKillSkip;
   if (REXCVAR_GET(gtav_native_shader_opt_color_mask)) opts |= kSpecUnusedColorOpt;
+  if (REXCVAR_GET(gtav_native_shader_opt_blend_skip)) opts |= kSpecBlendSkipOpt;
   if (REXCVAR_GET(gtav_native_shader_opt_texsize_verify)) opts |= kSpecTextureSizeVerify;
   return opts;
 }
@@ -3435,6 +3441,22 @@ struct Backend::Impl {
     return front || back;
   }
 
+  bool BlendSkip(const uint8_t* r, RenderTarget* const color[4], uint32_t count, bool colorless, uint32_t spec,
+                 uint32_t alpha_to_mask) const {
+    if (count != 1 || colorless || (spec & 2) || alpha_to_mask || active_query >= 0) return false;
+    const RenderFormat format = color[0]->format;
+    if (format != RenderFormat::R8G8B8A8_UNORM && format != RenderFormat::B8G8R8A8_UNORM) return false;
+    const uint32_t dc = regs::Read(r, regs::RB_DEPTHCONTROL);
+    if ((dc & 4) || ((dc & 1) && ((regs::Read(r, regs::RB_STENCILREFMASK) >> 16) & 0xFF))) return false;
+    const uint32_t b = regs::Read(r, regs::RB_BLENDCONTROL0);
+    auto keeps = [](RenderBlendOperation op) {
+      return op == RenderBlendOperation::ADD || op == RenderBlendOperation::REV_SUBTRACT;
+    };
+    auto one = [](RenderBlend f) { return f == RenderBlend::ONE || f == RenderBlend::INV_SRC_ALPHA; };
+    return Blend(b & 0x1F) == RenderBlend::SRC_ALPHA && one(Blend((b >> 8) & 0x1F)) && keeps(BlendOp((b >> 5) & 7)) &&
+           one(Blend((b >> 24) & 0x1F)) && keeps(BlendOp((b >> 21) & 7));
+  }
+
   static uint32_t UnusedColor(const uint8_t* r, uint32_t count, bool colorless, uint32_t spec, uint32_t alpha_to_mask) {
     const uint32_t mask = colorless ? 0 : regs::Read(r, regs::RB_COLOR_MASK);
     uint32_t unused = 0;
@@ -5653,7 +5675,7 @@ struct Backend::Impl {
     }
     spec = (colorcontrol & 8) ? 2u : 0u;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
-    spec |= shader_opts & ~kSpecUnusedColorOpt;
+    spec |= shader_opts & ~(kSpecUnusedColorOpt | kSpecBlendSkipOpt);
     }
     const uint32_t spec_words = spec;
 
@@ -5757,6 +5779,8 @@ struct Backend::Impl {
         early = true;
       }
     if ((shader_opts & kSpecUnusedColorOpt) && diag == kDiagOff) spec |= UnusedColor(r, bind_count, colorless, spec, *word(133));
+    if ((shader_opts & kSpecBlendSkipOpt) && diag == kDiagOff && BlendSkip(r, bind_color, bind_count, colorless, spec, *word(133)))
+      spec |= kSpecBlendSkip;
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     if (auto pi = pipeline_inputs.find(pkey); pi != pipeline_inputs.end())
       input_stat_draws++, input_stat_inputs += pi->second;
