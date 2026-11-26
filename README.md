@@ -9,8 +9,17 @@ original Nintendo Switch. No emulator. A Switch branch of
 > **The port is not finished.** It boots and plays through the prologue and the first mission at
 > 17-25 fps on stock clocks, with rendering problems. Performance is being worked on.
 
-Nothing derived from the game is in this repository: the code, the shaders and the NRO are made on
-your computer from your own copy.
+**No game is included, ever.** Not in this repository, not in any release. You bring your own
+Xbox 360 discs and title update; everything made from them (the recompiled code, the game files,
+the translated shaders, the NRO) is made on your own computer and stays there.
+
+> [!WARNING]
+> **Forking, mirroring or publishing your own builds?** Read
+> [Keeping it clean](#keeping-it-clean-rules-for-forks-and-downstream-releases) first. The
+> recompiled game code, the game's shaders and anything else made from the discs are **Rockstar
+> Games' copyrighted work**. They must never be in a repository, release, NRO, NSP, mirror or
+> download link. This project's GPL license covers only our own code and cannot give anyone the
+> right to share Rockstar's.
 
 ## Status
 
@@ -73,13 +82,59 @@ fetches the logs and prints the sweep as a table.
 - [plume](https://github.com/renderbag/plume) and
   [XenosRecomp](https://github.com/hedge-dev/XenosRecomp).
 
-## Legal
+## Keeping it clean: rules for forks and downstream releases
 
-Unofficial fan port with no affiliation to Rockstar Games, Take-Two Interactive, Microsoft or
-Nintendo. "Grand Theft Auto" is a trademark of Take-Two Interactive Software. You provide your own
-legally obtained copy of the game. No prebuilt files are distributed: the NRO contains code
-recompiled from the game, so it is made on your own computer from your copy. The leaked Rockstar
-source code was never used. Running homebrew requires custom firmware.
+This project only works because it **never distributes Rockstar Games' or Microsoft's work**, the
+same way [gtav-recomp](https://github.com/andrewnakas/gtav-recomp) does. Every player recompiles
+their own copy from their own discs. If you fork this repository, mirror it or share builds with
+friends, the same rules apply to you.
 
-Source code is under the GPL-3.0 license ([LICENSE](LICENSE)). Credits and the licenses of bundled
-components are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+### Never distribute any of these
+
+| What | Why it is Rockstar's / Microsoft's |
+|---|---|
+| Disc images (ISO), extracted disc folders, `default.xex` / `default.xexp`, `.rpf` archives, install packages | the game itself |
+| Title updates (`tu00000009_00000000`, `update.rpf`), or links to sites that host them | the game's executable and data |
+| Extracted assets: models, textures, audio, maps, scripts, text | the game's data |
+| **The generated C++** (`gtav/generated/`, the files the codegen writes) | a mechanical translation of the game's code is still the game's code |
+| **The NRO or an NSP**, or any other binary with the game linked in | compiled game code |
+| **Game shaders in any form**: the originals, HLSL, SPIR-V (`spirv/`), pipeline caches, `shader_cache` | translated game code |
+| Your game folder on the SD card, saves, memory dumps, GPU captures, traces, and logs that contain game memory | game data |
+
+### Rules for working on the code
+
+- **Never use the leaked Rockstar source code**, not even for names, comments or structure. Work only
+  from your own analysis of your own copy of the game.
+- Don't commit anything game-derived, even temporarily. Git history is permanent, and a deleted
+  file stays downloadable from old commits.
+- Function addresses, sizes and hook names (the manifest, the codegen partition, the hook lists)
+  are our own analysis and are fine. Code copied from the game is not, including code pasted from
+  a disassembly or from the generated C++.
+
+### Why this matters
+
+- **The GPL can't help you here.** The GNU GPL covers *our* code, and you may share and modify that
+  freely under its terms. It gives no rights to Rockstar's or Microsoft's work, because nobody here
+  owns them. Sharing a build with the game inside is copyright infringement by whoever shares it,
+  whatever license file sits next to it.
+- **Recompiling isn't a clean room.** The output of the recompiler is the game's code in another
+  form. It is legal for you to make it from a copy you own. It isn't legal to hand it to someone else.
+- **One bad mirror can end the project for everyone.** A takedown aimed at a build with game content
+  can take this repository with it.
+
+If you find game content in this repository or in a fork that links here, please open an issue
+(without attaching the content) so it can be removed.
+
+## License and legal
+
+This project is free software under the **GNU GPL, version 3 or later** (`LICENSE`). Bundled
+third-party components keep their own licenses; they are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+No Rockstar Games or Microsoft code, data, shaders or title-update files are in this repository,
+and the project never used leaked source code. What you make from your own discs is for you alone:
+don't share your game folder or your NRO. The GPL applies to this project's own code only; it
+grants no rights to Rockstar Games' or Microsoft's work.
+
+Grand Theft Auto V is a trademark of Take-Two Interactive Software. This project is not affiliated
+with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft or Nintendo.
