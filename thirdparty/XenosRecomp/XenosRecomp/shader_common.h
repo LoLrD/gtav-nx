@@ -6,6 +6,7 @@
 
 #define SPEC_CONSTANT_CONSTANTS_UBO         (1 << 10)
 #define SPEC_CONSTANT_PLAIN_MOVES           (1 << 12)
+#define SPEC_CONSTANT_KILL_SKIP             (1 << 13)
 #define SPEC_CONSTANT_TEXCOORD_MASK32       (1 << 14)
 #define SPEC_CONSTANT_TEXTURE_SIZE          (1 << 11)
 #define SPEC_CONSTANT_TEXTURE_SIZE_VERIFY   (1 << 15)

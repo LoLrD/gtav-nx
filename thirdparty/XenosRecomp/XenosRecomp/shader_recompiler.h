@@ -59,4 +59,5 @@ struct ShaderRecompiler : StringBuffer
     void recompile(const AluInstruction& instr);
 
     void recompile(const uint8_t* shaderData, const std::string_view& include);
+    void addKillSkip();
 };

@@ -2143,5 +2143,67 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
 #endif
 
+    if (isPixelShader && simpleControlFlow)
+        addKillSkip();
+
     out += "}";
+}
+
+void ShaderRecompiler::addKillSkip()
+{
+    const size_t body = out.find("void main(");
+    if (body == std::string::npos)
+        return;
+
+    static constexpr std::string_view KILL_END = " ? -1 : 1);\n";
+    static constexpr std::string_view PREDICATED[] = { "\n\tif (p0)\n\t{\n\t\tclip(", "\n\tif (!p0)\n\t{\n\t\tclip(" };
+    static constexpr std::string_view PLAIN = "\n\tclip(";
+
+    size_t start = std::string::npos, condition = 0;
+    std::string predicate;
+    for (size_t i = 0; i < std::size(PREDICATED); i++)
+    {
+        const size_t at = out.find(PREDICATED[i], body);
+        if (at < start)
+        {
+            start = at;
+            condition = at + PREDICATED[i].size();
+            predicate = i == 0 ? "p0 && " : "!p0 && ";
+        }
+    }
+    const size_t plain = out.find(PLAIN, body);
+    if (plain < start)
+    {
+        start = plain;
+        condition = plain + PLAIN.size();
+        predicate.clear();
+    }
+    if (start == std::string::npos)
+        return;
+
+    const size_t conditionEnd = out.find(KILL_END, condition);
+    if (conditionEnd == std::string::npos || out.find('\n', condition) < conditionEnd)
+        return;
+
+    size_t end = conditionEnd + KILL_END.size();
+    if (!predicate.empty())
+    {
+        static constexpr std::string_view CLOSE = "\t}\n";
+        if (out.compare(end, CLOSE.size(), CLOSE) != 0)
+            return;
+        end += CLOSE.size();
+    }
+
+    specConstantsMask |= SPEC_CONSTANT_KILL_SKIP;
+
+    std::string live = "\n\tuint killLive = 1;\n";
+    live += "\t[branch] if (g_SpecConstants() & SPEC_CONSTANT_KILL_SKIP)\n\t{\n";
+    live += fmt::format("\t\tkillLive = ({}({})) ? 0u : 1u;\n", predicate, out.substr(condition, conditionEnd - condition));
+    live += "\t\tkillLive |= QuadReadAcrossX(killLive);\n";
+    live += "\t\tkillLive |= QuadReadAcrossY(killLive);\n";
+    live += "\t}";
+
+    out.insert(end, "\t[branch] if (killLive != 0)\n\t{\n");
+    out.insert(start, live);
+    out += "\t}\n";
 }

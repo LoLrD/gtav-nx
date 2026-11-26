@@ -286,6 +286,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize_verify, false, "GTAV",
                     "Native renderer (live, diagnostic): query texture sizes and draw magenta where the shared "
                     "constants' size differs");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_kill_skip, false, "GTAV",
+                    "Native renderer (live): pixel shaders skip the rest of their work in 2x2 quads that their first "
+                    "kill discards entirely");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1156,6 +1159,7 @@ constexpr uint32_t kSpecConstantsUbo = 1u << 10;
 constexpr uint32_t kSpecPlainMoves = 1u << 12;
 constexpr uint32_t kSpecTexcoordMask32 = 1u << 14;
 constexpr uint32_t kSpecTextureSize = 1u << 11;
+constexpr uint32_t kSpecKillSkip = 1u << 13;
 constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
@@ -1163,6 +1167,7 @@ uint32_t ShaderOpts() {
   if (REXCVAR_GET(gtav_native_shader_opt_moves)) opts |= kSpecPlainMoves;
   if (REXCVAR_GET(gtav_native_shader_opt_texcoord32)) opts |= kSpecTexcoordMask32;
   if (REXCVAR_GET(gtav_native_shader_opt_texsize)) opts |= kSpecTextureSize;
+  if (REXCVAR_GET(gtav_native_shader_opt_kill_skip)) opts |= kSpecKillSkip;
   if (REXCVAR_GET(gtav_native_shader_opt_texsize_verify)) opts |= kSpecTextureSizeVerify;
   return opts;
 }
