@@ -2,7 +2,7 @@
 cam 0 0
 drawn 120
 wait 2
-set gtav_native_ab_sweep gtav_native_shader_opt_ubo=true|false;gtav_native_shader_opt_moves=true|false;gtav_native_shader_opt_texcoord32=true|false;gtav_native_shader_opt_texsize=true|false;gtav_native_shader_opt_kill_skip=true|false;gtav_native_shader_opt_color_mask=true|false;gtav_native_shader_opt_blend_skip=true|false;gtav_native_shader_opt_vs_outputs=true|false;gtav_native_fsr_bilinear=true|false;gtav_native_fsr_sharpness=-1|0.25
+set gtav_native_ab_sweep gtav_native_shader_opt_ubo=true|false;gtav_native_shader_opt_moves=true|false;gtav_native_shader_opt_texcoord32=true|false;gtav_native_shader_opt_texsize=true|false;gtav_native_shader_opt_kill_skip=true|false;gtav_native_shader_opt_color_mask=true|false;gtav_native_shader_opt_blend_skip=true|false;gtav_native_shader_opt_vs_outputs=true|false;gtav_native_rect_gs=true|false;gtav_native_fsr_bilinear=true|false;gtav_native_fsr_sharpness=-1|0.25
 mark bank
 sweep 1
 killscript flow_controller
