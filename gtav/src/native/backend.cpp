@@ -278,6 +278,8 @@ REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_ubo, false, "GTAV",
                     "(set 4) instead of buffer device address loads");
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_moves, false, "GTAV",
                     "Native renderer (live): Xenos moves (max/min of a value with itself) as plain copies");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texcoord32, false, "GTAV",
+                    "Native renderer (live): vertex shaders test the swapped-texcoord mask with 32-bit integers");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1144,10 +1146,12 @@ constexpr uint32_t kSpecScaled = 1u << 8;
 constexpr uint32_t kSpecEarlyTests = 1u << 9;
 constexpr uint32_t kSpecConstantsUbo = 1u << 10;
 constexpr uint32_t kSpecPlainMoves = 1u << 12;
+constexpr uint32_t kSpecTexcoordMask32 = 1u << 14;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
   if (REXCVAR_GET(gtav_native_shader_opt_ubo)) opts |= kSpecConstantsUbo;
   if (REXCVAR_GET(gtav_native_shader_opt_moves)) opts |= kSpecPlainMoves;
+  if (REXCVAR_GET(gtav_native_shader_opt_texcoord32)) opts |= kSpecTexcoordMask32;
   return opts;
 }
 float g_pixel_scale_inv = 1.0f;

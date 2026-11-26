@@ -6,6 +6,7 @@
 
 #define SPEC_CONSTANT_CONSTANTS_UBO         (1 << 10)
 #define SPEC_CONSTANT_PLAIN_MOVES           (1 << 12)
+#define SPEC_CONSTANT_TEXCOORD_MASK32       (1 << 14)
 
 #ifdef UNLEASHED_RECOMP
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
@@ -309,7 +310,12 @@ float4 tfetchR11G11B10(uint4 value)
 
 float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 {
-    return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+    bool swapped;
+    [branch] if (g_SpecConstants() & SPEC_CONSTANT_TEXCOORD_MASK32)
+        swapped = (swappedTexcoords & (1u << semanticIndex)) != 0;
+    else
+        swapped = (swappedTexcoords & (1ull << semanticIndex)) != 0;
+    return swapped ? value.yxwz : value;
 }
 
 #ifdef __spirv__
