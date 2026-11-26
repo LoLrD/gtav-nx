@@ -840,12 +840,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
         case AluVectorOpcode::Max:
         case AluVectorOpcode::MaxA:
-            print("max({}, {})", op(VECTOR_0), op(VECTOR_1));
+        {
+            const std::string a = op(VECTOR_0), b = op(VECTOR_1);
+            if (a == b)
+                print("maxSelf({})", a);
+            else
+                print("max({}, {})", a, b);
             break;
+        }
 
         case AluVectorOpcode::Min:
-            print("min({}, {})", op(VECTOR_0), op(VECTOR_1));
+        {
+            const std::string a = op(VECTOR_0), b = op(VECTOR_1);
+            if (a == b)
+                print("minSelf({})", a);
+            else
+                print("min({}, {})", a, b);
             break;
+        }
 
         case AluVectorOpcode::Seq:
             print("{} == {}", op(VECTOR_0), op(VECTOR_1));
@@ -1014,12 +1026,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluScalarOpcode::Maxs:
         case AluScalarOpcode::MaxAs:
         case AluScalarOpcode::MaxAsf:
-            print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
+        {
+            const std::string a = op(SCALAR_0), b = op(SCALAR_1);
+            if (a == b)
+                print("maxSelf({})", a);
+            else
+                print("max({}, {})", a, b);
             break;
+        }
 
         case AluScalarOpcode::Mins:
-            print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
+        {
+            const std::string a = op(SCALAR_0), b = op(SCALAR_1);
+            if (a == b)
+                print("minSelf({})", a);
+            else
+                print("min({}, {})", a, b);
             break;
+        }
 
         case AluScalarOpcode::Seqs:
             print("{} == 0.0", op(SCALAR_0));

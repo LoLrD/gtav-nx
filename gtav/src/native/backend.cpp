@@ -276,6 +276,8 @@ REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_ubo, false, "GTAV",
                     "Native renderer (live): translated shaders read their constants from dynamic uniform buffers "
                     "(set 4) instead of buffer device address loads");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_moves, false, "GTAV",
+                    "Native renderer (live): Xenos moves (max/min of a value with itself) as plain copies");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1141,9 +1143,11 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 constexpr uint32_t kSpecScaled = 1u << 8;
 constexpr uint32_t kSpecEarlyTests = 1u << 9;
 constexpr uint32_t kSpecConstantsUbo = 1u << 10;
+constexpr uint32_t kSpecPlainMoves = 1u << 12;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
   if (REXCVAR_GET(gtav_native_shader_opt_ubo)) opts |= kSpecConstantsUbo;
+  if (REXCVAR_GET(gtav_native_shader_opt_moves)) opts |= kSpecPlainMoves;
   return opts;
 }
 float g_pixel_scale_inv = 1.0f;

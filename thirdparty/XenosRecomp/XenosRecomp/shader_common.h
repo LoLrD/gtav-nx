@@ -5,6 +5,7 @@
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
 
 #define SPEC_CONSTANT_CONSTANTS_UBO         (1 << 10)
+#define SPEC_CONSTANT_PLAIN_MOVES           (1 << 12)
 
 #ifdef UNLEASHED_RECOMP
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
@@ -75,6 +76,9 @@ uint g_SpecConstants();
 #define g_ColorScale(INDEX) g_ColorScaleArray[INDEX]
 
 #endif
+
+#define maxSelf(a) ((g_SpecConstants() & SPEC_CONSTANT_PLAIN_MOVES) ? (a) : max(a, a))
+#define minSelf(a) ((g_SpecConstants() & SPEC_CONSTANT_PLAIN_MOVES) ? (a) : min(a, a))
 
 // Vertex shaders have no derivatives: sample mip 0 there, like Xenos vertex texture fetch.
 #if defined(__SHADER_TARGET_STAGE) && __SHADER_TARGET_STAGE == __SHADER_STAGE_VERTEX
