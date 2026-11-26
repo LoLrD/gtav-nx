@@ -1187,13 +1187,122 @@ uint32_t ShaderOpts() {
   return opts;
 }
 float g_pixel_scale_inv = 1.0f;
-uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[3], uint32_t live_outputs = ~0u) {
-  uint32_t n = 0;
-  out[n++] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
-  if (spec & kSpecScaled) out[n++] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
-  if (live_outputs != ~0u) out[n++] = RenderSpecConstant(2, live_outputs);
-  return n;
+uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
+  out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
+  if (!(spec & kSpecScaled)) return 1;
+  out[1] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
+  return 2;
 }
+
+std::vector<uint8_t> TrimVertexOutputsSpirv(const std::vector<uint8_t>& data, uint32_t keep) {
+  constexpr uint32_t kOpEntryPoint = 15, kOpTypePointer = 32, kOpVariable = 59, kOpAccessChain = 65;
+  constexpr uint32_t kOpInBoundsAccessChain = 66, kOpDecorate = 71, kLocation = 30, kOutput = 3, kPrivate = 6;
+  if (data.size() < 20 || data.size() % 4) return {};
+  std::vector<uint32_t> w(data.size() / 4);
+  std::memcpy(w.data(), data.data(), data.size());
+  if (w[0] != 0x07230203u) return {};
+  std::unordered_map<uint32_t, uint32_t> location, pointee, var_type;
+  for (size_t i = 5; i < w.size();) {
+    const uint32_t count = w[i] >> 16, op = w[i] & 0xFFFF;
+    if (!count || i + count > w.size()) return {};
+    if (op == kOpDecorate && count >= 4 && w[i + 2] == kLocation) location[w[i + 1]] = w[i + 3];
+    if (op == kOpTypePointer && count == 4) pointee[w[i + 1]] = w[i + 3];
+    if (op == kOpVariable && count >= 4 && w[i + 3] == kOutput) var_type[w[i + 2]] = w[i + 1];
+    i += count;
+  }
+  std::unordered_set<uint32_t> removed;
+  for (const auto& [id, type] : var_type)
+    if (auto it = location.find(id); it != location.end() && it->second < 32 && !(keep >> it->second & 1))
+      removed.insert(id);
+  if (removed.empty()) return {};
+  uint32_t bound = w[3];
+  std::unordered_map<uint32_t, uint32_t> private_pointer;
+  auto private_of = [&](uint32_t pointer_type) {
+    auto [it, fresh] = private_pointer.try_emplace(pointee.at(pointer_type), 0);
+    if (fresh) it->second = bound++;
+    return it->second;
+  };
+  for (size_t i = 5; i < w.size();) {
+    const uint32_t count = w[i] >> 16, op = w[i] & 0xFFFF;
+    if ((op == kOpAccessChain || op == kOpInBoundsAccessChain) && count >= 4 && removed.count(w[i + 3])) {
+      if (!pointee.count(w[i + 1])) return {};
+      private_of(w[i + 1]);
+    }
+    if (op == kOpVariable && removed.count(w[i + 2])) {
+      if (!pointee.count(w[i + 1])) return {};
+      private_of(w[i + 1]);
+    }
+    i += count;
+  }
+  std::vector<uint32_t> out(w.begin(), w.begin() + 5);
+  bool types_emitted = false;
+  for (size_t i = 5; i < w.size();) {
+    const uint32_t count = w[i] >> 16, op = w[i] & 0xFFFF;
+    if (op == kOpEntryPoint) {
+      size_t name_end = i + 3;
+      while (name_end < i + count && (w[name_end] >> 24) != 0) name_end++;
+      name_end++;
+      std::vector<uint32_t> ins(w.begin() + i, w.begin() + std::min(name_end, i + count));
+      for (size_t k = name_end; k < i + count; k++)
+        if (!removed.count(w[k])) ins.push_back(w[k]);
+      ins[0] = uint32_t(ins.size()) << 16 | op;
+      out.insert(out.end(), ins.begin(), ins.end());
+    } else if (op == kOpDecorate && removed.count(w[i + 1])) {
+    } else {
+      if (op == kOpVariable && !types_emitted) {
+        types_emitted = true;
+        for (const auto& [type, id] : private_pointer) out.insert(out.end(), {4u << 16 | kOpTypePointer, id, kPrivate, type});
+      }
+      const size_t at = out.size();
+      out.insert(out.end(), w.begin() + i, w.begin() + i + count);
+      if (op == kOpVariable && removed.count(w[i + 2])) {
+        out[at + 1] = private_of(w[i + 1]);
+        out[at + 3] = kPrivate;
+      }
+      if ((op == kOpAccessChain || op == kOpInBoundsAccessChain) && count >= 4 && removed.count(w[i + 3]))
+        out[at + 1] = private_of(w[i + 1]);
+    }
+    i += count;
+  }
+  out[3] = bound;
+  std::vector<uint8_t> bytes(out.size() * 4);
+  std::memcpy(bytes.data(), out.data(), bytes.size());
+  return bytes;
+}
+
+class TrimmedVertexShaders {
+ public:
+  const RenderShader* Get(RenderDevice* device, const std::string& dir, uint64_t hash, uint32_t keep) {
+    keep &= 0x3FFFF;
+    const uint64_t key = hash * 0x9E3779B97F4A7C15ull ^ keep;
+    std::lock_guard lock(mutex_);
+    if (auto it = shaders_.find(key); it != shaders_.end()) return it->second.get();
+    std::unique_ptr<RenderShader> shader;
+    if (FILE* f = std::fopen(fmt::format("{}/vs_{:016X}.spv", dir, hash).c_str(), "rb")) {
+      std::fseek(f, 0, SEEK_END);
+      std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
+      std::fseek(f, 0, SEEK_SET);
+      if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size()) {
+        const std::vector<uint8_t> trimmed = TrimVertexOutputsSpirv(data, keep);
+        if (!trimmed.empty())
+          shader = device->createShader(trimmed.data(), trimmed.size(), "main", RenderShaderFormat::SPIRV);
+      }
+      std::fclose(f);
+    }
+    created_ += shader != nullptr;
+    return (shaders_[key] = std::move(shader)).get();
+  }
+  uint64_t Created() {
+    std::lock_guard lock(mutex_);
+    return created_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<uint64_t, std::unique_ptr<RenderShader>> shaders_;
+  uint64_t created_ = 0;
+};
+TrimmedVertexShaders g_trimmed_vs;
 
 std::vector<uint8_t> EarlyFragmentTestsSpirv(const std::vector<uint8_t>& data) {
   constexpr uint32_t kOpEntryPoint = 15, kOpExecutionMode = 16, kOpDecorate = 71, kOpMemberDecorate = 72;
@@ -1231,7 +1340,7 @@ struct PipelineJob {
   std::vector<RenderInputElement> elements;
   std::vector<RenderInputSlot> slots;
   RenderSpecConstant spec{0, 0};
-  RenderSpecConstant specs[3];
+  RenderSpecConstant specs[2];
   std::unique_ptr<RenderPipeline> result;
   std::atomic<bool> done{false};
 };
@@ -1568,8 +1677,11 @@ class PipelineWarmer {
           auto it = ps ? shader_inputs_.find(ps) : shader_inputs_.end();
           live_outputs = !ps ? 0 : it != shader_inputs_.end() ? it->second : ~0u;
         }
-        RenderSpecConstant specs[3];
-        desc.specConstantsCount = SpecConstants(spec.value, specs, live_outputs);
+        if (live_outputs != ~0u)
+          if (const RenderShader* trimmed = g_trimmed_vs.Get(device_, spirv_dir_, rec->vs, live_outputs))
+            desc.vertexShader = trimmed;
+        RenderSpecConstant specs[2];
+        desc.specConstantsCount = SpecConstants(spec.value, specs);
         desc.specConstants = specs;
         pipeline = device_->createGraphicsPipeline(desc);
       }
@@ -4410,9 +4522,15 @@ struct Backend::Impl {
         live_outputs = pi->second;
       }
     }
+    if (live_outputs != ~0u) {
+      std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
+      if (dir.empty()) dir = DefaultSpirvDir();
+      if (const RenderShader* trimmed = g_trimmed_vs.Get(device, dir, vs_hash, live_outputs))
+        desc.vertexShader = trimmed;
+    }
     RenderSpecConstant sc(0, spec);
-    RenderSpecConstant scs[3];
-    desc.specConstantsCount = SpecConstants(spec, scs, live_outputs);
+    RenderSpecConstant scs[2];
+    desc.specConstantsCount = SpecConstants(spec, scs);
     desc.specConstants = scs;
     // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes. Not while
     // the pixel shader is still being translated: the draw then goes out depth-only under the same
@@ -4439,7 +4557,7 @@ struct Backend::Impl {
       job->desc = desc;
       job->desc.inputElements = job->elements.data();
       job->desc.inputSlots = job->slots.data();
-      job->desc.specConstantsCount = SpecConstants(spec, job->specs, live_outputs);
+      job->desc.specConstantsCount = SpecConstants(spec, job->specs);
       job->desc.specConstants = job->specs;
       pending_pipelines[key] = job;
       pipeline_compiler.Enqueue(device, job);
@@ -8204,6 +8322,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     if (s.input_stat_draws)
       REXLOG_INFO("[native] vertex inputs declared per draw {:.1f} (gtav_native_vertex_inputs_used {})",
                   double(s.input_stat_inputs) / s.input_stat_draws, REXCVAR_GET(gtav_native_vertex_inputs_used));
+      REXLOG_INFO("[native] vertex shaders with trimmed outputs: {} (gtav_native_shader_opt_vs_outputs {})",
+                  g_trimmed_vs.Created(), REXCVAR_GET(gtav_native_shader_opt_vs_outputs));
     s.input_stat_draws = s.input_stat_inputs = s.input_stat_frames = 0;
   }
   if (s.pass_times) {  // the end, then every query written (the pool is read whole)

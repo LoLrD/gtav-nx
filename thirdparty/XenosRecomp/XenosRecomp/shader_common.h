@@ -60,7 +60,6 @@ struct XenosConstantsShared { uint4 v[128]; };
 #define g_ColorScale(INDEX)        (XENOS_UBO ? asfloat(g_UboShared.v[35 + (INDEX)]) : vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560 + (INDEX) * 16))
 // Host pixels per guest pixel, inverted (render scale below 1): vPos stays in guest pixels.
 [[vk::constant_id(1)]] const float g_PixelScaleInv = 1.0;
-[[vk::constant_id(2)]] const uint g_LiveOutputs = 0xFFFFFFFF;
 
 #define g_SpecConstants() g_SpecConstants
 
@@ -79,7 +78,6 @@ struct XenosConstantsShared { uint4 v[128]; };
 uint g_SpecConstants();
 
 #define g_PixelScaleInv 1.0
-#define g_LiveOutputs 0xFFFFFFFF
 
 #define g_ColorScale(INDEX) g_ColorScaleArray[INDEX]
 

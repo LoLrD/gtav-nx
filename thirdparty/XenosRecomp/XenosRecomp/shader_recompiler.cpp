@@ -2110,13 +2110,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         // the viewport transform disabled) to clip space; identity otherwise.
                         out += "\toPos.xy = oPos.xy * g_NdcScale + (g_HalfPixelOffset + g_NdcOffset) * oPos.w;\n";
                     }
-
-                    for (size_t i = 0; i < std::size(INTERPOLATORS); i++)
-                    {
-                        indent();
-                        println("\tif ((g_LiveOutputs & 0x{:X}u) == 0) o{}{} = 0.0;", 1u << i,
-                            USAGE_VARIABLES[uint32_t(INTERPOLATORS[i].first)], INTERPOLATORS[i].second);
-                    }
                 }
 
                 if (simpleControlFlow)
