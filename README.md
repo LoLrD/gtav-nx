@@ -42,17 +42,18 @@ deferred lighting 10.4 ms (7.8 of it pixel shaders), forward and post effects 6.
 
 On macOS or Linux with CMake, Ninja, clang, Python 3 and Docker:
 
-1. Put your own `default.xex` and `default.xexp` (Title Update 27) in `gtav/assets/`.
-2. Build the code generator from `sdk/` and run it in `gtav/`:
+1. Fetch the SDK's third-party sources: `python3 tools/fetch_thirdparty.py`.
+2. Put your own `default.xex` and `default.xexp` (Title Update 27) in `gtav/assets/`.
+3. Build the code generator from `sdk/` and run it in `gtav/`:
    `../sdk/out/mac-arm64/rexglue --force codegen gtav_manifest.toml`.
-3. Build the desktop version, which also builds the renderer's own shaders:
+4. Build the desktop version, which also builds the renderer's own shaders:
    `cmake -S gtav -B build/mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DREXSDK_DIR=$PWD/sdk`, then
    `cmake --build build/mac`.
-4. Build the Switch Vulkan driver once: `mesa/build_mesa_docker.sh` (about an hour, 15 GB; see
+5. Build the Switch Vulkan driver once: `mesa/build_mesa_docker.sh` (about an hour, 15 GB; see
    [mesa/README.md](mesa/README.md)).
-5. Build the NRO: `LTO=ON tools/build_nro.sh`. Without `LTO` a renderer change relinks in under a
+6. Build the NRO: `LTO=ON tools/build_nro.sh`. Without `LTO` a renderer change relinks in under a
    minute.
-6. Copy `tools/console-test/credentials.env.example` to `credentials.env`, set the console's
+7. Copy `tools/console-test/credentials.env.example` to `credentials.env`, set the console's
    address, then run `tools/console-test/upload_data.sh` (your game files) and
    `tools/console-test/deploy.sh` (the NRO and `gtav/gtav_switch.toml`).
 
@@ -80,5 +81,5 @@ legally obtained copy of the game. No prebuilt files are distributed: the NRO co
 recompiled from the game, so it is made on your own computer from your copy. The leaked Rockstar
 source code was never used. Running homebrew requires custom firmware.
 
-Source code is under the GPL-3.0 license ([LICENSE](LICENSE)). Bundled third-party components keep
-their own licenses.
+Source code is under the GPL-3.0 license ([LICENSE](LICENSE)). Credits and the licenses of bundled
+components are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
