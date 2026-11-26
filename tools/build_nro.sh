@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MESA_SDK="${MESA_SDK:-$HOME/work/nier-nx-data/mesa-sdk}"
+MESA_SDK="${MESA_SDK:-$ROOT/out/mesa-sdk}"
 PGO="${PGO:-OFF}"
 LTO="${LTO:-OFF}"
 LTO_JOBS="${LTO_JOBS:-auto}"

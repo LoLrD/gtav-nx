@@ -5,25 +5,20 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 NAME="${1:?usage: collect.sh NAME}"
 check_console
 RUN_DIR="$OUT_ROOT/$NAME"
-mkdir -p "$RUN_DIR/crash"
-cp "$DEPLOYED_DIR/nier.elf" "$DEPLOYED_DIR/nier.toml" "$RUN_DIR/"
-if ftp_get "$SD_DIR/nier.log" "$RUN_DIR/nier.log" 2>/dev/null; then
-  ftp_del "$SD_DIR/nier.log"
+mkdir -p "$RUN_DIR"
+cp "$DEPLOYED_DIR/gtav.elf" "$RUN_DIR/"
+if ftp_get "$SD_DIR/logs/gtav.log" "$RUN_DIR/gtav.log" 2>/dev/null; then
+  ftp_del "$SD_DIR/logs/gtav.log"
 else
-  echo "warning: no nier.log on the console" >&2
+  echo "warning: no gtav.log on the console" >&2
 fi
-ftp_get "$SD_DIR/logs/rex/rex_profile.log" "$RUN_DIR/rex_profile.log" 2>/dev/null \
-  || echo "warning: no rex_profile.log on the console" >&2
-if ftp_get "$SD_DIR/nak.txt" "$RUN_DIR/nak.txt" 2>/dev/null; then
-  ftp_del "$SD_DIR/nak.txt"
-fi
-for dir in "${CRASH_DIRS[@]}"; do ftp_list "$dir" | sed "s#^#$dir/#"; done > "$RUN_DIR/crash_after.txt" \
-  || echo "warning: crash report folders not listed" >&2
-python3 "$CT_DIR/crash_reports.py" "$DEPLOYED_DIR/crash_before.txt" "$RUN_DIR/crash_after.txt" > "$RUN_DIR/crash_new.txt"
-while read -r report; do
-  [[ -n "$report" ]] || continue
-  if ftp_get "$report" "$RUN_DIR/crash/${report##*/}"; then
-    echo "$report" >> "$DEPLOYED_DIR/crash_before.txt"
+for name in rex_crash.log rex_stderr.log rex_profile.log; do
+  if ftp_get "$SD_DIR/logs/rex/$name" "$RUN_DIR/$name" 2>/dev/null; then
+    ftp_del "$SD_DIR/logs/rex/$name"
+  else
+    rm -f "$RUN_DIR/$name"
   fi
-done < "$RUN_DIR/crash_new.txt"
-python3 "$CT_DIR/run_summary.py" "$RUN_DIR"
+done
+if [[ -f "$RUN_DIR/gtav.log" ]] && grep -q "SWEEP" "$RUN_DIR/gtav.log"; then
+  python3 "$CT_DIR/sweep_table.py" "$RUN_DIR/gtav.log"
+fi

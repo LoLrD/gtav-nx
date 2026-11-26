@@ -2,11 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE="${DEVKITA64_IMAGE:-nier-nx-build}"
+IMAGE="${DEVKITA64_IMAGE:-gtav-nx-build}"
 
 ensure_image() {
   command -v docker >/dev/null 2>&1 || { echo "error: docker not found in PATH" >&2; exit 1; }
-  docker info >/dev/null 2>&1 || { echo "error: the Docker daemon is not running (start OrbStack)" >&2; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "error: the Docker daemon is not running (start Docker)" >&2; exit 1; }
   docker image inspect "$IMAGE" >/dev/null 2>&1 && return
   echo "== building the Docker image $IMAGE (devkitpro/devkita64 + glslang-tools), once" >&2
   docker build -t "$IMAGE" - <<'DOCKERFILE'

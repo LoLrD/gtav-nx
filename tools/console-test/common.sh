@@ -11,7 +11,7 @@ fi
 FTP_PORT="${FTP_PORT:-5000}"
 FTP_USER="${FTP_USER:-anonymous}"
 FTP_PASS="${FTP_PASS:-}"
-SD_DIR="${SD_DIR:-/switch/nier-nx}"
+SD_DIR="${SD_DIR:-/switch/gtav-nx}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/out/console-test}"
 NX_OUT="${NX_OUT:-$ROOT/out/nx}"
 DEPLOYED_DIR="$OUT_ROOT/deployed"
