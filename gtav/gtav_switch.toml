@@ -96,7 +96,8 @@ gtav_native_shader_opt_texsize = true
 gtav_native_shader_opt_kill_skip = true
 gtav_native_shader_opt_color_mask = true
 gtav_native_shader_opt_blend_skip = true
-gtav_native_ab_sweep = "gtav_native_shader_opt_ubo=true|false;gtav_native_shader_opt_moves=true|false;gtav_native_shader_opt_texcoord32=true|false;gtav_native_shader_opt_texsize=true|false;gtav_native_shader_opt_kill_skip=true|false;gtav_native_shader_opt_color_mask=true|false;gtav_native_shader_opt_blend_skip=true|false"
+gtav_native_shader_opt_vs_outputs = true
+gtav_native_ab_sweep = "gtav_native_shader_opt_ubo=true|false;gtav_native_shader_opt_moves=true|false;gtav_native_shader_opt_texcoord32=true|false;gtav_native_shader_opt_texsize=true|false;gtav_native_shader_opt_kill_skip=true|false;gtav_native_shader_opt_color_mask=true|false;gtav_native_shader_opt_blend_skip=true|false;gtav_native_shader_opt_vs_outputs=true|false"
 gtav_native_ab_sweep_seconds = 8
 gtav_debug_commands = true
 gtav_bench_script = "sdmc:/switch/gtav-nx/bench.txt"
