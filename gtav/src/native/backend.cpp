@@ -477,6 +477,9 @@ struct DrawListMask {
   bool Has(uint8_t dl) const { return lists.test(dl); }
 };
 
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_vs_outputs, false, "GTAV",
+                    "Zero the vertex shader outputs the pixel shader of the pipeline does not read (all of them "
+                    "without a pixel shader), so the driver drops the vertex work that only fed them");
 REXCVAR_DEFINE_BOOL(gtav_native_vertex_inputs_used, false, "GTAV",
                     "Native renderer: pipelines declare only the vertex inputs their vertex shader reads (from the "
                     "SPIR-V) instead of the declaration plus zero inputs at all 32 locations");
@@ -1184,11 +1187,12 @@ uint32_t ShaderOpts() {
   return opts;
 }
 float g_pixel_scale_inv = 1.0f;
-uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
-  out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
-  if (!(spec & kSpecScaled)) return 1;
-  out[1] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
-  return 2;
+uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[3], uint32_t live_outputs = ~0u) {
+  uint32_t n = 0;
+  out[n++] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
+  if (spec & kSpecScaled) out[n++] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
+  if (live_outputs != ~0u) out[n++] = RenderSpecConstant(2, live_outputs);
+  return n;
 }
 
 std::vector<uint8_t> EarlyFragmentTestsSpirv(const std::vector<uint8_t>& data) {
@@ -1227,7 +1231,7 @@ struct PipelineJob {
   std::vector<RenderInputElement> elements;
   std::vector<RenderInputSlot> slots;
   RenderSpecConstant spec{0, 0};
-  RenderSpecConstant specs[2];
+  RenderSpecConstant specs[3];
   std::unique_ptr<RenderPipeline> result;
   std::atomic<bool> done{false};
 };
@@ -1501,6 +1505,7 @@ class PipelineWarmer {
       if (auto it = shaders_.find(key); it != shaders_.end()) return it->second.get();
     }
     std::unique_ptr<RenderShader> shader;
+    uint32_t inputs = ~0u;
     if (FILE* f = std::fopen((spirv_dir_ + "/" + name).c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
       std::vector<uint8_t> data(size_t(std::max(0L, std::ftell(f))));
@@ -1508,12 +1513,16 @@ class PipelineWarmer {
       if (!data.empty() && std::fread(data.data(), 1, data.size(), f) == data.size()) {
         if (early) data = EarlyFragmentTestsSpirv(data);
         if (!data.empty()) shader = device_->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+        if (pixel && shader) inputs = SpirvInputsRead(data.data(), data.size());
       }
       std::fclose(f);
     }
     std::lock_guard lock(shader_mutex_);
     auto& slot = shaders_[key];
-    if (!slot) slot = std::move(shader);
+    if (!slot) {
+      slot = std::move(shader);
+      if (slot) shader_inputs_[slot.get()] = inputs;
+    }
     return slot.get();
   }
 
@@ -1553,8 +1562,14 @@ class PipelineWarmer {
         desc.inputElementsCount = uint32_t(elements.size());
         desc.inputSlots = slots.data();
         desc.inputSlotsCount = uint32_t(slots.size());
-        RenderSpecConstant specs[2];
-        desc.specConstantsCount = SpecConstants(spec.value, specs);
+        uint32_t live_outputs = ~0u;
+        if (REXCVAR_GET(gtav_native_shader_opt_vs_outputs) && !has_gs) {
+          std::lock_guard lock(shader_mutex_);
+          auto it = ps ? shader_inputs_.find(ps) : shader_inputs_.end();
+          live_outputs = !ps ? 0 : it != shader_inputs_.end() ? it->second : ~0u;
+        }
+        RenderSpecConstant specs[3];
+        desc.specConstantsCount = SpecConstants(spec.value, specs, live_outputs);
         desc.specConstants = specs;
         pipeline = device_->createGraphicsPipeline(desc);
       }
@@ -1586,6 +1601,7 @@ class PipelineWarmer {
   std::deque<std::shared_ptr<Record>> queue_;
   std::mutex shader_mutex_, names_mutex_;
   std::unordered_map<std::string, std::unique_ptr<RenderShader>> shaders_;
+  std::unordered_map<const RenderShader*, uint32_t> shader_inputs_;
   std::unordered_set<std::string> shader_files_;
   std::set<std::string> names_;
   std::atomic<int> workers_{0};
@@ -2124,6 +2140,7 @@ struct Backend::Impl {
   std::unique_ptr<RenderShader> blit_vs, blit_ps, rectlist_gs, depth_ps, resolve_ps, depth_pack_ps, diag_flat_ps, alpha_ps;
   std::unique_ptr<RenderShader> diag_const_ps;
   std::unordered_map<const RenderShader*, uint32_t> vs_inputs;
+  std::unordered_map<const RenderShader*, uint32_t> ps_inputs;
   std::unordered_map<uint64_t, uint32_t> pipeline_inputs;
   uint64_t input_stat_draws = 0, input_stat_inputs = 0, input_stat_frames = 0;
   DrawListMask diag_no_pixels, diag_const_ps_lists, diag_no_draws, diag_half_draws;
@@ -3398,7 +3415,8 @@ struct Backend::Impl {
         std::fclose(f);
       }
     }
-    if (!pixel && shader) vs_inputs[shader.get()] = data.empty() ? inputs : SpirvInputsRead(data.data(), data.size());
+    if (shader)
+      (pixel ? ps_inputs : vs_inputs)[shader.get()] = data.empty() ? inputs : SpirvInputsRead(data.data(), data.size());
     // vs_<hash>.indirect (written by the shader census): the shader fetches vertices by a computed
     // index and needs the raw streams (Draw fills its vfetchIndirect records).
     if (!pixel && shader) {
@@ -4220,7 +4238,8 @@ struct Backend::Impl {
     k.mode = regs::Read(r, regs::PA_SU_SC_MODE_CNTL);
     k.alpha_to_mask = (regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1;
     uint32_t exp = (REXCVAR_GET(gtav_native_depth_clamp) ? 1u : 0u) | (REXCVAR_GET(gtav_native_lightvol_keep) ? 2u : 0u) |
-                   (REXCVAR_GET(gtav_native_vertex_inputs_used) ? 4u : 0u);
+                   (REXCVAR_GET(gtav_native_vertex_inputs_used) ? 4u : 0u) |
+                   (REXCVAR_GET(gtav_native_shader_opt_vs_outputs) ? 8u : 0u);
     return Hash(&k, sizeof(k), Hash(&exp, 4, layout_hash));
   }
   static uint64_t LayoutHash(const vertex_layout::HostLayout& vl) {
@@ -4383,9 +4402,17 @@ struct Backend::Impl {
     desc.inputElementsCount = uint32_t(elements.size());
     desc.inputSlots = slots.data();
     desc.inputSlotsCount = uint32_t(slots.size());
+    uint32_t live_outputs = ~0u;
+    if (REXCVAR_GET(gtav_native_shader_opt_vs_outputs) && !desc.geometryShader) {
+      if (!ps) {
+        live_outputs = 0;
+      } else if (auto pi = ps_inputs.find(ps); pi != ps_inputs.end()) {
+        live_outputs = pi->second;
+      }
+    }
     RenderSpecConstant sc(0, spec);
-    RenderSpecConstant scs[2];
-    desc.specConstantsCount = SpecConstants(spec, scs);
+    RenderSpecConstant scs[3];
+    desc.specConstantsCount = SpecConstants(spec, scs, live_outputs);
     desc.specConstants = scs;
     // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes. Not while
     // the pixel shader is still being translated: the draw then goes out depth-only under the same
@@ -4412,7 +4439,7 @@ struct Backend::Impl {
       job->desc = desc;
       job->desc.inputElements = job->elements.data();
       job->desc.inputSlots = job->slots.data();
-      job->desc.specConstantsCount = SpecConstants(spec, job->specs);
+      job->desc.specConstantsCount = SpecConstants(spec, job->specs, live_outputs);
       job->desc.specConstants = job->specs;
       pending_pipelines[key] = job;
       pipeline_compiler.Enqueue(device, job);
