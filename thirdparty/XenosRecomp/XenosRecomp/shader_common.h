@@ -39,14 +39,14 @@ struct PushConstants
 
 struct XenosConstantsVertex { float4 v[256]; };
 struct XenosConstantsPixel { float4 v[256]; };
-struct XenosConstantsShared { float4 v[128]; };
+struct XenosConstantsShared { uint4 v[128]; };
 [[vk::binding(0, 4)]] ConstantBuffer<XenosConstantsVertex> g_UboVertex;
 [[vk::binding(1, 4)]] ConstantBuffer<XenosConstantsPixel> g_UboPixel;
 [[vk::binding(2, 4)]] ConstantBuffer<XenosConstantsShared> g_UboShared;
 
 #define XENOS_UBO ((g_SpecConstants & SPEC_CONSTANT_CONSTANTS_UBO) != 0)
-#define XENOS_SHARED_UINT(B) asuint(g_UboShared.v[(B) / 16][((B) % 16) / 4])
-#define XENOS_SHARED_FLOAT(B) g_UboShared.v[(B) / 16][((B) % 16) / 4]
+#define XENOS_SHARED_UINT(B) g_UboShared.v[(B) / 16][((B) % 16) / 4]
+#define XENOS_SHARED_FLOAT(B) asfloat(g_UboShared.v[(B) / 16][((B) % 16) / 4])
 #define XENOS_SHARED_FLOAT2(B) float2(XENOS_SHARED_FLOAT(B), XENOS_SHARED_FLOAT((B) + 4))
 
 #define g_Booleans                 (XENOS_UBO ? XENOS_SHARED_UINT(512) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 512))
@@ -57,7 +57,7 @@ struct XenosConstantsShared { float4 v[128]; };
 #define g_NdcScale                 (XENOS_UBO ? XENOS_SHARED_FLOAT2(536) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 536))
 #define g_NdcOffset                (XENOS_UBO ? XENOS_SHARED_FLOAT2(544) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 544))
 #define g_AlphaFunc                (XENOS_UBO ? XENOS_SHARED_UINT(552) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 552))
-#define g_ColorScale(INDEX)        (XENOS_UBO ? g_UboShared.v[35 + (INDEX)] : vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560 + (INDEX) * 16))
+#define g_ColorScale(INDEX)        (XENOS_UBO ? asfloat(g_UboShared.v[35 + (INDEX)]) : vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560 + (INDEX) * 16))
 // Host pixels per guest pixel, inverted (render scale below 1): vPos stays in guest pixels.
 [[vk::constant_id(1)]] const float g_PixelScaleInv = 1.0;
 
