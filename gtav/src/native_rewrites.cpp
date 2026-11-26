@@ -34,7 +34,6 @@ REXCVAR_DEFINE_BOOL(gtav_nr_quat, true, "GTAV", "Native animation Euler-to-quate
 REXCVAR_DEFINE_BOOL(gtav_nr_cull, true, "GTAV", "Native triangle binning into the 12 occlusion tiles (sub_831665D8)");
 REXCVAR_DEFINE_BOOL(gtav_nr_blend, true, "GTAV", "Native animation frame blending (sub_83441C48)");
 REXCVAR_DEFINE_BOOL(gtav_nr_bound, true, "GTAV", "Native sphere against box overlap test (sub_83585DE8)");
-REXCVAR_DEFINE_BOOL(gtav_nr_vm, true, "GTAV", "Native animation expression VM (sub_834260A0)");
 REXCVAR_DEFINE_BOOL(gtav_nr_pack, true, "GTAV", "Native packed-element sphere culling into a bitmask (sub_8358AE80)");
 REXCVAR_DEFINE_BOOL(gtav_nr_gather, true, "GTAV",
                     "Native skeleton local-pose gather and hierarchy transform (sub_83442200)");
@@ -63,7 +62,6 @@ REX_EXTERN(__imp__sub_831665D8);
 REX_EXTERN(__imp__sub_83441C48);
 REX_EXTERN(__imp__sub_83585DE8);
 REX_EXTERN(sub_826B9248);
-REX_EXTERN(__imp__sub_834260A0);
 REX_EXTERN(__imp__sub_8358AE80);
 REX_EXTERN(__imp__sub_83442200);
 REX_EXTERN(__imp__sub_822F4E48);
@@ -140,16 +138,14 @@ Stat g_quat{"quat sub_83420D18"};
 Stat g_cull{"cull sub_831665D8"};
 Stat g_blend{"blend sub_83441C48"};
 Stat g_bound{"bound sub_83585DE8"};
-Stat g_vm{"vm sub_834260A0"};
 Stat g_pack{"pack sub_8358AE80"};
 Stat g_gather{"gather sub_83442200"};
 Stat g_pow{"pow sub_822F4E48"};
 Stat g_lzx{"lzx sub_837A0D88"};
-std::atomic<uint64_t> g_vm_unchecked{0};
 
-std::array<Stat*, 16> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack,
-                              &g_volume, &g_quat,    &g_cull,   &g_blend,     &g_bound,  &g_vm,
-                              &g_pack,   &g_gather,  &g_pow,    &g_lzx};
+std::array<Stat*, 15> g_stats{&g_memcpy, &g_memcpy2, &g_memset, &g_memset128, &g_curve3, &g_unpack,
+                              &g_volume, &g_quat,    &g_cull,   &g_blend,     &g_bound,  &g_pack,
+                              &g_gather, &g_pow,     &g_lzx};
 
 std::mutex g_report_mutex;
 Clock::time_point g_report_at = Clock::now();
@@ -186,8 +182,6 @@ void Report() {
                 s->guard_hits.load(std::memory_order_relaxed), s->nan_only.load(std::memory_order_relaxed), native,
                 original, native > 0 ? original / native : 0.0);
   }
-  if (const uint64_t n = g_vm_unchecked.load(std::memory_order_relaxed))
-    REXLOG_INFO("[native-rewrites] vm sub_834260A0: {} calls not checkable", n);
 }
 
 void Record(Stat& s, bool ok, bool guard_ok, uint64_t native_ns, uint64_t original_ns, const std::string& what) {
@@ -1767,230 +1761,6 @@ namespace {
 
 #if defined(__aarch64__)
 
-constexpr int kVmStackBias = 16;
-constexpr int kVmStackMask = 511;
-
-struct VmRegs {
-  PPCRegister r7, r8, r9, r10;
-  PPCVRegister v0, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13;
-};
-
-inline void VmPull(const PPCContext& ctx, VmRegs& c) {
-  c.r7 = ctx.r7;
-  c.r8 = ctx.r8;
-  c.r9 = ctx.r9;
-  c.r10 = ctx.r10;
-  c.v0 = ctx.v0;
-  c.v4 = ctx.v4;
-  c.v5 = ctx.v5;
-  c.v6 = ctx.v6;
-  c.v7 = ctx.v7;
-  c.v8 = ctx.v8;
-  c.v9 = ctx.v9;
-  c.v10 = ctx.v10;
-  c.v11 = ctx.v11;
-  c.v12 = ctx.v12;
-  c.v13 = ctx.v13;
-}
-
-inline void VmPush(PPCContext& ctx, const VmRegs& c) {
-  ctx.r7 = c.r7;
-  ctx.r8 = c.r8;
-  ctx.r9 = c.r9;
-  ctx.r10 = c.r10;
-  ctx.v0 = c.v0;
-  ctx.v4 = c.v4;
-  ctx.v5 = c.v5;
-  ctx.v6 = c.v6;
-  ctx.v7 = c.v7;
-  ctx.v8 = c.v8;
-  ctx.v9 = c.v9;
-  ctx.v10 = c.v10;
-  ctx.v11 = c.v11;
-  ctx.v12 = c.v12;
-  ctx.v13 = c.v13;
-}
-
-inline uint8_t VmL8(uint8_t* base, uint32_t a) { return *Host(base, a); }
-
-inline void VmS32(uint8_t* base, uint32_t a, uint32_t v) {
-  v = __builtin_bswap32(v);
-  std::memcpy(Host(base, a), &v, 4);
-}
-
-inline uint8_t* VmRaw(uint8_t* base, uint32_t a) { return Host(base, a); }
-
-#define VM_NEXT                                 \
-  do {                                          \
-    r11.u64 = VmL8(base, r25.u32);              \
-    r25.s64 = r25.s64 + 1;                      \
-    if (r11.u32 > 73) __builtin_trap();         \
-    goto* kVmTable[r11.u32];                    \
-  } while (0)
-#undef VM_NEXT
-
-bool VmSameRegs(const PPCContext& a, const PPCContext& b) { return a.r1.u64 == b.r1.u64 && a.r3.u64 == b.r3.u64; }
-
-constexpr uint32_t kVmObjBytes = 64;
-constexpr uint32_t kVmTrackBytes = 65535u + 1024u + 32u;
-constexpr uint32_t kVmMaxSlots = 4096;
-constexpr uint32_t kVmTrackOffset = 128;
-constexpr uint32_t kVmSlotOffset = kVmTrackOffset + ((kVmTrackBytes + 15) & ~15u) + 16;
-constexpr uint32_t kVmShadowBytes = kVmSlotOffset + 16 * kVmMaxSlots + 32;
-constexpr uint32_t kVmStackScratch = 32768;
-
-struct VmShadow {
-  uint32_t at = 0;
-  uint32_t obj = 0, tracks_from = 0, tracks_n = 0, tracks_to = 0, slots_from = 0, slots_n = 0, slots_to = 0;
-
-  uint32_t Map(uint32_t v) const {
-    if (tracks_n && v - tracks_from < tracks_n) return v - tracks_from + tracks_to;
-    if (slots_n && v - slots_from < slots_n) return v - slots_from + slots_to;
-    return v;
-  }
-
-  void Fill(uint8_t* base, uint32_t real_obj, uint32_t slots_need, const VmShadow* from) {
-    obj = at + (real_obj & 15);
-    std::memcpy(Host(base, obj), Host(base, real_obj), kVmObjBytes);
-    std::memcpy(Host(base, tracks_to), Host(base, from ? from->tracks_to : tracks_from), tracks_n);
-    std::memset(Host(base, tracks_to + tracks_n), 0, kVmTrackBytes - tracks_n);
-    std::memcpy(Host(base, slots_to), Host(base, from ? from->slots_to : slots_from), slots_n);
-    std::memset(Host(base, slots_to + slots_n), 0, slots_need - slots_n);
-    for (uint32_t o : {0u, 4u, 8u, 16u, 24u}) VmS32(base, obj + o, Map(Load32(base, obj + o)));
-  }
-};
-
-uint32_t VmShadowBlock(int i) {
-  thread_local uint32_t blocks[2] = {0, 0};
-  if (!blocks[i]) blocks[i] = rex::system::kernel_memory()->SystemHeapAlloc(kVmShadowBytes, 4096);
-  return blocks[i];
-}
-
-bool VmShadows(const PPCContext& ctx, uint8_t* base, VmShadow& a, VmShadow& b) {
-  const uint32_t obj = ctx.r4.u32;
-  if (!Flat(obj, kVmObjBytes) || Writable(obj, kVmObjBytes) != kVmObjBytes) return false;
-  const uint32_t tracks = Load32(base, obj), slots = Load32(base, obj + 24), count = Load32(base, obj + 48);
-  if (count > kVmMaxSlots) return false;
-  const uint32_t t0 = tracks & ~15u, s0 = slots & ~15u;
-  const uint32_t tn = Flat(t0, kVmTrackBytes) ? Writable(t0, kVmTrackBytes) : 0;
-  const uint32_t slots_need = 16 * count + 16;
-  const uint32_t sn = count && Flat(s0, slots_need) ? Writable(s0, slots_need) : 0;
-  auto apart = [](uint32_t a, uint32_t an, uint32_t b, uint32_t bn) {
-    return !an || !bn || uint64_t(a) + an <= b || uint64_t(b) + bn <= a;
-  };
-  if (!tn || sn < 16 * count || !apart(t0, tn, s0, sn) || !apart(obj, kVmObjBytes, t0, tn) ||
-      !apart(obj, kVmObjBytes, s0, sn))
-    return false;
-  for (VmShadow* s : {&a, &b}) {
-    s->at = VmShadowBlock(s == &a ? 0 : 1);
-    if (!s->at) return false;
-    s->tracks_from = t0;
-    s->tracks_n = tn;
-    s->tracks_to = s->at + kVmTrackOffset;
-    s->slots_from = s0;
-    s->slots_n = sn;
-    s->slots_to = s->at + kVmSlotOffset;
-  }
-  a.Fill(base, obj, slots_need, nullptr);
-  b.Fill(base, obj, slots_need, &a);
-  return true;
-}
-
-bool VmSameBytes(const uint8_t* want, const uint8_t* have, uint32_t n, uint32_t addr, std::string& what,
-                 bool& nan_only) {
-  for (uint32_t w = 0; w < n; w += 4) {
-    if (std::memcmp(want + w, have + w, std::min(4u, n - w)) == 0) continue;
-    const uint32_t x = n - w >= 4 ? Be32(want, w) : 0, y = n - w >= 4 ? Be32(have, w) : 1;
-    if (IsNan(x) && IsNan(y)) {
-      nan_only = true;
-      continue;
-    }
-    what = fmt::format("byte {:08X}: original {:08X} native {:08X}", addr + w, x, y);
-    return false;
-  }
-  return true;
-}
-
-void VmCheck(PPCContext& ctx, uint8_t* base) {
-  VmShadow sa, sb;
-  if (!VmShadows(ctx, base, sa, sb)) {
-    g_vm_unchecked.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  PPCContext mine = ctx, theirs = ctx;
-  mine.r4.u64 = sa.obj;
-  theirs.r4.u64 = sb.obj;
-  const uint32_t below = ctx.r1.u32 - kVmStackScratch;
-  const uint32_t scratch = Flat(below, kVmStackScratch) ? Writable(below, kVmStackScratch) : 0;
-  thread_local std::vector<uint8_t> stack;
-  stack.resize(scratch);
-  std::memcpy(stack.data(), Host(base, below), scratch);
-  thread_local uint32_t flip = 0;
-  Clock::time_point t[4];
-  if (++flip & 1) {
-    t[0] = Clock::now();
-    Vm834260A0(mine, base);
-    t[1] = Clock::now();
-    std::memcpy(Host(base, below), stack.data(), scratch);
-    t[2] = Clock::now();
-    __imp__sub_834260A0(theirs, base);
-    t[3] = Clock::now();
-  } else {
-    t[2] = Clock::now();
-    __imp__sub_834260A0(theirs, base);
-    t[3] = Clock::now();
-    std::memcpy(Host(base, below), stack.data(), scratch);
-    t[0] = Clock::now();
-    Vm834260A0(mine, base);
-    t[1] = Clock::now();
-  }
-  std::string what;
-  bool nan_only = false;
-  bool ok = VmSameBytes(Host(base, sb.tracks_to), Host(base, sa.tracks_to), sa.tracks_n, sa.tracks_from, what,
-                        nan_only) &&
-            VmSameBytes(Host(base, sb.slots_to), Host(base, sa.slots_to), sa.slots_n, sa.slots_from, what,
-                        nan_only);
-  auto canon = [](const VmShadow& s, uint64_t v) -> uint64_t {
-    const uint32_t lo = uint32_t(v);
-    if (s.tracks_n && lo - s.tracks_to < s.tracks_n) return (v & ~0xFFFFFFFFull) | (lo - s.tracks_to + s.tracks_from);
-    if (s.slots_n && lo - s.slots_to < s.slots_n) return (v & ~0xFFFFFFFFull) | (lo - s.slots_to + s.slots_from);
-    if (lo - s.at < kVmShadowBytes) return (v & ~0xFFFFFFFFull) | (lo - s.at + 0x10000000u);
-    return v;
-  };
-  if (ok) {
-    PPCContext x = mine, y = theirs;
-    x.r3.u64 = canon(sa, x.r3.u64);
-    y.r3.u64 = canon(sb, y.r3.u64);
-    ok = VmSameRegs(x, y);
-    if (!ok) what = fmt::format("registers: r1 {:X}/{:X} r3 {:X}/{:X}", y.r1.u64, x.r1.u64, y.r3.u64, x.r3.u64);
-  }
-  if (nan_only) g_vm.nan_only.fetch_add(1, std::memory_order_relaxed);
-  if (!ok)
-    what += fmt::format(" | in r3 {:08X} r4 {:08X} tracks {:08X} slots {:08X} count {}", ctx.r3.u32, ctx.r4.u32,
-                        sa.tracks_from, sa.slots_from, sa.slots_n / 16);
-  Record(g_vm, ok, true, Ns(t[0], t[1]), Ns(t[2], t[3]), what);
-}
-
-#endif
-
-}  // namespace
-
-REX_HOOK_RAW(sub_834260A0) {
-#if defined(__aarch64__)
-  if (Enabled(REXCVAR_GET(gtav_nr_vm))) {
-    if (CheckNow()) [[unlikely]]
-      VmCheck(ctx, base);
-    Vm834260A0(ctx, base);
-    return;
-  }
-#endif
-  __imp__sub_834260A0(ctx, base);
-}
-
-namespace {
-
-#if defined(__aarch64__)
-
 constexpr uint32_t kPackMaskTable = 0x83E2BBD0u;
 constexpr uint32_t kPackConstA = 0x8206F5F4u;
 constexpr uint32_t kPackConstB = 0x8206F5F0u;
@@ -2813,8 +2583,8 @@ void Pow822F4E48(PPCContext& ctx, uint8_t* base) {
   uint32_t xb, yb;
   std::memcpy(&xb, &fx, 4);
   std::memcpy(&yb, &fy, 4);
-  VmS32(base, ctx.r1.u32 + 28, yb);
-  VmS32(base, ctx.r1.u32 + 20, xb);
+  BoundStore32(base, ctx.r1.u32 + 28, yb);
+  BoundStore32(base, ctx.r1.u32 + 20, xb);
   const simde__m128 x = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(xb)));
   const simde__m128 y = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(yb)));
   const simde__m128 zero = simde_mm_setzero_ps();
