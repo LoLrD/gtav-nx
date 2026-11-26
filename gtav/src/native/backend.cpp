@@ -27,6 +27,7 @@
 #include <imgui.h>
 #include <xxhash.h>
 #include "byteswap_simd.h"
+#include <plume_vulkan.h>
 
 #include <algorithm>
 #include <bitset>
@@ -280,6 +281,11 @@ REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_moves, false, "GTAV",
                     "Native renderer (live): Xenos moves (max/min of a value with itself) as plain copies");
 REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texcoord32, false, "GTAV",
                     "Native renderer (live): vertex shaders test the swapped-texcoord mask with 32-bit integers");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize, false, "GTAV",
+                    "Native renderer (live): 1D/2D texture sizes from the shared constants instead of size queries");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_texsize_verify, false, "GTAV",
+                    "Native renderer (live, diagnostic): query texture sizes and draw magenta where the shared "
+                    "constants' size differs");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -527,7 +533,9 @@ uint64_t g_upload_chunk = uint64_t(GTAV_UPLOAD_CHUNK_DEFAULT) << 20;
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
 constexpr uint32_t kMaxTargetRows = 4096;
-constexpr uint32_t kSharedConstantsSize = 1792;  // see shader_common.h + xenosrecomp-gtav.patch
+constexpr uint32_t kSharedConstantsSize = 2048;
+constexpr uint32_t kSlotWords = 256;
+constexpr uint32_t kTextureSizeOffset = 1792;  // see shader_common.h + xenosrecomp-gtav.patch
 // Indirect vertex fetch records (vfetchIndirect): 32 bytes per input location from byte 768.
 constexpr uint32_t kIndirectFetchRecords = 768;
 constexpr uint32_t kDummyStream = 15;  // vertex slot feeding zeros to inputs a declaration lacks
@@ -1147,11 +1155,15 @@ constexpr uint32_t kSpecEarlyTests = 1u << 9;
 constexpr uint32_t kSpecConstantsUbo = 1u << 10;
 constexpr uint32_t kSpecPlainMoves = 1u << 12;
 constexpr uint32_t kSpecTexcoordMask32 = 1u << 14;
+constexpr uint32_t kSpecTextureSize = 1u << 11;
+constexpr uint32_t kSpecTextureSizeVerify = 1u << 15;
 uint32_t ShaderOpts() {
   uint32_t opts = 0;
   if (REXCVAR_GET(gtav_native_shader_opt_ubo)) opts |= kSpecConstantsUbo;
   if (REXCVAR_GET(gtav_native_shader_opt_moves)) opts |= kSpecPlainMoves;
   if (REXCVAR_GET(gtav_native_shader_opt_texcoord32)) opts |= kSpecTexcoordMask32;
+  if (REXCVAR_GET(gtav_native_shader_opt_texsize)) opts |= kSpecTextureSize;
+  if (REXCVAR_GET(gtav_native_shader_opt_texsize_verify)) opts |= kSpecTextureSizeVerify;
   return opts;
 }
 float g_pixel_scale_inv = 1.0f;
@@ -2368,7 +2380,7 @@ struct Backend::Impl {
                                                                      RenderFormat::R8G8B8A8_UNORM));
       menu_font_view = menu_font->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8G8B8A8_UNORM));
       menu_font_descriptor = AllocDescriptor();
-      texture_set->setTexture(menu_font_descriptor, menu_font.get(), RenderTextureLayout::SHADER_READ,
+      SetTexture(menu_font_descriptor, menu_font.get(), RenderTextureLayout::SHADER_READ,
                               menu_font_view.get());
       uint64_t size = uint64_t(fw) * uint64_t(fh) * 4;
       auto staging = upload.AllocateShared(size, 512);
@@ -2911,6 +2923,13 @@ struct Backend::Impl {
                 available(), released, kMinIdleFrames, freed, textures_evicted, textures.size());
   }
 
+  std::vector<std::array<float, 2>> descriptor_size = std::vector<std::array<float, 2>>(kTextureDescriptors, {1.0f, 1.0f});
+  void SetTexture(uint32_t descriptor, RenderTexture* texture, RenderTextureLayout layout, RenderTextureView* view) {
+    texture_set->setTexture(descriptor, texture, layout, view);
+    const auto* v = static_cast<const plume::VulkanTextureView*>(view);
+    descriptor_size[descriptor] = {float(std::max(1u, v->texture->desc.width >> v->desc.mipSlice)),
+                                   float(std::max(1u, v->texture->desc.height >> v->desc.mipSlice))};
+  }
   uint32_t AllocDescriptor() {
     if (!free_descriptors.empty()) {
       uint32_t d = free_descriptors.back();
@@ -3116,10 +3135,10 @@ struct Backend::Impl {
                                 : RenderTextureViewDimension::TEXTURE_CUBE;
       null_textures[i] = device->createTexture(desc);
       null_views[i] = null_textures[i]->createTextureView(view);
-      texture_set->setTexture(uint32_t(i), null_textures[i].get(), RenderTextureLayout::SHADER_READ,
+      SetTexture(uint32_t(i), null_textures[i].get(), RenderTextureLayout::SHADER_READ,
                               null_views[i].get());
     }
-    texture_set->setTexture(kOverflow, null_textures[0].get(), RenderTextureLayout::SHADER_READ, null_views[0].get());
+    SetTexture(kOverflow, null_textures[0].get(), RenderTextureLayout::SHADER_READ, null_views[0].get());
     writeback_resolves = REXCVAR_GET(gtav_native) == "on";
     if (writeback_resolves)
       for (auto& pool : query_pools) pool = device->createOcclusionQueryPool(kMaxQueries);
@@ -3523,12 +3542,12 @@ struct Backend::Impl {
     if (msaa == 0) {  // sampled by resolves (depth through its depth aspect)
       t.view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(t.format));
       t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(),
+      SetTexture(t.descriptor, t.texture.get(),
                               depth ? RenderTextureLayout::DEPTH_READ : RenderTextureLayout::SHADER_READ, t.view.get());
       if (depth) {
         t.stencil_view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8_UINT));
         t.stencil_descriptor = AllocDescriptor();
-        texture_set->setTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
+        SetTexture(t.stencil_descriptor, t.texture.get(), RenderTextureLayout::DEPTH_READ,
                                 t.stencil_view.get());
       }
     }
@@ -3714,7 +3733,7 @@ struct Backend::Impl {
       view.componentMapping = dec.swizzle;
       t.view = t.texture->createTextureView(view);
       if (t.descriptor < kFirstTextureDescriptor) t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+      SetTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     auto staging = upload.AllocateShared(dec.data.size(), 512);
     std::memcpy(staging.cpu, dec.data.data(), dec.data.size());
@@ -4864,9 +4883,9 @@ struct Backend::Impl {
   uint32_t* NewSlotBlock() {
     const uint32_t chunk = slot_blocks_used / kSlotBlocksPerChunk, at = slot_blocks_used % kSlotBlocksPerChunk;
     if (chunk == slot_block_chunks.size())
-      slot_block_chunks.push_back(std::make_unique_for_overwrite<uint32_t[]>(size_t(kSlotBlocksPerChunk) * 192));
+      slot_block_chunks.push_back(std::make_unique_for_overwrite<uint32_t[]>(size_t(kSlotBlocksPerChunk) * kSlotWords));
     slot_blocks_used++;
-    uint32_t* block = slot_block_chunks[chunk].get() + size_t(at) * 192;
+    uint32_t* block = slot_block_chunks[chunk].get() + size_t(at) * kSlotWords;
     std::memset(block + 128, 0, 32 * 4);  // words 128-159 come from the record
     return block;
   }
@@ -5511,6 +5530,8 @@ struct Backend::Impl {
         memo.generation = 0;  // a per-call view: never reused
       }
     }
+    if (sc)
+      for (uint32_t slot = 0; slot < 32; slot++) std::memcpy(&sc[192 + 2 * slot], descriptor_size[sc[slot]].data(), 8);
     if (!fetch_cached && prof.on)
       tprof.descriptor_ms +=
           8 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
@@ -6137,6 +6158,7 @@ struct Backend::Impl {
         std::memset(shared_cpu + 192 * 4, 0, kSharedConstantsSize - 192 * 4);
         rc.last_shared.records[building] = false;
       }
+      std::memcpy(shared_cpu + kTextureSizeOffset, rec.slots + 192, (kSlotWords - 192) * 4);
     }
     rc.prof.Mark(rc.prof.consts);
 
@@ -6286,7 +6308,9 @@ struct Backend::Impl {
     } else {
       const bool records = rc.last_shared.records[0] || rc.last_shared.records[1];
       if (const_reuse && rc.last_shared.valid &&
-          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0) {
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur], shared_cpu, records ? kSharedConstantsSize : 192 * 4) == 0 &&
+          std::memcmp(rc.last_shared.cpu[rc.last_shared.cur] + kTextureSizeOffset, shared_cpu + kTextureSizeOffset,
+                      kSharedConstantsSize - kTextureSizeOffset) == 0) {
         shared = rc.last_shared.gpu;
       } else {
         shared = ContextUpload(rc, kSharedConstantsSize);
@@ -6606,7 +6630,7 @@ struct Backend::Impl {
       dst.scale = s;
       ZeroTexture(list, dst.texture.get(), dst.format, Sz(dw, s), Sz(dh, s));
       dst.descriptor = AllocDescriptor();
-      texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      SetTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }
     Transition(list, src->texture.get(), RenderTextureLayout::DEPTH_READ);
     Transition(list, dst.texture.get(), RenderTextureLayout::COLOR_WRITE);
@@ -6702,7 +6726,7 @@ struct Backend::Impl {
       u.texture = device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, r.format));
       u.view = u.texture->createTextureView(RenderTextureViewDesc::Texture2D(r.format));
       u.descriptor = AllocDescriptor();
-      texture_set->setTexture(u.descriptor, u.texture.get(), RenderTextureLayout::SHADER_READ, u.view.get());
+      SetTexture(u.descriptor, u.texture.get(), RenderTextureLayout::SHADER_READ, u.view.get());
       u.width = w, u.height = h, u.format = r.format;
     }
     u.pitch = pitch;
@@ -7022,7 +7046,7 @@ struct Backend::Impl {
       t.texture = device->createTexture(RenderTextureDesc::ColorTarget(t.width, t.height, t.format));
       t.view = t.texture->createTextureView(RenderTextureViewDesc::Texture2D(t.format));
       t.descriptor = AllocDescriptor();
-      texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+      SetTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     return t;
   }
@@ -7234,7 +7258,7 @@ struct Backend::Impl {
           RenderTextureDesc::Texture2D(Sz(front.width, front.scale), Sz(front.height, front.scale), 1, front.format));
       held_view = held->createTextureView(RenderTextureViewDesc::Texture2D(front.format));
       if (!held_descriptor) held_descriptor = AllocDescriptor();
-      texture_set->setTexture(held_descriptor, held.get(), RenderTextureLayout::SHADER_READ, held_view.get());
+      SetTexture(held_descriptor, held.get(), RenderTextureLayout::SHADER_READ, held_view.get());
       held_width = front.width, held_height = front.height, held_format = front.format;
     }
     Transition(list, front.texture.get(), RenderTextureLayout::COPY_SOURCE);
@@ -7352,7 +7376,7 @@ struct Backend::Impl {
       const RenderTexture* color = out.texture.get();
       out.framebuffer = device->createFramebuffer(RenderFramebufferDesc(&color, 1));
       if (!out.descriptor) out.descriptor = AllocDescriptor();
-      texture_set->setTexture(out.descriptor, out.texture.get(), RenderTextureLayout::SHADER_READ, out.view.get());
+      SetTexture(out.descriptor, out.texture.get(), RenderTextureLayout::SHADER_READ, out.view.get());
       out.format = front.format;
       out.width = front.width;
       out.height = front.height;
@@ -7528,7 +7552,7 @@ struct Backend::Impl {
       if (cube) {
         dst.cube_view = dst.texture->createTextureView(RenderTextureViewDesc::TextureCube(dst_format));
         dst.cube_descriptor = AllocDescriptor();
-        texture_set->setTexture(dst.cube_descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ,
+        SetTexture(dst.cube_descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ,
                                 dst.cube_view.get());
       }
       dst.render_target = shader_copy;
@@ -7546,7 +7570,7 @@ struct Backend::Impl {
       dst.scale = s;
       ZeroTexture(list, dst.texture.get(), dst_format, Sz(dw, s), Sz(dh, s), mips, layers);
       dst.descriptor = AllocDescriptor();
-      texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      SetTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
       dst.cube_faces = 0;
     }
     if (cube && rc.dest_level == 0) dst.cube_faces |= 1u << rc.dest_face;

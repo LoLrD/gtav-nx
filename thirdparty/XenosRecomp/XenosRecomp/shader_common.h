@@ -7,6 +7,8 @@
 #define SPEC_CONSTANT_CONSTANTS_UBO         (1 << 10)
 #define SPEC_CONSTANT_PLAIN_MOVES           (1 << 12)
 #define SPEC_CONSTANT_TEXCOORD_MASK32       (1 << 14)
+#define SPEC_CONSTANT_TEXTURE_SIZE          (1 << 11)
+#define SPEC_CONSTANT_TEXTURE_SIZE_VERIFY   (1 << 15)
 
 #ifdef UNLEASHED_RECOMP
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
@@ -100,6 +102,24 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
     return dimensions;
 }
 
+float2 xenosTextureSize(Texture2D<float4> texture, float2 size)
+{
+    float2 result;
+    [branch] if ((g_SpecConstants() & (SPEC_CONSTANT_TEXTURE_SIZE | SPEC_CONSTANT_TEXTURE_SIZE_VERIFY)) == SPEC_CONSTANT_TEXTURE_SIZE)
+        result = size;
+    else
+        result = float2(getTexture2DDimensions(texture));
+    return result;
+}
+
+bool xenosTextureSizeWrong(Texture2D<float4> texture, float2 size)
+{
+    bool wrong = false;
+    [branch] if (g_SpecConstants() & SPEC_CONSTANT_TEXTURE_SIZE_VERIFY)
+        wrong = any(size != float2(getTexture2DDimensions(texture)));
+    return wrong;
+}
+
 // GTA V: like the SDK's shader translator (kRoundingOffset), every fetch gets 1.5/1024 texel added
 // to its offset. With D3D9 pixel centres, screen-space passes put coordinates exactly on texel
 // edges, and point sampling then picks texel i or i-1 depending on interpolation rounding (the
@@ -107,28 +127,28 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
 #define XENOS_FETCH_ROUNDING (1.5 / 1024.0)
 
 // 1D textures are bound as 2D textures of height 1.
-float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
+float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float texCoord)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                        float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5));
+                        float2(texCoord + XENOS_FETCH_ROUNDING / xenosTextureSize(texture, size).x, 0.5));
 }
 
-float getWeights1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
+float getWeights1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float texCoord)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture).x + XENOS_FETCH_ROUNDING - 0.5));
+    return select(isnan(texCoord), 0.0, frac(texCoord * xenosTextureSize(texture, size).x + XENOS_FETCH_ROUNDING - 0.5));
 }
 
 // GTA V: fetches with unnormalized coordinates (texCoordDenorm) address texels of the base level.
-float denorm1D(uint resourceDescriptorIndex, float texCoord)
+float denorm1D(uint resourceDescriptorIndex, float2 size, float texCoord)
 {
-    return texCoord / getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]).x;
+    return texCoord / xenosTextureSize(g_Texture2DDescriptorHeap[resourceDescriptorIndex], size).x;
 }
 
-float2 denorm2D(uint resourceDescriptorIndex, float2 texCoord)
+float2 denorm2D(uint resourceDescriptorIndex, float2 size, float2 texCoord)
 {
-    return texCoord / getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]);
+    return texCoord / xenosTextureSize(g_Texture2DDescriptorHeap[resourceDescriptorIndex], size);
 }
 
 float3 denorm3D(uint resourceDescriptorIndex, float3 texCoord)
@@ -138,16 +158,18 @@ float3 denorm3D(uint resourceDescriptorIndex, float3 texCoord)
     return texCoord / float3(w, h, d);
 }
 
-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture));
+    if (xenosTextureSizeWrong(texture, size))
+        return float4(1.0, 0.0, 1.0, 1.0);
+    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / xenosTextureSize(texture, size));
 }
 
-float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset + XENOS_FETCH_ROUNDING - 0.5));
+    return select(isnan(texCoord), 0.0, frac(texCoord * xenosTextureSize(texture, size) + offset + XENOS_FETCH_ROUNDING - 0.5));
 }
 
 float w0(float a)
@@ -246,31 +268,35 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
 }
 
 // GTA V: fetches with an explicit LOD (setTexLOD + UseRegisterLOD, or computed LOD disabled).
-float4 tfetch1DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord, float lod)
+float4 tfetch1DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float texCoord, float lod)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-                               float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5), lod);
+                               float2(texCoord + XENOS_FETCH_ROUNDING / xenosTextureSize(texture, size).x, 0.5), lod);
 }
 
-float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
+float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float2 texCoord, float2 offset, float lod)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture), lod);
+    if (xenosTextureSizeWrong(texture, size))
+        return float4(1.0, 0.0, 1.0, 1.0);
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / xenosTextureSize(texture, size), lod);
 }
 
 // GTA V: fetches whose instruction overrides the filter to point (mag and min) read one texel, as
 // the hardware does; the descriptor's sampler is the fetch constant's (usually linear), which
 // blended depths across edges in min/max depth downsamples (tiled lighting data).
-float4 tfetch2DPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+float4 tfetch2DPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    int2 dims = int2(getTexture2DDimensions(texture));
+    if (xenosTextureSizeWrong(texture, size))
+        return float4(1.0, 0.0, 1.0, 1.0);
+    int2 dims = int2(xenosTextureSize(texture, size));
     int2 p = clamp(int2(floor(texCoord * float2(dims) + offset + XENOS_FETCH_ROUNDING)), int2(0, 0), dims - 1);
     return texture.Load(int3(p, 0));
 }
 
-float4 tfetch2DLodPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
+float4 tfetch2DLodPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 size, float2 texCoord, float2 offset, float lod)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     uint w, h, levels;

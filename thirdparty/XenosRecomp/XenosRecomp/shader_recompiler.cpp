@@ -453,11 +453,15 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += "Bicubic";
 #endif
 
+    const bool sized = instr.dimension == TextureDimension::Texture1D || instr.dimension == TextureDimension::Texture2D;
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    if (sized)
+        print("{}_TextureSize, ", constNamePtr);
     // GTA V: unnormalized (texel-space) coordinates are divided by the texture's size.
     bool denorm = instr.texCoordDenorm && instr.dimension != TextureDimension::TextureCube;
     if (denorm)
-        print("denorm{0}({1}_Texture{0}DescriptorIndex, ", dimension, constNamePtr);
+        print("denorm{0}({1}_Texture{0}DescriptorIndex, {2}", dimension, constNamePtr,
+              sized ? fmt::format("{}_TextureSize, ", constNamePtr) : std::string());
     printSrcRegister(componentCount);
     if (denorm)
         out += ")";
@@ -1354,6 +1358,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             slot, (std::size(TEXTURE_DIMENSIONS) * FETCH_SLOT_COUNT + slot) * 4);
         println("#define s{0}_ExpScale (XENOS_UBO ? XENOS_SHARED_FLOAT({1}) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {1}))",
             slot, 640 + slot * 4);
+        println("#define s{0}_TextureSize (XENOS_UBO ? XENOS_SHARED_FLOAT2({1}) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {1}))",
+            slot, 1792 + slot * 8);
     }
 
     out += "\n#else\n\n";
@@ -1401,6 +1407,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         uint32_t index = uint32_t(std::size(TEXTURE_DIMENSIONS)) * FETCH_SLOT_COUNT + slot;
         println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});", slot, index / 4, SWIZZLES[index % 4]);
         println("\tfloat s{}_ExpScale : packoffset(c{}.{});", slot, 40 + slot / 4, SWIZZLES[slot % 4]);
+        println("\tfloat2 s{}_TextureSize : packoffset(c{}.{});", slot, 112 + slot / 2, slot % 2 ? "z" : "x");
         println("\t#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
     }
 
