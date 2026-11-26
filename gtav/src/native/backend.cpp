@@ -273,6 +273,9 @@ REXCVAR_DEFINE_INT32(gtav_native_early_depth_tests, 0, "GTAV",
                      "not shaded): 1 = draws whose pixel shader can kill pixels and that write neither depth nor "
                      "stencil, 2 = also every draw whose pixel shader cannot kill (no texkill, alpha test or "
                      "alpha-to-mask)");
+REXCVAR_DEFINE_BOOL(gtav_native_shader_opt_ubo, false, "GTAV",
+                    "Native renderer (live): translated shaders read their constants from dynamic uniform buffers "
+                    "(set 4) instead of buffer device address loads");
 REXCVAR_DEFINE_BOOL(gtav_native_skip_silent_draws, false, "GTAV",
                     "Native renderer: skip draws that write no colour, depth, stencil or memory outside occlusion "
                     "queries");
@@ -1137,6 +1140,12 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 // keys them apart) and get spec constant 1 = 1 / scale, which the shaders' vPos is multiplied by.
 constexpr uint32_t kSpecScaled = 1u << 8;
 constexpr uint32_t kSpecEarlyTests = 1u << 9;
+constexpr uint32_t kSpecConstantsUbo = 1u << 10;
+uint32_t ShaderOpts() {
+  uint32_t opts = 0;
+  if (REXCVAR_GET(gtav_native_shader_opt_ubo)) opts |= kSpecConstantsUbo;
+  return opts;
+}
 float g_pixel_scale_inv = 1.0f;
 uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
   out[0] = RenderSpecConstant(0, spec & ~kSpecEarlyTests);
@@ -1879,7 +1888,6 @@ struct Backend::Impl {
   }
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
-#if GTAV_MOBILE
   // Constant uniform-buffer sets (layout set 4), one per combination of upload-ring buffers the
   // three constant blocks of a draw live in (almost always one chunk).
   static constexpr uint32_t kConstantSet = 4;
@@ -1890,7 +1898,6 @@ struct Backend::Impl {
   RenderDescriptorSet* ConstantSet(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     return ConstantSetImpl(vs, ps, shared);
   }
-#endif
   std::unique_ptr<RenderTexture> null_textures[3];
   std::unique_ptr<RenderTextureView> null_views[3];
   std::unique_ptr<RenderBuffer> zero_buffer;  // dummy vertex stream
@@ -3031,7 +3038,6 @@ struct Backend::Impl {
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
 
-#if GTAV_MOBILE
   RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     auto key = std::make_tuple(vs, ps, shared);
     auto it = ubo_sets.find(key);
@@ -3044,7 +3050,6 @@ struct Backend::Impl {
     }
     return (ubo_sets[key] = std::move(set)).get();
   }
-#endif
 
   bool fragment_barriers = true;  // --gtav_native_fragment_barriers (live)
 
@@ -3072,7 +3077,6 @@ struct Backend::Impl {
     set.end(true, kSamplerDescriptors);
     sampler_set = set.create(device);
     lb.addDescriptorSet(set);
-#if GTAV_MOBILE
     // Set 4: the draw's constants as dynamic uniform buffers (tools/android/ubo_constants.py):
     // VS ALU, PS ALU and shared constants, at the upload-ring offsets the push constants address.
     ubo_builder.begin();
@@ -3081,7 +3085,6 @@ struct Backend::Impl {
     ubo_builder.addConstantBufferDynamic(2);
     ubo_builder.end();
     lb.addDescriptorSet(ubo_builder);
-#endif
     lb.addPushConstant(0, 4, 24, RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
     lb.end();
     layout = lb.create(device);
@@ -4684,10 +4687,8 @@ struct Backend::Impl {
     // Upload memory is taken from the frame's ring a span at a time.
     UploadAllocation span{};
     uint64_t span_size = 0, span_at = 0;
-#if GTAV_MOBILE
     const RenderBuffer* ubo_key[3] = {};
     RenderDescriptorSet* ubo_set = nullptr;
-#endif
     DrawProfile prof;  // consts, streams, submit
     uint32_t draws = 0, skipped = 0;
     uint64_t pipeline_binds = 0;
@@ -4711,7 +4712,6 @@ struct Backend::Impl {
   std::array<std::mutex, 256> cache_locks;
   std::mutex& CacheLock(uint64_t key) { return cache_locks[(key * 0x9E3779B97F4A7C15ull) >> 56]; }
   std::mutex snap_mutex;  // snap_cache's map (entries: CacheLock)
-#if GTAV_MOBILE
   std::mutex ubo_mutex;
   RenderDescriptorSet* ConstantSet(RecordContext& rc, const RenderBuffer* vs, const RenderBuffer* ps,
                                    const RenderBuffer* shared) {
@@ -4720,7 +4720,6 @@ struct Backend::Impl {
     rc.ubo_key[0] = vs, rc.ubo_key[1] = ps, rc.ubo_key[2] = shared;
     return rc.ubo_set = ConstantSetImpl(vs, ps, shared);
   }
-#endif
   RecordContext main_ctx;  // the render thread's
 
   // What DrawFront decided about a draw. Plain data; the pointers stay valid until the frame is
@@ -5199,6 +5198,7 @@ struct Backend::Impl {
   std::array<DrawMemo, kDrawMemos> draw_memos;
   uint64_t draw_memo_uses = 0;
   bool draw_memo_on = false, draw_memo_verify = false;
+  uint32_t shader_opts = 0;
   uint64_t draw_memo_hits = 0, draw_memo_new_shaders = 0, draw_memo_regs = 0,
            draw_memo_targets = 0, draw_memo_mismatches = 0;
   uint32_t draw_memo_logged = 0;
@@ -5596,6 +5596,7 @@ struct Backend::Impl {
     }
     spec = (colorcontrol & 8) ? 2u : 0u;
     if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
+    spec |= shader_opts;
     }
     const uint32_t spec_words = spec;
 
@@ -6296,12 +6297,10 @@ struct Backend::Impl {
       std::memcpy(ds.push, push, sizeof(push));
       ds.push_set = true;
     }
-#if GTAV_MOBILE
     if (RenderDescriptorSet* cs = ConstantSet(rc, vsc.buffer, psc.buffer, shared.buffer)) {
       const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
       list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
     }
-#endif
     if (ds.viewports != rec.viewports || std::memcmp(&ds.vp, &rec.vp, sizeof(rec.vp)) != 0 ||
         std::memcmp(&ds.scissor, &rec.scissor, sizeof(rec.scissor)) != 0) {
       RenderViewport vps[4] = {rec.vp, rec.vp, rec.vp, rec.vp};
@@ -7781,6 +7780,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   write_watch::Harvest();  // before this frame's texture and buffer lookups
   s.fetch_cache.valid = false;
   s.draw_memo_on = REXCVAR_GET(gtav_native_draw_memo);
+  s.shader_opts = ShaderOpts();
   s.draw_memo_verify = s.draw_memo_on && REXCVAR_GET(gtav_native_draw_memo_verify);
   s.slot_generation++;
   s.frame_generation++;

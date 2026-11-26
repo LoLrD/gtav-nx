@@ -1294,13 +1294,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+                println("#define {0}(INDEX) select((INDEX) < {1}, (XENOS_UBO ? g_Ubo{2}.v[{3} + min(INDEX, {4})] : vk::RawBufferLoad<float4>(g_PushConstants.{2}ShaderConstants + ({3} + min(INDEX, {4})) * 16, 0x10)), 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
             {
-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
-                    constantName, shaderName, constantInfo->registerIndex * 16);
+                println("#define {} (XENOS_UBO ? g_Ubo{}.v[{}] : vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10))",
+                    constantName, shaderName, constantInfo->registerIndex.get(), shaderName, constantInfo->registerIndex * 16);
             }
             
             for (uint16_t j = 0; j < constantInfo->registerCount; j++)
@@ -1322,13 +1322,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
         {
-            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+            println("#define s{0}_Texture{1}DescriptorIndex (XENOS_UBO ? XENOS_SHARED_UINT({2}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {2}))",
                 slot, TEXTURE_DIMENSIONS[j], (j * FETCH_SLOT_COUNT + slot) * 4);
         }
         println("#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
-        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+        println("#define s{0}_SamplerDescriptorIndex (XENOS_UBO ? XENOS_SHARED_UINT({1}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {1}))",
             slot, (std::size(TEXTURE_DIMENSIONS) * FETCH_SLOT_COUNT + slot) * 4);
-        println("#define s{}_ExpScale vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
+        println("#define s{0}_ExpScale (XENOS_UBO ? XENOS_SHARED_FLOAT({1}) : vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {1}))",
             slot, 640 + slot * 4);
     }
 
